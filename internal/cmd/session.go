@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
@@ -114,6 +115,27 @@ Examples:
 	RunE: runSessionInject,
 }
 
+var sessionRestartCmd = &cobra.Command{
+	Use:   "restart <rig>/<polecat>",
+	Short: "Restart a polecat session",
+	Long: `Restart a polecat session (stop + start).
+
+Gracefully stops the current session and starts a fresh one.
+Use --force to skip graceful shutdown.`,
+	Args: cobra.ExactArgs(1),
+	RunE: runSessionRestart,
+}
+
+var sessionStatusCmd = &cobra.Command{
+	Use:   "status <rig>/<polecat>",
+	Short: "Show session status details",
+	Long: `Show detailed status for a polecat session.
+
+Displays running state, uptime, session info, and activity.`,
+	Args: cobra.ExactArgs(1),
+	RunE: runSessionStatus,
+}
+
 func init() {
 	// Start flags
 	sessionStartCmd.Flags().StringVar(&sessionIssue, "issue", "", "Issue ID to work on")
@@ -132,6 +154,9 @@ func init() {
 	sessionInjectCmd.Flags().StringVarP(&sessionMessage, "message", "m", "", "Message to inject")
 	sessionInjectCmd.Flags().StringVarP(&sessionFile, "file", "f", "", "File to read message from")
 
+	// Restart flags
+	sessionRestartCmd.Flags().BoolVarP(&sessionForce, "force", "f", false, "Force immediate shutdown")
+
 	// Add subcommands
 	sessionCmd.AddCommand(sessionStartCmd)
 	sessionCmd.AddCommand(sessionStopCmd)
@@ -139,6 +164,8 @@ func init() {
 	sessionCmd.AddCommand(sessionListCmd)
 	sessionCmd.AddCommand(sessionCaptureCmd)
 	sessionCmd.AddCommand(sessionInjectCmd)
+	sessionCmd.AddCommand(sessionRestartCmd)
+	sessionCmd.AddCommand(sessionStatusCmd)
 
 	rootCmd.AddCommand(sessionCmd)
 }
@@ -412,4 +439,109 @@ func runSessionInject(cmd *cobra.Command, args []string) error {
 	fmt.Printf("%s Message sent to %s/%s\n",
 		style.Bold.Render("✓"), rigName, polecatName)
 	return nil
+}
+
+func runSessionRestart(cmd *cobra.Command, args []string) error {
+	rigName, polecatName, err := parseAddress(args[0])
+	if err != nil {
+		return err
+	}
+
+	mgr, _, err := getSessionManager(rigName)
+	if err != nil {
+		return err
+	}
+
+	// Check if running
+	running, err := mgr.IsRunning(polecatName)
+	if err != nil {
+		return fmt.Errorf("checking session: %w", err)
+	}
+
+	if running {
+		// Stop first
+		if sessionForce {
+			fmt.Printf("Force stopping session for %s/%s...\n", rigName, polecatName)
+		} else {
+			fmt.Printf("Stopping session for %s/%s...\n", rigName, polecatName)
+		}
+		if err := mgr.Stop(polecatName, sessionForce); err != nil {
+			return fmt.Errorf("stopping session: %w", err)
+		}
+	}
+
+	// Start fresh session
+	fmt.Printf("Starting session for %s/%s...\n", rigName, polecatName)
+	opts := session.StartOptions{}
+	if err := mgr.Start(polecatName, opts); err != nil {
+		return fmt.Errorf("starting session: %w", err)
+	}
+
+	fmt.Printf("%s Session restarted. Attach with: %s\n",
+		style.Bold.Render("✓"),
+		style.Dim.Render(fmt.Sprintf("gt session at %s/%s", rigName, polecatName)))
+	return nil
+}
+
+func runSessionStatus(cmd *cobra.Command, args []string) error {
+	rigName, polecatName, err := parseAddress(args[0])
+	if err != nil {
+		return err
+	}
+
+	mgr, _, err := getSessionManager(rigName)
+	if err != nil {
+		return err
+	}
+
+	// Get session info
+	info, err := mgr.Status(polecatName)
+	if err != nil {
+		return fmt.Errorf("getting status: %w", err)
+	}
+
+	// Format output
+	fmt.Printf("%s Session: %s/%s\n\n", style.Bold.Render("📺"), rigName, polecatName)
+
+	if info.Running {
+		fmt.Printf("  State: %s\n", style.Bold.Render("● running"))
+	} else {
+		fmt.Printf("  State: %s\n", style.Dim.Render("○ stopped"))
+		return nil
+	}
+
+	fmt.Printf("  Session ID: %s\n", info.SessionID)
+
+	if info.Attached {
+		fmt.Printf("  Attached: yes\n")
+	} else {
+		fmt.Printf("  Attached: no\n")
+	}
+
+	if !info.Created.IsZero() {
+		uptime := time.Since(info.Created)
+		fmt.Printf("  Created: %s\n", info.Created.Format("2006-01-02 15:04:05"))
+		fmt.Printf("  Uptime: %s\n", formatDuration(uptime))
+	}
+
+	fmt.Printf("\nAttach with: %s\n", style.Dim.Render(fmt.Sprintf("gt session at %s/%s", rigName, polecatName)))
+	return nil
+}
+
+// formatDuration formats a duration for human display.
+func formatDuration(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm %ds", int(d.Minutes()), int(d.Seconds())%60)
+	}
+	hours := int(d.Hours())
+	mins := int(d.Minutes()) % 60
+	if hours >= 24 {
+		days := hours / 24
+		hours = hours % 24
+		return fmt.Sprintf("%dd %dh %dm", days, hours, mins)
+	}
+	return fmt.Sprintf("%dh %dm", hours, mins)
 }

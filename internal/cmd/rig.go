@@ -11,8 +11,12 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/refinery"
 	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/tmux"
+	"github.com/steveyegge/gastown/internal/witness"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -77,12 +81,32 @@ Examples:
 	RunE: runRigReset,
 }
 
+var rigShutdownCmd = &cobra.Command{
+	Use:   "shutdown <rig>",
+	Short: "Gracefully stop all rig agents",
+	Long: `Stop all agents in a rig.
+
+This command gracefully shuts down:
+- All polecat sessions
+- The refinery (if running)
+- The witness (if running)
+
+Use --force to skip graceful shutdown and kill immediately.
+
+Examples:
+  gt rig shutdown gastown
+  gt rig shutdown gastown --force`,
+	Args: cobra.ExactArgs(1),
+	RunE: runRigShutdown,
+}
+
 // Flags
 var (
-	rigAddPrefix    string
-	rigAddCrew      string
-	rigResetHandoff bool
-	rigResetRole    string
+	rigAddPrefix      string
+	rigAddCrew        string
+	rigResetHandoff   bool
+	rigResetRole      string
+	rigShutdownForce  bool
 )
 
 func init() {
@@ -91,12 +115,15 @@ func init() {
 	rigCmd.AddCommand(rigListCmd)
 	rigCmd.AddCommand(rigRemoveCmd)
 	rigCmd.AddCommand(rigResetCmd)
+	rigCmd.AddCommand(rigShutdownCmd)
 
 	rigAddCmd.Flags().StringVar(&rigAddPrefix, "prefix", "", "Beads issue prefix (default: derived from name)")
 	rigAddCmd.Flags().StringVar(&rigAddCrew, "crew", "main", "Default crew workspace name")
 
 	rigResetCmd.Flags().BoolVar(&rigResetHandoff, "handoff", false, "Clear handoff content")
 	rigResetCmd.Flags().StringVar(&rigResetRole, "role", "", "Role to reset (default: auto-detect from cwd)")
+
+	rigShutdownCmd.Flags().BoolVarP(&rigShutdownForce, "force", "f", false, "Force immediate shutdown")
 }
 
 func runRigAdd(cmd *cobra.Command, args []string) error {
@@ -301,4 +328,74 @@ func runRigReset(cmd *cobra.Command, args []string) error {
 func pathExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+func runRigShutdown(cmd *cobra.Command, args []string) error {
+	rigName := args[0]
+
+	// Find workspace
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	// Load rigs config and get rig
+	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
+	rigsConfig, err := config.LoadRigsConfig(rigsPath)
+	if err != nil {
+		rigsConfig = &config.RigsConfig{Rigs: make(map[string]config.RigEntry)}
+	}
+
+	g := git.NewGit(townRoot)
+	rigMgr := rig.NewManager(townRoot, rigsConfig, g)
+	r, err := rigMgr.GetRig(rigName)
+	if err != nil {
+		return fmt.Errorf("rig '%s' not found", rigName)
+	}
+
+	fmt.Printf("Shutting down rig %s...\n", style.Bold.Render(rigName))
+
+	var errors []string
+
+	// 1. Stop all polecat sessions
+	t := tmux.NewTmux()
+	sessMgr := session.NewManager(t, r)
+	infos, err := sessMgr.List()
+	if err == nil && len(infos) > 0 {
+		fmt.Printf("  Stopping %d polecat session(s)...\n", len(infos))
+		if err := sessMgr.StopAll(rigShutdownForce); err != nil {
+			errors = append(errors, fmt.Sprintf("polecat sessions: %v", err))
+		}
+	}
+
+	// 2. Stop the refinery
+	refMgr := refinery.NewManager(r)
+	refStatus, err := refMgr.Status()
+	if err == nil && refStatus.State == refinery.StateRunning {
+		fmt.Printf("  Stopping refinery...\n")
+		if err := refMgr.Stop(); err != nil {
+			errors = append(errors, fmt.Sprintf("refinery: %v", err))
+		}
+	}
+
+	// 3. Stop the witness
+	witMgr := witness.NewManager(r)
+	witStatus, err := witMgr.Status()
+	if err == nil && witStatus.State == witness.StateRunning {
+		fmt.Printf("  Stopping witness...\n")
+		if err := witMgr.Stop(); err != nil {
+			errors = append(errors, fmt.Sprintf("witness: %v", err))
+		}
+	}
+
+	if len(errors) > 0 {
+		fmt.Printf("\n%s Some agents failed to stop:\n", style.Warning.Render("⚠"))
+		for _, e := range errors {
+			fmt.Printf("  - %s\n", e)
+		}
+		return fmt.Errorf("shutdown incomplete")
+	}
+
+	fmt.Printf("%s Rig %s shut down successfully\n", style.Success.Render("✓"), rigName)
+	return nil
 }

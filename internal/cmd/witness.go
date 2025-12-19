@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 
 	"github.com/spf13/cobra"
@@ -11,6 +12,7 @@ import (
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/witness"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -65,6 +67,20 @@ Displays running state, monitored polecats, and statistics.`,
 	RunE: runWitnessStatus,
 }
 
+var witnessAttachCmd = &cobra.Command{
+	Use:     "attach <rig>",
+	Aliases: []string{"at"},
+	Short:   "Attach to witness session",
+	Long: `Attach to the Witness tmux session for a rig.
+
+Attaches the current terminal to the witness's tmux session.
+Detach with Ctrl-B D.
+
+If the witness is not running, this will start it first.`,
+	Args: cobra.ExactArgs(1),
+	RunE: runWitnessAttach,
+}
+
 func init() {
 	// Start flags
 	witnessStartCmd.Flags().BoolVar(&witnessForeground, "foreground", false, "Run in foreground (default: background)")
@@ -76,6 +92,7 @@ func init() {
 	witnessCmd.AddCommand(witnessStartCmd)
 	witnessCmd.AddCommand(witnessStopCmd)
 	witnessCmd.AddCommand(witnessStatusCmd)
+	witnessCmd.AddCommand(witnessAttachCmd)
 
 	rootCmd.AddCommand(witnessCmd)
 }
@@ -212,4 +229,59 @@ func runWitnessStatus(cmd *cobra.Command, args []string) error {
 	fmt.Printf("    Total escalations: %d\n", w.Stats.TotalEscalations)
 
 	return nil
+}
+
+// witnessSessionName returns the tmux session name for a rig's witness.
+func witnessSessionName(rigName string) string {
+	return fmt.Sprintf("gt-witness-%s", rigName)
+}
+
+func runWitnessAttach(cmd *cobra.Command, args []string) error {
+	rigName := args[0]
+
+	// Verify rig exists
+	_, r, err := getWitnessManager(rigName)
+	if err != nil {
+		return err
+	}
+
+	t := tmux.NewTmux()
+	sessionName := witnessSessionName(rigName)
+
+	// Check if session exists
+	running, err := t.HasSession(sessionName)
+	if err != nil {
+		return fmt.Errorf("checking session: %w", err)
+	}
+
+	if !running {
+		// Start witness session (like Mayor)
+		fmt.Printf("Starting witness session for %s...\n", rigName)
+
+		if err := t.NewSession(sessionName, r.Path); err != nil {
+			return fmt.Errorf("creating session: %w", err)
+		}
+
+		// Set environment
+		t.SetEnvironment(sessionName, "GT_ROLE", "witness")
+		t.SetEnvironment(sessionName, "GT_RIG", rigName)
+
+		// Launch Claude in a respawn loop
+		loopCmd := `while true; do echo "👁️ Starting Witness for ` + rigName + `..."; claude --dangerously-skip-permissions; echo ""; echo "Witness exited. Restarting in 2s... (Ctrl-C to stop)"; sleep 2; done`
+		if err := t.SendKeysDelayed(sessionName, loopCmd, 200); err != nil {
+			return fmt.Errorf("sending command: %w", err)
+		}
+	}
+
+	// Attach to the session
+	tmuxPath, err := exec.LookPath("tmux")
+	if err != nil {
+		return fmt.Errorf("tmux not found: %w", err)
+	}
+
+	attachCmd := exec.Command(tmuxPath, "attach-session", "-t", sessionName)
+	attachCmd.Stdin = os.Stdin
+	attachCmd.Stdout = os.Stdout
+	attachCmd.Stderr = os.Stderr
+	return attachCmd.Run()
 }

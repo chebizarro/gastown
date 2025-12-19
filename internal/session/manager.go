@@ -59,6 +59,15 @@ type Info struct {
 
 	// RigName is the rig this session belongs to.
 	RigName string `json:"rig_name"`
+
+	// Attached indicates if someone is attached to the session.
+	Attached bool `json:"attached,omitempty"`
+
+	// Created is when the session was created.
+	Created time.Time `json:"created,omitempty"`
+
+	// Windows is the number of tmux windows.
+	Windows int `json:"windows,omitempty"`
 }
 
 // sessionName generates the tmux session name for a polecat.
@@ -168,6 +177,56 @@ func (m *Manager) Stop(polecat string, force bool) error {
 func (m *Manager) IsRunning(polecat string) (bool, error) {
 	sessionID := m.sessionName(polecat)
 	return m.tmux.HasSession(sessionID)
+}
+
+// Status returns detailed status for a polecat session.
+func (m *Manager) Status(polecat string) (*Info, error) {
+	sessionID := m.sessionName(polecat)
+
+	running, err := m.tmux.HasSession(sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("checking session: %w", err)
+	}
+
+	info := &Info{
+		Polecat:   polecat,
+		SessionID: sessionID,
+		Running:   running,
+		RigName:   m.rig.Name,
+	}
+
+	if !running {
+		return info, nil
+	}
+
+	// Get detailed session info
+	tmuxInfo, err := m.tmux.GetSessionInfo(sessionID)
+	if err != nil {
+		// Non-fatal - return basic info
+		return info, nil
+	}
+
+	info.Attached = tmuxInfo.Attached
+	info.Windows = tmuxInfo.Windows
+
+	// Parse created time from tmux format (e.g., "Thu Dec 19 10:30:00 2025")
+	if tmuxInfo.Created != "" {
+		// Try common tmux date formats
+		formats := []string{
+			"Mon Jan 2 15:04:05 2006",
+			"Mon Jan _2 15:04:05 2006",
+			time.ANSIC,
+			time.UnixDate,
+		}
+		for _, format := range formats {
+			if t, err := time.Parse(format, tmuxInfo.Created); err == nil {
+				info.Created = t
+				break
+			}
+		}
+	}
+
+	return info, nil
 }
 
 // List returns information about all sessions for this rig.

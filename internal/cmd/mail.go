@@ -17,18 +17,20 @@ import (
 
 // Mail command flags
 var (
-	mailSubject     string
-	mailBody        string
-	mailPriority    string
-	mailType        string
-	mailReplyTo     string
-	mailNotify      bool
-	mailInboxJSON   bool
-	mailReadJSON    bool
-	mailInboxUnread bool
-	mailCheckInject bool
-	mailCheckJSON   bool
-	mailThreadJSON  bool
+	mailSubject       string
+	mailBody          string
+	mailPriority      string
+	mailType          string
+	mailReplyTo       string
+	mailNotify        bool
+	mailInboxJSON     bool
+	mailReadJSON      bool
+	mailInboxUnread   bool
+	mailCheckInject   bool
+	mailCheckJSON     bool
+	mailThreadJSON    bool
+	mailReplySubject  string
+	mailReplyMessage  string
 )
 
 var mailCmd = &cobra.Command{
@@ -137,6 +139,23 @@ Examples:
 	RunE: runMailThread,
 }
 
+var mailReplyCmd = &cobra.Command{
+	Use:   "reply <message-id>",
+	Short: "Reply to a message",
+	Long: `Reply to a specific message.
+
+This is a convenience command that automatically:
+- Sets the reply-to field to the original message
+- Prefixes the subject with "Re: " (if not already present)
+- Sends to the original sender
+
+Examples:
+  gt mail reply msg-abc123 -m "Thanks, working on it now"
+  gt mail reply msg-abc123 -s "Custom subject" -m "Reply body"`,
+	Args: cobra.ExactArgs(1),
+	RunE: runMailReply,
+}
+
 func init() {
 	// Send flags
 	mailSendCmd.Flags().StringVarP(&mailSubject, "subject", "s", "", "Message subject (required)")
@@ -161,6 +180,11 @@ func init() {
 	// Thread flags
 	mailThreadCmd.Flags().BoolVar(&mailThreadJSON, "json", false, "Output as JSON")
 
+	// Reply flags
+	mailReplyCmd.Flags().StringVarP(&mailReplySubject, "subject", "s", "", "Override reply subject (default: Re: <original>)")
+	mailReplyCmd.Flags().StringVarP(&mailReplyMessage, "message", "m", "", "Reply message body (required)")
+	mailReplyCmd.MarkFlagRequired("message")
+
 	// Add subcommands
 	mailCmd.AddCommand(mailSendCmd)
 	mailCmd.AddCommand(mailInboxCmd)
@@ -168,6 +192,7 @@ func init() {
 	mailCmd.AddCommand(mailDeleteCmd)
 	mailCmd.AddCommand(mailCheckCmd)
 	mailCmd.AddCommand(mailThreadCmd)
+	mailCmd.AddCommand(mailReplyCmd)
 
 	rootCmd.AddCommand(mailCmd)
 }
@@ -624,6 +649,71 @@ func runMailThread(cmd *cobra.Command, args []string) error {
 		if msg.Body != "" {
 			fmt.Printf("    %s\n", msg.Body)
 		}
+	}
+
+	return nil
+}
+
+func runMailReply(cmd *cobra.Command, args []string) error {
+	msgID := args[0]
+
+	// Find workspace
+	workDir, err := findBeadsWorkDir()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	// Determine current address
+	from := detectSender()
+
+	// Get the original message
+	router := mail.NewRouter(workDir)
+	mailbox, err := router.GetMailbox(from)
+	if err != nil {
+		return fmt.Errorf("getting mailbox: %w", err)
+	}
+
+	original, err := mailbox.Get(msgID)
+	if err != nil {
+		return fmt.Errorf("getting message: %w", err)
+	}
+
+	// Build reply subject
+	subject := mailReplySubject
+	if subject == "" {
+		if strings.HasPrefix(original.Subject, "Re: ") {
+			subject = original.Subject
+		} else {
+			subject = "Re: " + original.Subject
+		}
+	}
+
+	// Create reply message
+	reply := &mail.Message{
+		From:     from,
+		To:       original.From, // Reply to sender
+		Subject:  subject,
+		Body:     mailReplyMessage,
+		Type:     mail.TypeReply,
+		Priority: mail.PriorityNormal,
+		ReplyTo:  msgID,
+		ThreadID: original.ThreadID,
+	}
+
+	// If original has no thread ID, create one
+	if reply.ThreadID == "" {
+		reply.ThreadID = generateThreadID()
+	}
+
+	// Send the reply
+	if err := router.Send(reply); err != nil {
+		return fmt.Errorf("sending reply: %w", err)
+	}
+
+	fmt.Printf("%s Reply sent to %s\n", style.Bold.Render("✓"), original.From)
+	fmt.Printf("  Subject: %s\n", subject)
+	if original.ThreadID != "" {
+		fmt.Printf("  Thread: %s\n", style.Dim.Render(original.ThreadID))
 	}
 
 	return nil
