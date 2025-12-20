@@ -3,7 +3,9 @@ package daemon
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -117,6 +119,11 @@ func (d *Daemon) executeLifecycleAction(request *LifecycleRequest) error {
 
 	d.logger.Printf("Executing %s for session %s", request.Action, sessionName)
 
+	// Verify agent state shows requesting_<action>=true before killing
+	if err := d.verifyAgentRequestingState(request.From, request.Action); err != nil {
+		return fmt.Errorf("state verification failed: %w", err)
+	}
+
 	// Check if session exists
 	running, err := d.tmux.HasSession(sessionName)
 	if err != nil {
@@ -216,4 +223,61 @@ func (d *Daemon) closeMessage(id string) error {
 	cmd := exec.Command("bd", "close", id)
 	cmd.Dir = d.config.TownRoot
 	return cmd.Run()
+}
+
+// verifyAgentRequestingState verifies that the agent has set requesting_<action>=true
+// in its state.json before we kill its session. This ensures the agent is actually
+// ready to be killed and has completed its pre-shutdown tasks (git clean, handoff mail, etc).
+func (d *Daemon) verifyAgentRequestingState(identity string, action LifecycleAction) error {
+	stateFile := d.identityToStateFile(identity)
+	if stateFile == "" {
+		// If we can't determine state file, log warning but allow action
+		// This maintains backwards compatibility with agents that don't support state files yet
+		d.logger.Printf("Warning: cannot determine state file for %s, skipping verification", identity)
+		return nil
+	}
+
+	data, err := os.ReadFile(stateFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("agent state file not found: %s (agent must set requesting_%s=true before lifecycle request)", stateFile, action)
+		}
+		return fmt.Errorf("reading agent state: %w", err)
+	}
+
+	var state map[string]interface{}
+	if err := json.Unmarshal(data, &state); err != nil {
+		return fmt.Errorf("parsing agent state: %w", err)
+	}
+
+	// Check for requesting_<action>=true
+	key := "requesting_" + string(action)
+	val, ok := state[key]
+	if !ok {
+		return fmt.Errorf("agent state missing %s field (agent must set this before lifecycle request)", key)
+	}
+
+	requesting, ok := val.(bool)
+	if !ok || !requesting {
+		return fmt.Errorf("agent state %s is not true (got: %v)", key, val)
+	}
+
+	d.logger.Printf("Verified agent %s has %s=true", identity, key)
+	return nil
+}
+
+// identityToStateFile maps an agent identity to its state.json file path.
+func (d *Daemon) identityToStateFile(identity string) string {
+	switch identity {
+	case "mayor":
+		return filepath.Join(d.config.TownRoot, "mayor", "state.json")
+	default:
+		// Pattern: <rig>-witness → <townRoot>/<rig>/witness/state.json
+		if strings.HasSuffix(identity, "-witness") {
+			rigName := strings.TrimSuffix(identity, "-witness")
+			return filepath.Join(d.config.TownRoot, rigName, "witness", "state.json")
+		}
+		// Unknown identity - can't determine state file
+		return ""
+	}
 }
