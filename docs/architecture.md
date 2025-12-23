@@ -603,6 +603,70 @@ Patrol agents (long-running monitors) execute in infinite wisp loops:
 
 This gives patrols full audit trails without ledger bloat.
 
+### Dynamic Bonding: The Christmas Ornament Pattern
+
+Some workflows need **dynamic structure** - steps that emerge at runtime based
+on discovered work. Consider mol-witness-patrol: it monitors N polecats where
+N varies. A static molecule can't express "for each polecat, do these steps."
+
+The solution is **dynamic bonding** - spawning child molecules at runtime:
+
+```bash
+# In survey-workers step:
+for polecat in $(gt polecat list gastown); do
+  bd mol bond mol-polecat-arm $PATROL_WISP_ID --var polecat_name=$polecat
+done
+```
+
+This creates the **Christmas Ornament** shape:
+
+```
+                    ★ mol-witness-patrol (trunk)
+                   /|\
+            ┌─────┘ │ └─────┐
+            ●       ●       ●     mol-polecat-arm (dynamic arms)
+           ace     nux    toast
+            │       │       │
+         ┌──┴──┐ ┌──┴──┐ ┌──┴──┐
+         │steps│ │steps│ │steps│  (each arm has 4-5 steps)
+         └──┬──┘ └──┬──┘ └──┬──┘
+            └───────┴───────┘
+                    │
+                 ⬣ base (cleanup)
+```
+
+Arms execute in **parallel**. The `aggregate` step uses `WaitsFor: all-children`
+to gate until all dynamically-bonded children complete.
+
+See [molecular-chemistry.md](molecular-chemistry.md#dynamic-bonding-the-christmas-ornament-pattern)
+for full documentation.
+
+### The Activity Feed
+
+Dynamic bonding enables a **real-time activity feed** - structured work state
+instead of parsing agent logs:
+
+```
+[14:32:01] ✓ patrol-x7k.inbox-check completed
+[14:32:03] ✓ patrol-x7k.check-refinery completed
+[14:32:08] + patrol-x7k.arm-ace bonded (5 steps)
+[14:32:08] + patrol-x7k.arm-nux bonded (5 steps)
+[14:32:09] → patrol-x7k.arm-ace.capture in_progress
+[14:32:10] ✓ patrol-x7k.arm-ace.capture completed
+[14:32:14] ✓ patrol-x7k.arm-ace.decide completed (action: nudge-1)
+[14:32:17] ✓ patrol-x7k.arm-ace COMPLETE
+[14:32:23] ✓ patrol-x7k SQUASHED → digest-x7k
+```
+
+**This is what you want to see.** Not Claude's internal monologue. WORK STATE.
+
+The beads ledger becomes a real-time activity feed:
+- `bd activity --follow` - Stream state transitions
+- `bd activity --mol <id>` - Activity for specific molecule
+- Control plane IS data plane - state transitions are queryable data
+
+This transforms debugging from "read the logs" to "watch the feed."
+
 ### Step States
 
 ```

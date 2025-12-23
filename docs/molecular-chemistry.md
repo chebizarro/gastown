@@ -591,6 +591,165 @@ This ensures cross-phase references remain valid:
 - On squash: Replace placeholder with actual digest
 - Cross-phase references never break
 
+## Dynamic Bonding: The Christmas Ornament Pattern
+
+Static molecules have fixed steps defined at design time. But some workflows
+need **dynamic structure** - steps that emerge at runtime based on discovered work.
+
+### The Problem
+
+Consider mol-witness-patrol. The Witness monitors N polecats where N varies:
+- Sometimes 0 polecats (quiet rig)
+- Sometimes 8 polecats (busy swarm)
+- Polecats come and go during the patrol
+
+A static molecule can't express "for each polecat, do these steps."
+
+### The Solution: Dynamic Bond
+
+The **bond** operator becomes a runtime spawner:
+
+```bash
+# In survey-workers step:
+for polecat in $(gt polecat list gastown); do
+  bd mol bond mol-polecat-arm $PATROL_WISP_ID \
+    --var polecat_name=$polecat \
+    --var rig=gastown
+done
+```
+
+Each bond creates a **wisp child** under the patrol molecule:
+- `patrol-x7k.arm-ace` (5 steps)
+- `patrol-x7k.arm-nux` (5 steps)
+- `patrol-x7k.arm-toast` (5 steps)
+
+### The Christmas Ornament Shape
+
+```
+                         ★ mol-witness-patrol (trunk)
+                        /|\
+                       / | \
+            ┌─────────┘  │  └─────────┐
+            │            │            │
+         PREFLIGHT    DISCOVERY    CLEANUP
+            │            │            │
+        ┌───┴───┐    ┌───┴───┐    ┌───┴───┐
+        │inbox  │    │survey │    │aggreg │
+        │refnry │    │       │    │save   │
+        │load   │    │       │    │summary│
+        └───────┘    └───┬───┘    │contxt │
+                        │        │loop   │
+              ┌─────────┼─────────┐ └───────┘
+              │         │         │
+              ●         ●         ●    mol-polecat-arm
+             ace       nux      toast
+              │         │         │
+           ┌──┴──┐   ┌──┴──┐   ┌──┴──┐
+           │cap  │   │cap  │   │cap  │
+           │ass  │   │ass  │   │ass  │
+           │dec  │   │dec  │   │dec  │
+           │exec │   │exec │   │exec │
+           └──┬──┘   └──┬──┘   └──┬──┘
+              │         │         │
+              └─────────┴─────────┘
+                        │
+                     ⬣ base (cleanup)
+```
+
+The ornament **hangs from the Witness's pinned bead**. The star is the patrol
+head (preflight steps). Arms grow dynamically as polecats are discovered.
+The base (cleanup) runs after all arms complete.
+
+### The WaitsFor Directive
+
+A step that follows dynamic bonding needs to **wait for all children**:
+
+```markdown
+## Step: aggregate
+Collect outcomes from all polecat inspection arms.
+WaitsFor: all-children
+Needs: survey-workers
+```
+
+The `WaitsFor: all-children` directive makes this a **fanout gate** - it can't
+proceed until ALL dynamically-bonded children complete.
+
+### Parallelism
+
+Arms execute in **parallel**. Within an arm, steps are sequential:
+
+```
+survey-workers ─┬─ arm-ace ─┬─ aggregate
+                │   (seq)   │
+                ├─ arm-nux ─┤  (all arms parallel)
+                │   (seq)   │
+                └─ arm-toast┘
+```
+
+Agents can use subagents (Task tool) to work multiple arms simultaneously.
+
+### The Activity Feed
+
+Dynamic bonding enables a **real-time activity feed** - structured work state
+instead of agent logs:
+
+```
+[14:32:01] ✓ patrol-x7k.inbox-check completed
+[14:32:03] ✓ patrol-x7k.check-refinery completed
+[14:32:07] → patrol-x7k.survey-workers in_progress
+[14:32:08] + patrol-x7k.arm-ace bonded (5 steps)
+[14:32:08] + patrol-x7k.arm-nux bonded (5 steps)
+[14:32:08] + patrol-x7k.arm-toast bonded (5 steps)
+[14:32:08] ✓ patrol-x7k.survey-workers completed
+[14:32:09] → patrol-x7k.arm-ace.capture in_progress
+[14:32:10] ✓ patrol-x7k.arm-ace.capture completed
+[14:32:14] ✓ patrol-x7k.arm-ace.decide completed (action: nudge-1)
+[14:32:17] ✓ patrol-x7k.arm-ace COMPLETE
+[14:32:23] ✓ patrol-x7k SQUASHED → digest-x7k
+```
+
+This is what you want to see. Not logs. **WORK STATE.**
+
+The beads ledger becomes a real-time activity feed. Control plane IS data plane.
+
+### Variable Substitution
+
+Bonded molecules support variable substitution:
+
+```markdown
+## Molecule: polecat-arm
+Inspection cycle for {{polecat_name}} in {{rig}}.
+
+## Step: capture
+Capture tmux output for {{polecat_name}}.
+```bash
+tmux capture-pane -t gt-{{rig}}-{{polecat_name}} -p | tail -50
+```
+
+Variables are resolved at bond time, creating concrete wisp steps.
+
+### Squash Behavior
+
+At patrol end:
+- **Notable events**: Squash to digest with summary
+- **Routine cycle**: Burn without digest
+
+All arm wisps are children of the patrol wisp - they squash/burn together.
+
+### The Mol Mall
+
+mol-polecat-arm is **swappable** via variable:
+
+```markdown
+## Step: survey-workers
+For each polecat, bond: {{arm_molecule | default: mol-polecat-arm}}
+```
+
+Install alternatives from the Mol Mall:
+- `mol-polecat-arm-enterprise` (compliance checks)
+- `mol-polecat-arm-secure` (credential scanning)
+- `mol-polecat-arm-ml` (ML-based stuck detection)
+
 ## Summary of Operators
 
 | Operator | From | To | Effect |
