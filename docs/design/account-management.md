@@ -63,7 +63,7 @@ Highest priority override. Set this to use a specific account:
 
 ```bash
 export GT_ACCOUNT=yegge
-gt spawn gastown  # Uses yegge account
+gt sling <bead> gastown  # Uses yegge account
 ```
 
 ### Command Interface
@@ -100,13 +100,13 @@ gt account status
 
 ```bash
 # Override for a specific spawn
-gt spawn --account=yegge gastown
+gt sling <bead> gastown --account=yegge
 
 # Override for crew attach
 gt crew at --account=ghosttrack max
 
 # With env var (highest precedence)
-GT_ACCOUNT=yegge gt spawn gastown
+GT_ACCOUNT=yegge gt sling <bead> gastown
 ```
 
 ### Implementation Details
@@ -119,7 +119,7 @@ GT_ACCOUNT=yegge gt spawn gastown
 
 #### How Spawning Works
 
-When `gt spawn` or `gt crew at` runs Claude Code:
+When `gt sling` or `gt crew at` runs Claude Code:
 
 ```go
 func resolveAccountConfigDir() string {

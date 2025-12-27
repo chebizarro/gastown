@@ -267,7 +267,7 @@ Execute registered plugins whose gates are open.
 ## Limitations
 
 - **No polecat spawning**: Plugins cannot spawn polecats. If a plugin tries
-  to use `gt spawn`, behavior is undefined. This may change in the future.
+  to use `gt sling`, behavior is undefined. This may change in the future.
 
 - **No cross-plugin dependencies**: Plugins don't declare dependencies on
   each other. If ordering matters, mark both as `parallel: false`.

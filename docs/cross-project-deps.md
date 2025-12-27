@@ -127,7 +127,7 @@ bd list --has-external-block
 
 **Manual (launch):**
 ```bash
-gt spawn --continue gt-mol-root
+gt sling gt-mol-root
 # Spawns polecat, which reads handoff mail and continues
 ```
 
@@ -153,7 +153,7 @@ Deacon patrol checks parked molecules:
 ### Phase 2: Gas Town Integration (gt-* issues)
 
 1. **gt park command**: Set blocked_by, clear assignee, handoff, shutdown
-2. **gt spawn --continue**: Resume parked molecule
+2. **gt sling**: Resume parked molecule
 3. **Patrol step**: Check parked molecules for unblocked
 
 ### Phase 3: Automation (future)
@@ -213,7 +213,7 @@ gt park --step=gt-mol.3 --waiting="beads:mol-run-assignee"
 # Polecat shutting down.
 
 # Later, after beads ships:
-gt spawn --continue gt-mol-root
+gt sling gt-mol-root
 # Resuming molecule gt-mol-root...
 # Reading handoff context...
 # Continuing from step gt-mol.3

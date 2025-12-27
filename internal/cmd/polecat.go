@@ -94,7 +94,7 @@ var polecatWakeCmd = &cobra.Command{
 	Long: `Resume a polecat to working state.
 
 DEPRECATED: In the transient model, polecats are created fresh for each task
-via 'gt spawn'. This command is kept for backward compatibility.
+via 'gt sling'. This command is kept for backward compatibility.
 
 Transitions: done → working
 
@@ -509,7 +509,7 @@ func runPolecatRemove(cmd *cobra.Command, args []string) error {
 }
 
 func runPolecatWake(cmd *cobra.Command, args []string) error {
-	fmt.Println(style.Warning.Render("DEPRECATED: Use 'gt spawn' to create fresh polecats instead"))
+	fmt.Println(style.Warning.Render("DEPRECATED: Use 'gt sling' to create fresh polecats instead"))
 	fmt.Println()
 
 	rigName, polecatName, err := parseAddress(args[0])

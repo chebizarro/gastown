@@ -361,7 +361,7 @@ Putting it all together:
 
 ```
 1. Human files issue in Beads
-2. Mayor dispatches: gt spawn --issue <id>
+2. Mayor dispatches: gt sling --issue <id>
 3. Polecat created with:
    - Fresh worktree
    - mol-polecat-work pinned to hook

@@ -699,7 +699,7 @@ pending → in_progress → completed
 When a molecule is attached to an issue:
 
 ```bash
-gt spawn --issue gt-xyz --molecule mol-shiny
+gt sling gt-xyz <rig> --molecule mol-shiny
 ```
 
 1. Molecule is validated (steps, dependencies)
@@ -756,7 +756,7 @@ bd mol show mol-shiny
 bd mol bond mol-shiny --var feature_name="auth"
 
 # Spawn polecat with molecule
-gt spawn --issue gt-xyz --molecule mol-shiny
+gt sling gt-xyz <rig> --molecule mol-shiny
 ```
 
 ### Why Molecules?
@@ -1957,7 +1957,7 @@ gt capture <polecat> "<cmd>"     # Run command in polecat session
 ### Session Management
 
 ```bash
-gt spawn --issue <id> --molecule mol-shiny  # Spawn polecat with workflow
+gt sling <id> <rig> --molecule mol-shiny  # Spawn polecat with workflow
 gt handoff             # Polecat requests shutdown (run when done)
 gt session stop <p>    # Kill polecat session (Witness uses this)
 ```

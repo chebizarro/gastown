@@ -426,7 +426,7 @@ Unlike polecats, crew workers have no Witness oversight:
 ### Phase 3: Spawn & Lifecycle
 1. Port spawn injection prompts
 2. Add lifecycle templates (nudge, escalation)
-3. Integrate with `gt spawn` command
+3. Integrate with `gt sling` command
 
 ### Phase 4: CLI & Validation
 1. Implement `gt prime` with role detection

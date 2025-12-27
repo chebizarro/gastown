@@ -72,7 +72,7 @@ var (
 	slingVars     []string // --var flag: formula variables (key=value)
 	slingArgs     string   // --args flag: natural language instructions for executor
 
-	// Flags migrated from gt spawn for unified work assignment
+	// Flags migrated for polecat spawning (used by sling for work assignment
 	slingNaked    bool   // --naked: no-tmux mode (skip session creation)
 	slingCreate   bool   // --create: create polecat if it doesn't exist
 	slingMolecule string // --molecule: workflow to instantiate on the bead

@@ -65,7 +65,7 @@ gastown/                    ← This rig
 - `gt rigs` - List all rigs
 
 ### Work Management
-- `gt spawn --issue <id>` - Spawn polecat for issue
+- `gt sling <bead> <rig>` - Assign work to polecat in rig
 - `bd update <id> --status=in_progress` - Claim work
 
 ## Development
