@@ -31,6 +31,7 @@ var (
 	spawnMessage  string
 	spawnCreate   bool
 	spawnNoStart  bool
+	spawnNaked    bool
 	spawnPolecat  string
 	spawnRig      string
 	spawnMolecule string
@@ -60,11 +61,15 @@ molecule, or -m/--message for free-form tasks without a molecule.
 SIMPLER ALTERNATIVE: For quick polecat spawns, use 'gt sling':
   gt sling <bead> <rig>    # Auto-spawns polecat, hooks work, starts immediately
 
+NO-TMUX MODE: Use --naked to assign work without creating a tmux session.
+Agent must be started manually, but discovers work via gt prime on startup.
+
 Examples:
   gt spawn gastown/Toast --issue gt-abc    # uses mol-polecat-work
   gt spawn gastown --issue gt-def          # auto-select polecat
   gt spawn gastown/Nux -m "Fix the tests"  # free-form task (no molecule)
   gt spawn gastown/Capable --issue gt-xyz --create  # create if missing
+  gt spawn gastown/Toast --issue gt-abc --naked     # no-tmux mode
 
   # Flag-based selection (rig inferred from current directory):
   gt spawn --issue gt-xyz --polecat Angharad
@@ -102,6 +107,7 @@ func init() {
 	spawnCmd.Flags().StringVarP(&spawnMessage, "message", "m", "", "Free-form task description")
 	spawnCmd.Flags().BoolVar(&spawnCreate, "create", false, "Create polecat if it doesn't exist")
 	spawnCmd.Flags().BoolVar(&spawnNoStart, "no-start", false, "Assign work but don't start session")
+	spawnCmd.Flags().BoolVar(&spawnNaked, "naked", false, "No-tmux mode: assign work via mail only, skip tmux session (agent starts manually)")
 	spawnCmd.Flags().StringVar(&spawnPolecat, "polecat", "", "Polecat name (alternative to positional arg)")
 	spawnCmd.Flags().StringVar(&spawnRig, "rig", "", "Rig name (defaults to current directory's rig)")
 	spawnCmd.Flags().StringVar(&spawnMolecule, "molecule", "", "Molecule ID to instantiate on the issue")
@@ -425,6 +431,18 @@ func runSpawn(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("sending work assignment: %w", err)
 	}
 	fmt.Printf("%s Work assignment sent\n", style.Bold.Render("✓"))
+
+	// Stop here if --naked (no-tmux mode)
+	if spawnNaked {
+		fmt.Println()
+		fmt.Printf("%s\n", style.Bold.Render("🔧 NO-TMUX MODE (--naked)"))
+		fmt.Printf("Work assigned via mail. Agent must be started manually.\n\n")
+		fmt.Printf("To start the agent:\n")
+		fmt.Printf("  cd %s/%s/%s\n", townRoot, rigName, polecatName)
+		fmt.Printf("  claude            # Or: claude-code\n\n")
+		fmt.Printf("Agent will discover work via gt prime / bd show on startup.\n")
+		return nil
+	}
 
 	// Resolve account for Claude config
 	accountsPath := constants.MayorAccountsPath(townRoot)

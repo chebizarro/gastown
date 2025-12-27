@@ -572,6 +572,11 @@ func outputAttachmentStatus(ctx RoleContext) {
 	if attachment.AttachedAt != "" {
 		fmt.Printf("Attached at: %s\n", attachment.AttachedAt)
 	}
+	if attachment.AttachedArgs != "" {
+		fmt.Println()
+		fmt.Printf("%s\n", style.Bold.Render("📋 ARGS (use these to guide execution):"))
+		fmt.Printf("  %s\n", attachment.AttachedArgs)
+	}
 	fmt.Println()
 
 	// Show current step from molecule

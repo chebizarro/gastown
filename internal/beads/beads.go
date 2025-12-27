@@ -632,6 +632,7 @@ func (b *Beads) ClearMail(reason string) (*ClearMailResult, error) {
 type AttachmentFields struct {
 	AttachedMolecule string // Root issue ID of the attached molecule
 	AttachedAt       string // ISO 8601 timestamp when attached
+	AttachedArgs     string // Natural language args passed via gt sling --args (no-tmux mode)
 }
 
 // ParseAttachmentFields extracts attachment fields from an issue's description.
@@ -670,6 +671,9 @@ func ParseAttachmentFields(issue *Issue) *AttachmentFields {
 		case "attached_at", "attached-at", "attachedat":
 			fields.AttachedAt = value
 			hasFields = true
+		case "attached_args", "attached-args", "attachedargs":
+			fields.AttachedArgs = value
+			hasFields = true
 		}
 	}
 
@@ -694,6 +698,9 @@ func FormatAttachmentFields(fields *AttachmentFields) string {
 	if fields.AttachedAt != "" {
 		lines = append(lines, "attached_at: "+fields.AttachedAt)
 	}
+	if fields.AttachedArgs != "" {
+		lines = append(lines, "attached_args: "+fields.AttachedArgs)
+	}
 
 	return strings.Join(lines, "\n")
 }
@@ -704,12 +711,15 @@ func FormatAttachmentFields(fields *AttachmentFields) string {
 func SetAttachmentFields(issue *Issue, fields *AttachmentFields) string {
 	// Known attachment field keys (lowercase)
 	attachmentKeys := map[string]bool{
-		"attached_molecule":  true,
-		"attached-molecule":  true,
-		"attachedmolecule":   true,
-		"attached_at":        true,
-		"attached-at":        true,
-		"attachedat":         true,
+		"attached_molecule": true,
+		"attached-molecule": true,
+		"attachedmolecule":  true,
+		"attached_at":       true,
+		"attached-at":       true,
+		"attachedat":        true,
+		"attached_args":     true,
+		"attached-args":     true,
+		"attachedargs":      true,
 	}
 
 	// Collect non-attachment lines from existing description

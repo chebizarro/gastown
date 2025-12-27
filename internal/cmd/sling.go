@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -214,12 +215,69 @@ func runSling(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("%s Work attached to hook (pinned bead)\n", style.Bold.Render("✓"))
 
-	// Inject the "start now" prompt
-	if err := injectStartPrompt(targetPane, beadID, slingSubject, slingArgs); err != nil {
-		return fmt.Errorf("injecting start prompt: %w", err)
+	// Store args in bead description (no-tmux mode: beads as data plane)
+	if slingArgs != "" {
+		if err := storeArgsInBead(beadID, slingArgs); err != nil {
+			// Warn but don't fail - args will still be in the nudge prompt
+			fmt.Printf("%s Could not store args in bead: %v\n", style.Dim.Render("Warning:"), err)
+		} else {
+			fmt.Printf("%s Args stored in bead (durable)\n", style.Bold.Render("✓"))
+		}
 	}
 
-	fmt.Printf("%s Start prompt sent\n", style.Bold.Render("▶"))
+	// Try to inject the "start now" prompt (graceful if no tmux)
+	if targetPane == "" {
+		fmt.Printf("%s No pane to nudge (agent will discover work via gt prime)\n", style.Dim.Render("○"))
+	} else if err := injectStartPrompt(targetPane, beadID, slingSubject, slingArgs); err != nil {
+		// Graceful fallback for no-tmux mode
+		fmt.Printf("%s Could not nudge (no tmux?): %v\n", style.Dim.Render("○"), err)
+		fmt.Printf("  Agent will discover work via gt prime / bd show\n")
+	} else {
+		fmt.Printf("%s Start prompt sent\n", style.Bold.Render("▶"))
+	}
+
+	return nil
+}
+
+// storeArgsInBead stores args in the bead's description using attached_args field.
+// This enables no-tmux mode where agents discover args via gt prime / bd show.
+func storeArgsInBead(beadID, args string) error {
+	// Get the bead to preserve existing description content
+	showCmd := exec.Command("bd", "show", beadID, "--json")
+	out, err := showCmd.Output()
+	if err != nil {
+		return fmt.Errorf("fetching bead: %w", err)
+	}
+
+	// Parse the bead
+	var issues []beads.Issue
+	if err := json.Unmarshal(out, &issues); err != nil {
+		return fmt.Errorf("parsing bead: %w", err)
+	}
+	if len(issues) == 0 {
+		return fmt.Errorf("bead not found")
+	}
+	issue := &issues[0]
+
+	// Get or create attachment fields
+	fields := beads.ParseAttachmentFields(issue)
+	if fields == nil {
+		fields = &beads.AttachmentFields{}
+	}
+
+	// Set the args
+	fields.AttachedArgs = args
+
+	// Update the description
+	newDesc := beads.SetAttachmentFields(issue, fields)
+
+	// Update the bead
+	updateCmd := exec.Command("bd", "update", beadID, "--description="+newDesc)
+	updateCmd.Stderr = os.Stderr
+	if err := updateCmd.Run(); err != nil {
+		return fmt.Errorf("updating bead description: %w", err)
+	}
+
 	return nil
 }
 
@@ -485,9 +543,18 @@ func runSlingFormula(args []string) error {
 	}
 	fmt.Printf("%s Attached to hook (pinned bead)\n", style.Bold.Render("✓"))
 
-	// Step 4: Nudge to start
+	// Store args in wisp bead if provided (no-tmux mode: beads as data plane)
+	if slingArgs != "" {
+		if err := storeArgsInBead(wispResult.RootID, slingArgs); err != nil {
+			fmt.Printf("%s Could not store args in bead: %v\n", style.Dim.Render("Warning:"), err)
+		} else {
+			fmt.Printf("%s Args stored in bead (durable)\n", style.Bold.Render("✓"))
+		}
+	}
+
+	// Step 4: Nudge to start (graceful if no tmux)
 	if targetPane == "" {
-		fmt.Printf("%s No pane to nudge (target may need manual start)\n", style.Dim.Render("○"))
+		fmt.Printf("%s No pane to nudge (agent will discover work via gt prime)\n", style.Dim.Render("○"))
 		return nil
 	}
 
@@ -499,9 +566,12 @@ func runSlingFormula(args []string) error {
 	}
 	t := tmux.NewTmux()
 	if err := t.NudgePane(targetPane, prompt); err != nil {
-		return fmt.Errorf("nudging: %w", err)
+		// Graceful fallback for no-tmux mode
+		fmt.Printf("%s Could not nudge (no tmux?): %v\n", style.Dim.Render("○"), err)
+		fmt.Printf("  Agent will discover work via gt prime / bd show\n")
+	} else {
+		fmt.Printf("%s Nudged to start\n", style.Bold.Render("▶"))
 	}
-	fmt.Printf("%s Nudged to start\n", style.Bold.Render("▶"))
 
 	return nil
 }

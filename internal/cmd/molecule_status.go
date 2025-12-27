@@ -35,6 +35,7 @@ type MoleculeStatusInfo struct {
 	PinnedBead       *beads.Issue          `json:"pinned_bead,omitempty"`
 	AttachedMolecule string                `json:"attached_molecule,omitempty"`
 	AttachedAt       string                `json:"attached_at,omitempty"`
+	AttachedArgs     string                `json:"attached_args,omitempty"`
 	IsWisp           bool                  `json:"is_wisp"`
 	Progress         *MoleculeProgressInfo `json:"progress,omitempty"`
 	NextAction       string                `json:"next_action,omitempty"`
@@ -264,6 +265,7 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {
 		if attachment != nil {
 			status.AttachedMolecule = attachment.AttachedMolecule
 			status.AttachedAt = attachment.AttachedAt
+			status.AttachedArgs = attachment.AttachedArgs
 
 			// Check if it's a wisp (look for wisp indicator in description)
 			status.IsWisp = strings.Contains(pinnedBeads[0].Description, "wisp: true") ||
@@ -455,6 +457,9 @@ func outputMoleculeStatus(status MoleculeStatusInfo) error {
 		fmt.Printf("%s %s: %s\n", style.Bold.Render("🧬 "+molType+":"), status.AttachedMolecule, "")
 		if status.AttachedAt != "" {
 			fmt.Printf("   Attached: %s\n", status.AttachedAt)
+		}
+		if status.AttachedArgs != "" {
+			fmt.Printf("   %s %s\n", style.Bold.Render("Args:"), status.AttachedArgs)
 		}
 	} else {
 		fmt.Printf("%s\n", style.Dim.Render("No molecule attached"))
