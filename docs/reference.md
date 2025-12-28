@@ -228,8 +228,12 @@ gt handoff                   # Request cycle (context-aware)
 gt handoff --shutdown        # Terminate (polecats)
 gt session stop <rig>/<agent>
 gt peek <agent>              # Check health
-gt nudge <agent>             # Wake stuck worker
+gt nudge <agent> "message"   # Send message to agent
 ```
+
+**IMPORTANT**: Always use `gt nudge` to send messages to Claude sessions.
+Never use raw `tmux send-keys` - it doesn't handle Claude's input correctly.
+`gt nudge` uses literal mode + debounce + separate Enter for reliable delivery.
 
 ### Emergency
 ```bash
