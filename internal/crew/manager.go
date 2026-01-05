@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/git"
@@ -16,10 +17,35 @@ import (
 
 // Common errors
 var (
-	ErrCrewExists   = errors.New("crew worker already exists")
-	ErrCrewNotFound = errors.New("crew worker not found")
-	ErrHasChanges   = errors.New("crew worker has uncommitted changes")
+	ErrCrewExists      = errors.New("crew worker already exists")
+	ErrCrewNotFound    = errors.New("crew worker not found")
+	ErrHasChanges      = errors.New("crew worker has uncommitted changes")
+	ErrInvalidCrewName = errors.New("invalid crew name")
 )
+
+// validateCrewName checks that a crew name is safe and valid.
+// Rejects path traversal attempts and characters that break agent ID parsing.
+func validateCrewName(name string) error {
+	if name == "" {
+		return fmt.Errorf("%w: name cannot be empty", ErrInvalidCrewName)
+	}
+	if name == "." || name == ".." {
+		return fmt.Errorf("%w: %q is not allowed", ErrInvalidCrewName, name)
+	}
+	if strings.ContainsAny(name, "/\\") {
+		return fmt.Errorf("%w: %q contains path separators", ErrInvalidCrewName, name)
+	}
+	if strings.Contains(name, "..") {
+		return fmt.Errorf("%w: %q contains path traversal sequence", ErrInvalidCrewName, name)
+	}
+	// Reject characters that break agent ID parsing (same as rig names)
+	if strings.ContainsAny(name, "-. ") {
+		sanitized := strings.NewReplacer("-", "_", ".", "_", " ", "_").Replace(name)
+		sanitized = strings.ToLower(sanitized)
+		return fmt.Errorf("%w: %q contains invalid characters; hyphens, dots, and spaces are reserved for agent ID parsing. Try %q instead", ErrInvalidCrewName, name, sanitized)
+	}
+	return nil
+}
 
 // Manager handles crew worker lifecycle.
 type Manager struct {
@@ -58,6 +84,9 @@ func (m *Manager) exists(name string) bool {
 
 // Add creates a new crew worker with a clone of the rig.
 func (m *Manager) Add(name string, createBranch bool) (*CrewWorker, error) {
+	if err := validateCrewName(name); err != nil {
+		return nil, err
+	}
 	if m.exists(name) {
 		return nil, ErrCrewExists
 	}
@@ -143,6 +172,9 @@ func (m *Manager) Add(name string, createBranch bool) (*CrewWorker, error) {
 
 // Remove deletes a crew worker.
 func (m *Manager) Remove(name string, force bool) error {
+	if err := validateCrewName(name); err != nil {
+		return err
+	}
 	if !m.exists(name) {
 		return ErrCrewNotFound
 	}
@@ -195,6 +227,9 @@ func (m *Manager) List() ([]*CrewWorker, error) {
 
 // Get returns a specific crew worker by name.
 func (m *Manager) Get(name string) (*CrewWorker, error) {
+	if err := validateCrewName(name); err != nil {
+		return nil, err
+	}
 	if !m.exists(name) {
 		return nil, ErrCrewNotFound
 	}
@@ -289,6 +324,9 @@ func (m *Manager) Rename(oldName, newName string) error {
 // Pristine ensures a crew worker is up-to-date with remote.
 // It runs git pull --rebase and bd sync.
 func (m *Manager) Pristine(name string) (*PristineResult, error) {
+	if err := validateCrewName(name); err != nil {
+		return nil, err
+	}
 	if !m.exists(name) {
 		return nil, ErrCrewNotFound
 	}
