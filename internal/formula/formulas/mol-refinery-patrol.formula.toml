@@ -1,7 +1,7 @@
 description = """
 Merge queue processor patrol loop.
 
-The Refinery is the Engineer in the engine room. You process polecat branches, merging them to main one at a time with sequential rebasing.
+The Refinery is the Engineer in the engine room. You process polecat branches, merging them to the target branch one at a time with sequential rebasing.
 
 **The Scotty Test**: Before proceeding past any failure, ask yourself: "Would Scotty walk past a warp core leak because it existed before his shift?"
 
@@ -130,12 +130,18 @@ id = "process-branch"
 title = "Mechanical rebase"
 needs = ["queue-scan"]
 description = """
-Pick next branch from queue. Attempt mechanical rebase on current main.
+Pick next branch from queue. Attempt mechanical rebase on current target branch.
+
+**Step 0: Determine target branch** (if not already set)
+```bash
+TARGET_BRANCH=$(cat $(git rev-parse --show-toplevel)/../config.json 2>/dev/null | grep -o '"default_branch"[^,]*' | cut -d'"' -f4)
+TARGET_BRANCH=${TARGET_BRANCH:-main}
+```
 
 **Step 1: Checkout and attempt rebase**
 ```bash
 git checkout -b temp origin/<polecat-branch>
-git rebase origin/main
+git rebase origin/$TARGET_BRANCH
 ```
 
 **Step 2: Check rebase result**
@@ -164,8 +170,8 @@ git rebase --abort
 
 2. **Record conflict metadata**:
 ```bash
-# Capture main SHA for reference
-MAIN_SHA=$(git rev-parse origin/main)
+# Capture target branch SHA for reference
+TARGET_SHA=$(git rev-parse origin/$TARGET_BRANCH)
 BRANCH_SHA=$(git rev-parse origin/<polecat-branch>)
 ```
 
@@ -178,12 +184,12 @@ bd create --type=task --priority=1 \
 Original MR: <mr-bead-id>
 Branch: <polecat-branch>
 Original Issue: <issue-id>
-Conflict with main at: ${MAIN_SHA}
+Conflict with $TARGET_BRANCH at: ${TARGET_SHA}
 Branch SHA: ${BRANCH_SHA}
 
 ## Instructions
 1. Clone/checkout the branch
-2. Rebase on current main: git rebase origin/main
+2. Rebase on current target branch: git rebase origin/$TARGET_BRANCH
 3. Resolve conflicts
 4. Force push: git push -f origin <branch>
 5. Close this task when done
@@ -224,12 +230,12 @@ description = """
 If tests PASSED: This step auto-completes. Proceed to merge.
 
 If tests FAILED:
-1. Diagnose: Is this a branch regression or pre-existing on main?
+1. Diagnose: Is this a branch regression or pre-existing on the target branch?
 2. If branch caused it:
    - Abort merge
    - Notify polecat: "Tests failing. Please fix and resubmit."
    - Skip to loop-check
-3. If pre-existing on main:
+3. If pre-existing on the target branch:
    - File a bead: bd create --type=bug --priority=1 --title="..."
    - FORBIDDEN: Writing code to fix test failures. You merge branches, you do not develop.
    - Proceed with the merge if the failure is pre-existing (not caused by the branch).
@@ -245,16 +251,26 @@ This is non-negotiable. Never disavow. Never "note and proceed." """
 
 [[steps]]
 id = "merge-push"
-title = "Merge and push to main"
+title = "Merge and push to target branch"
 needs = ["handle-failures"]
 description = """
-Merge to main and push. CRITICAL: Notifications come IMMEDIATELY after push.
+Merge to target branch and push. CRITICAL: Notifications come IMMEDIATELY after push.
+
+**IMPORTANT**: The target branch is configured per-rig in config.json (default_branch field).
+It may be "main", "gastown", "develop", or another branch. Check your PRIME.md or run:
+```bash
+cat $(git rev-parse --show-toplevel)/../config.json | grep default_branch
+```
 
 **Step 1: Merge and Push**
 ```bash
-git checkout main
+# Use the rig's configured target branch (e.g., main, gastown, develop)
+TARGET_BRANCH=$(cat $(git rev-parse --show-toplevel)/../config.json 2>/dev/null | grep -o '"default_branch"[^,]*' | cut -d'"' -f4)
+TARGET_BRANCH=${TARGET_BRANCH:-main}  # fallback to main if not set
+
+git checkout $TARGET_BRANCH
 git merge --ff-only temp
-git push origin main
+git push origin $TARGET_BRANCH
 ```
 
 ⚠️ **STOP HERE - DO NOT PROCEED UNTIL STEPS 2-3 COMPLETE**
@@ -274,18 +290,18 @@ POLECAT WORKTREES ACCUMULATE INDEFINITELY AND THE LIFECYCLE BREAKS.
 
 **Step 3: Close MR Bead (REQUIRED - DO THIS IMMEDIATELY)**
 
-⚠️ **VERIFICATION BEFORE CLOSING**: Confirm the work is actually on main:
+⚠️ **VERIFICATION BEFORE CLOSING**: Confirm the work is actually on the target branch:
 ```bash
-# Get the commit message/issue from the branch
-git log origin/main --oneline | grep "<issue-id>"
-# OR verify the commit SHA is on main:
-git branch --contains <commit-sha> | grep main
+# Get the commit message/issue from the branch (use $TARGET_BRANCH from Step 1)
+git log origin/$TARGET_BRANCH --oneline | grep "<issue-id>"
+# OR verify the commit SHA is on target branch:
+git branch --contains <commit-sha> | grep $TARGET_BRANCH
 ```
 
-If work is NOT on main, DO NOT close the MR bead. Investigate first.
+If work is NOT on the target branch, DO NOT close the MR bead. Investigate first.
 
 ```bash
-bd close <mr-bead-id> --reason "Merged to main at $(git rev-parse --short HEAD)"
+bd close <mr-bead-id> --reason "Merged to $TARGET_BRANCH at $(git rev-parse --short HEAD)"
 ```
 
 The MR bead ID was in the MERGE_READY message or find via:
@@ -364,7 +380,7 @@ Include in summary:
 - Any escalations sent
 
 **Conflict tracking is important** for monitoring MQ health. If many branches
-conflict, it may indicate main is moving too fast or branches are too stale.
+conflict, it may indicate the target branch is moving too fast or branches are too stale.
 
 This becomes the digest when the patrol is squashed."""
 
@@ -419,9 +435,9 @@ bd list --type=merge-request --status=open
 
 For each open MR bead:
 1. Check if branch exists: `git ls-remote origin refs/heads/<branch>`
-2. If branch gone, verify work is on main: `git log origin/main --oneline | grep "<source_issue>"`
-3. If work on main → close MR with reason "Merged (verified on main)"
-4. If work NOT on main → investigate before closing:
+2. If branch gone, verify work is on target branch: `git log origin/$TARGET_BRANCH --oneline | grep "<source_issue>"`
+3. If work on target branch → close MR with reason "Merged (verified on $TARGET_BRANCH)"
+4. If work NOT on target branch → investigate before closing:
    - Check source_issue validity (should be gt-xxxxx, not branch name)
    - Search reflog/dangling commits if possible
    - If unverifiable, close with reason "Unverifiable - no audit trail"
