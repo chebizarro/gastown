@@ -55,8 +55,39 @@ Your agent bead last_activity is updated automatically during patrol.
 gt mail archive <message-id>
 ```
 
+**IDLE_DIRTY / IDLE_POLECAT**:
+Witnesses report idle polecats with uncommitted/unpushed work. The Deacon has
+FULL AUTHORITY to resolve these directly. NEVER escalate to the Mayor.
+
+Resolution protocol:
+1. Nudge the polecat to run `gt done`:
+```bash
+gt nudge <rig>/polecats/<name> "You are idle with no hooked work. Run gt done NOW to self-clean."
+```
+2. Wait 2-3 minutes for the polecat to respond:
+```bash
+sleep 150
+```
+3. Check if polecat session is still running:
+```bash
+gt session status <rig>/polecats/<name>
+```
+4. If still alive and idle (no hooked work), nuke it:
+```bash
+gt polecat nuke <name>
+```
+5. Archive the message:
+```bash
+gt mail archive <message-id>
+```
+
+Idle polecats are pure overhead. Their uncommitted work is either already
+pushed (safe to nuke) or lost context that a fresh polecat will redo better.
+This is routine cleanup - the Mayor should never see these.
+
 **HELP / Escalation**:
-Assess and handle or forward to Mayor.
+Assess and handle or forward to Mayor. Do NOT forward idle polecat alerts -
+those are handled above.
 Archive after handling:
 ```bash
 gt mail archive <message-id>
