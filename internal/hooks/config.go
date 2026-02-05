@@ -1,0 +1,233 @@
+// Package hooks provides centralized Claude Code hook management for Gas Town.
+//
+// It manages a base hook configuration and per-role/per-rig overrides,
+// generating .claude/settings.json files for all agents in the workspace.
+package hooks
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+// HookEntry represents a single hook matcher with its associated hooks.
+type HookEntry struct {
+	Matcher string `json:"matcher"`
+	Hooks   []Hook `json:"hooks"`
+}
+
+// Hook represents an individual hook command.
+type Hook struct {
+	Type    string `json:"type"`    // "command"
+	Command string `json:"command"`
+}
+
+// HooksConfig represents the hooks section of a Claude Code settings.json.
+type HooksConfig struct {
+	PreToolUse       []HookEntry `json:"PreToolUse,omitempty"`
+	PostToolUse      []HookEntry `json:"PostToolUse,omitempty"`
+	SessionStart     []HookEntry `json:"SessionStart,omitempty"`
+	Stop             []HookEntry `json:"Stop,omitempty"`
+	PreCompact       []HookEntry `json:"PreCompact,omitempty"`
+	UserPromptSubmit []HookEntry `json:"UserPromptSubmit,omitempty"`
+}
+
+// SettingsJSON represents the full Claude Code settings.json structure.
+// Non-hooks fields are preserved during sync.
+type SettingsJSON struct {
+	EditorMode     string            `json:"editorMode,omitempty"`
+	EnabledPlugins map[string]bool   `json:"enabledPlugins,omitempty"`
+	Hooks          HooksConfig       `json:"hooks"`
+}
+
+// Target represents a managed settings.json location.
+type Target struct {
+	Path string // Full path to .claude/settings.json
+	Key  string // Override key: "gastown/crew", "mayor", etc.
+	Rig  string // Rig name or empty for town-level
+	Role string // crew, witness, refinery, polecats, mayor, deacon
+}
+
+// gtDir returns the ~/.gt directory path.
+func gtDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(os.TempDir(), ".gt")
+	}
+	return filepath.Join(home, ".gt")
+}
+
+// BasePath returns the path to the base hooks config file.
+func BasePath() string {
+	return filepath.Join(gtDir(), "hooks-base.json")
+}
+
+// OverridePath returns the path to the override config for a given target.
+func OverridePath(target string) string {
+	// Replace "/" with "__" for filesystem safety (e.g., "gastown/crew" -> "gastown__crew")
+	safe := strings.ReplaceAll(target, "/", "__")
+	return filepath.Join(gtDir(), "hooks-overrides", safe+".json")
+}
+
+// OverridesDir returns the path to the overrides directory.
+func OverridesDir() string {
+	return filepath.Join(gtDir(), "hooks-overrides")
+}
+
+// LoadBase loads the base hooks configuration from ~/.gt/hooks-base.json.
+// Returns an error if the file doesn't exist or can't be parsed.
+func LoadBase() (*HooksConfig, error) {
+	return loadConfig(BasePath())
+}
+
+// LoadOverride loads an override configuration for the given target.
+// Returns an error if the file doesn't exist or can't be parsed.
+func LoadOverride(target string) (*HooksConfig, error) {
+	return loadConfig(OverridePath(target))
+}
+
+// SaveBase writes the base hooks configuration to ~/.gt/hooks-base.json.
+func SaveBase(cfg *HooksConfig) error {
+	return saveConfig(BasePath(), cfg)
+}
+
+// SaveOverride writes an override configuration for the given target.
+func SaveOverride(target string, cfg *HooksConfig) error {
+	return saveConfig(OverridePath(target), cfg)
+}
+
+// MarshalConfig serializes a HooksConfig to pretty-printed JSON.
+func MarshalConfig(cfg *HooksConfig) ([]byte, error) {
+	return json.MarshalIndent(cfg, "", "  ")
+}
+
+// ValidTarget returns true if the target string is a valid override target.
+// Valid targets are roles (crew, witness, etc.) or rig/role combinations.
+func ValidTarget(target string) bool {
+	validRoles := map[string]bool{
+		"crew": true, "witness": true, "refinery": true,
+		"polecats": true, "mayor": true, "deacon": true,
+	}
+
+	// Simple role target
+	if validRoles[target] {
+		return true
+	}
+
+	// Rig/role target (e.g., "gastown/crew")
+	parts := strings.SplitN(target, "/", 2)
+	if len(parts) == 2 && parts[0] != "" && validRoles[parts[1]] {
+		return true
+	}
+
+	return false
+}
+
+// DefaultBase returns a sensible default base configuration.
+// This includes PATH setup and gt prime hooks that all agents need.
+func DefaultBase() *HooksConfig {
+	pathSetup := `export PATH="$HOME/go/bin:$HOME/.local/bin:$PATH"`
+
+	return &HooksConfig{
+		SessionStart: []HookEntry{
+			{
+				Matcher: "",
+				Hooks: []Hook{
+					{
+						Type:    "command",
+						Command: fmt.Sprintf("%s && gt prime --hook", pathSetup),
+					},
+				},
+			},
+		},
+		PreCompact: []HookEntry{
+			{
+				Matcher: "",
+				Hooks: []Hook{
+					{
+						Type:    "command",
+						Command: fmt.Sprintf("%s && gt prime --hook", pathSetup),
+					},
+				},
+			},
+		},
+		UserPromptSubmit: []HookEntry{
+			{
+				Matcher: "",
+				Hooks: []Hook{
+					{
+						Type:    "command",
+						Command: fmt.Sprintf("%s && gt mail check --inject", pathSetup),
+					},
+				},
+			},
+		},
+		Stop: []HookEntry{
+			{
+				Matcher: "",
+				Hooks: []Hook{
+					{
+						Type:    "command",
+						Command: fmt.Sprintf("%s && gt costs record", pathSetup),
+					},
+				},
+			},
+		},
+	}
+}
+
+// GetApplicableOverrides returns the override keys in order of specificity
+// for a given target. More specific overrides are applied later (and win).
+//
+// Examples:
+//
+//	"gastown/crew" -> ["crew", "gastown/crew"]
+//	"mayor"        -> ["mayor"]
+//	"beads/witness" -> ["witness", "beads/witness"]
+func GetApplicableOverrides(target string) []string {
+	parts := strings.SplitN(target, "/", 2)
+	if len(parts) == 2 {
+		// Rig/role target: apply role override first, then rig+role
+		return []string{parts[1], target}
+	}
+	// Simple role target
+	return []string{target}
+}
+
+// loadConfig loads a HooksConfig from a JSON file.
+func loadConfig(path string) (*HooksConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var cfg HooksConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", path, err)
+	}
+
+	return &cfg, nil
+}
+
+// saveConfig writes a HooksConfig to a JSON file, creating directories as needed.
+func saveConfig(path string, cfg *HooksConfig) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("creating directory: %w", err)
+	}
+
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshaling config: %w", err)
+	}
+
+	// Add trailing newline for human editing
+	data = append(data, '\n')
+
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return fmt.Errorf("writing %s: %w", path, err)
+	}
+
+	return nil
+}
