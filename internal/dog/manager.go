@@ -352,10 +352,14 @@ func (m *Manager) Refresh(name string) error {
 		return fmt.Errorf("loading state: %w", err)
 	}
 
-	dogPath := m.dogDir(name)
-	newWorktrees := make(map[string]string)
+	// Refuse to refresh a working dog
+	if state.State == StateWorking {
+		return fmt.Errorf("dog %s is currently working; stop it first or use --force", name)
+	}
 
-	// Recreate each worktree
+	dogPath := m.dogDir(name)
+
+	// Recreate each worktree, saving progress as we go
 	for rigName := range m.rigsConfig.Rigs {
 		rigPath := filepath.Join(m.townRoot, rigName)
 		oldWorktreePath := state.Worktrees[rigName]
@@ -363,6 +367,10 @@ func (m *Manager) Refresh(name string) error {
 		// Find repo base
 		repoGit, err := m.findRepoBase(rigPath)
 		if err != nil {
+			// Save partial progress before returning
+			state.LastActive = time.Now()
+			state.UpdatedAt = time.Now()
+			_ = m.saveState(name, state)
 			return fmt.Errorf("finding repo base for %s: %w", rigName, err)
 		}
 
@@ -379,13 +387,17 @@ func (m *Manager) Refresh(name string) error {
 		// Create fresh worktree
 		worktreePath, err := m.createRigWorktree(dogPath, name, rigName)
 		if err != nil {
+			// Save partial progress before returning
+			state.Worktrees[rigName] = "" // old removed, new failed
+			state.LastActive = time.Now()
+			state.UpdatedAt = time.Now()
+			_ = m.saveState(name, state)
 			return fmt.Errorf("creating worktree for %s: %w", rigName, err)
 		}
-		newWorktrees[rigName] = worktreePath
+		state.Worktrees[rigName] = worktreePath
 	}
 
 	// Update state
-	state.Worktrees = newWorktrees
 	state.LastActive = time.Now()
 	state.UpdatedAt = time.Now()
 
@@ -405,6 +417,11 @@ func (m *Manager) RefreshRig(name, rigName string) error {
 	state, err := m.loadState(name)
 	if err != nil {
 		return fmt.Errorf("loading state: %w", err)
+	}
+
+	// Refuse to refresh a working dog
+	if state.State == StateWorking {
+		return fmt.Errorf("dog %s is currently working; stop it first or use --force", name)
 	}
 
 	dogPath := m.dogDir(name)
@@ -430,6 +447,11 @@ func (m *Manager) RefreshRig(name, rigName string) error {
 	// Create fresh worktree
 	worktreePath, err := m.createRigWorktree(dogPath, name, rigName)
 	if err != nil {
+		// Save state reflecting old worktree is gone
+		state.Worktrees[rigName] = ""
+		state.LastActive = time.Now()
+		state.UpdatedAt = time.Now()
+		_ = m.saveState(name, state)
 		return fmt.Errorf("creating worktree: %w", err)
 	}
 
