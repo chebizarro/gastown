@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -520,10 +521,12 @@ func runSling(cmd *cobra.Command, args []string) error {
 
 	// Hook the bead using bd update with retry logic.
 	// Dolt can fail with concurrency errors (HTTP 400) when multiple agents write simultaneously.
-	// We retry with exponential backoff and verify the hook actually stuck.
+	// We retry with exponential backoff + jitter and verify the hook actually stuck.
 	// See: https://github.com/steveyegge/gastown/issues/148
 	hookDir := beads.ResolveHookDir(townRoot, beadID, hookWorkDir)
-	const maxRetries = 3
+	const maxRetries = 10
+	const hookBaseBackoff = 500 * time.Millisecond
+	const hookBackoffMax = 30 * time.Second
 	skipVerify := os.Getenv("GT_TEST_SKIP_HOOK_VERIFY") != "" // For tests with stub bd
 	var lastErr error
 	for attempt := 1; attempt <= maxRetries; attempt++ {
@@ -533,7 +536,7 @@ func runSling(cmd *cobra.Command, args []string) error {
 		if err := hookCmd.Run(); err != nil {
 			lastErr = err
 			if attempt < maxRetries {
-				backoff := time.Duration(attempt*500) * time.Millisecond
+				backoff := slingBackoff(attempt, hookBaseBackoff, hookBackoffMax)
 				fmt.Printf("%s Hook attempt %d failed, retrying in %v...\n", style.Warning.Render("⚠"), attempt, backoff)
 				time.Sleep(backoff)
 				continue
@@ -551,7 +554,7 @@ func runSling(cmd *cobra.Command, args []string) error {
 		if verifyErr != nil {
 			lastErr = fmt.Errorf("verifying hook: %w", verifyErr)
 			if attempt < maxRetries {
-				backoff := time.Duration(attempt*500) * time.Millisecond
+				backoff := slingBackoff(attempt, hookBaseBackoff, hookBackoffMax)
 				fmt.Printf("%s Hook verification failed, retrying in %v...\n", style.Warning.Render("⚠"), backoff)
 				time.Sleep(backoff)
 				continue
@@ -563,7 +566,7 @@ func runSling(cmd *cobra.Command, args []string) error {
 			lastErr = fmt.Errorf("hook did not stick: status=%s, assignee=%s (expected hooked, %s)",
 				verifyInfo.Status, verifyInfo.Assignee, targetAgent)
 			if attempt < maxRetries {
-				backoff := time.Duration(attempt*500) * time.Millisecond
+				backoff := slingBackoff(attempt, hookBaseBackoff, hookBackoffMax)
 				fmt.Printf("%s %v, retrying in %v...\n", style.Warning.Render("⚠"), lastErr, backoff)
 				time.Sleep(backoff)
 				continue
@@ -683,6 +686,26 @@ func runSling(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// slingBackoff calculates exponential backoff with ±25% jitter for a given attempt (1-indexed).
+// Formula: base * 2^(attempt-1) * (1 ± 25% random), capped at max.
+func slingBackoff(attempt int, base, max time.Duration) time.Duration {
+	backoff := base
+	for i := 1; i < attempt; i++ {
+		backoff *= 2
+		if backoff > max {
+			backoff = max
+			break
+		}
+	}
+	// Apply ±25% jitter
+	jitter := 1.0 + (rand.Float64()-0.5)*0.5 // range [0.75, 1.25]
+	result := time.Duration(float64(backoff) * jitter)
+	if result > max {
+		result = max
+	}
+	return result
 }
 
 // rollbackSlingArtifacts cleans up artifacts left by a partial sling when session start fails.

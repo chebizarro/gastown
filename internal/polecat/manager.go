@@ -5,6 +5,7 @@ package polecat
 import (
 	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,11 +23,45 @@ import (
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
-// Retry constants for Dolt operations (matching hook update pattern in sling.go:492-539).
+// Retry constants for Dolt operations (matching hook update pattern in sling.go).
 const (
-	doltMaxRetries  = 3
+	doltMaxRetries  = 10
 	doltBaseBackoff = 500 * time.Millisecond
+	doltBackoffMax  = 30 * time.Second
 )
+
+// doltBackoff calculates exponential backoff with ±25% jitter for a given attempt (1-indexed).
+// Formula: base * 2^(attempt-1) * (1 ± 25% random), capped at doltBackoffMax.
+func doltBackoff(attempt int) time.Duration {
+	backoff := doltBaseBackoff
+	for i := 1; i < attempt; i++ {
+		backoff *= 2
+		if backoff > doltBackoffMax {
+			backoff = doltBackoffMax
+			break
+		}
+	}
+	// Apply ±25% jitter
+	jitter := 1.0 + (rand.Float64()-0.5)*0.5 // range [0.75, 1.25]
+	result := time.Duration(float64(backoff) * jitter)
+	if result > doltBackoffMax {
+		result = doltBackoffMax
+	}
+	return result
+}
+
+// isDoltOptimisticLockError returns true if the error is an optimistic lock / serialization failure.
+// These indicate transient write conflicts from concurrent Dolt operations — worth retrying.
+func isDoltOptimisticLockError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "optimistic lock") ||
+		strings.Contains(msg, "serialization failure") ||
+		strings.Contains(msg, "lock wait timeout") ||
+		strings.Contains(msg, "try restarting transaction")
+}
 
 // Common errors
 var (
@@ -111,13 +146,17 @@ func (m *Manager) CheckDoltHealth() error {
 			// Dolt is healthy — a "not found" error means the DB responded
 			return nil
 		}
+		// Optimistic lock errors mean Dolt is alive but busy with concurrent writes
+		if isDoltOptimisticLockError(err) {
+			return nil
+		}
 		// If beads isn't configured at all, skip the health check
 		if strings.Contains(err.Error(), "does not exist") || errors.Is(err, beads.ErrNotInstalled) {
 			return nil
 		}
 		lastErr = err
 		if attempt < doltMaxRetries {
-			backoff := time.Duration(attempt) * doltBaseBackoff
+			backoff := doltBackoff(attempt)
 			fmt.Printf("Warning: Dolt health check attempt %d failed, retrying in %v...\n", attempt, backoff)
 			time.Sleep(backoff)
 		}
@@ -168,7 +207,7 @@ func (m *Manager) createAgentBeadWithRetry(agentID string, fields *beads.AgentFi
 			return nil
 		}
 		if attempt < doltMaxRetries {
-			backoff := time.Duration(attempt) * doltBaseBackoff
+			backoff := doltBackoff(attempt)
 			fmt.Printf("Warning: agent bead creation attempt %d failed, retrying in %v: %v\n", attempt, backoff, err)
 			time.Sleep(backoff)
 		}
@@ -186,7 +225,7 @@ func (m *Manager) SetAgentStateWithRetry(name string, state string) error {
 		}
 		lastErr = err
 		if attempt < doltMaxRetries {
-			backoff := time.Duration(attempt) * doltBaseBackoff
+			backoff := doltBackoff(attempt)
 			fmt.Printf("Warning: SetAgentState attempt %d failed, retrying in %v: %v\n", attempt, backoff, err)
 			time.Sleep(backoff)
 		}
