@@ -704,16 +704,18 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 		}
 	}
 
-	// Close agent bead FIRST, before any filesystem operations.
+	// Reset agent bead FIRST, before any filesystem operations.
 	// This prevents a race where a concurrent sling allocates the same name,
-	// sets hook_bead, and then has it cleared by this cleanup. By closing
-	// the agent bead first, concurrent slings see a CLOSED bead and
-	// CreateOrReopenAgentBead safely reopens it with fresh state.
+	// sets hook_bead, and then has it cleared by this cleanup. By resetting
+	// the agent bead first (clearing fields, setting agent_state="nuked"),
+	// concurrent slings see a clean bead and CreateOrReopenAgentBead can
+	// simply update it without needing close/reopen (which fails on Dolt).
+	// See gt-14b8o: close/reopen cycle breaks on Dolt backend.
 	agentID := m.agentBeadID(name)
-	if err := m.beads.CloseAndClearAgentBead(agentID, "polecat removed"); err != nil {
+	if err := m.beads.ResetAgentBeadForReuse(agentID, "polecat removed"); err != nil {
 		// Only log if not "not found" - it's ok if it doesn't exist
 		if !errors.Is(err, beads.ErrNotFound) {
-			fmt.Printf("Warning: could not close agent bead %s: %v\n", agentID, err)
+			fmt.Printf("Warning: could not reset agent bead %s: %v\n", agentID, err)
 		}
 	}
 
@@ -946,14 +948,14 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
 		return nil, fmt.Errorf("creating fresh worktree from %s: %w", startPoint, err)
 	}
 
-	// New worktree created successfully — now safe to close old bead and remove old worktree.
-	// Closing the bead AFTER creation prevents inconsistent state if creation fails.
-	// NOTE: We use CloseAndClearAgentBead instead of DeleteAgentBead because bd delete --hard
-	// creates tombstones that cannot be reopened.
+	// New worktree created successfully — now safe to reset old bead and remove old worktree.
+	// Resetting the bead AFTER creation prevents inconsistent state if creation fails.
+	// NOTE: We use ResetAgentBeadForReuse instead of CloseAndClearAgentBead to avoid
+	// the close/reopen cycle that fails on Dolt backend (gt-14b8o).
 	agentID := m.agentBeadID(name)
-	if err := m.beads.CloseAndClearAgentBead(agentID, "polecat repair"); err != nil {
+	if err := m.beads.ResetAgentBeadForReuse(agentID, "polecat repair"); err != nil {
 		if !errors.Is(err, beads.ErrNotFound) {
-			fmt.Printf("Warning: could not close old agent bead %s: %v\n", agentID, err)
+			fmt.Printf("Warning: could not reset old agent bead %s: %v\n", agentID, err)
 		}
 	}
 

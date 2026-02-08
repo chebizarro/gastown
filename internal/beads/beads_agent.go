@@ -210,18 +210,19 @@ func (b *Beads) CreateAgentBead(id, title string, fields *AgentFields) (*Issue, 
 
 // CreateOrReopenAgentBead creates an agent bead or reopens an existing one.
 // This handles the case where a polecat is nuked and re-spawned with the same name:
-// the old agent bead exists as a closed bead, so we reopen and update it instead of
+// the old agent bead exists (open or closed), so we update it instead of
 // failing with a UNIQUE constraint error.
-//
-// NOTE: This does NOT handle tombstones. If the old bead was hard-deleted (creating
-// a tombstone), this function will fail. Use CloseAndClearAgentBead instead of DeleteAgentBead
-// when cleaning up agent beads to ensure they can be reopened later.
-//
 //
 // The function:
 // 1. Tries to create the agent bead
-// 2. If create fails, tries to reopen existing bead and update its fields
-// 3. If reopen also fails, returns the original create error
+// 2. If create fails, checks if bead exists (via bd show)
+// 3. If bead exists and is closed, reopens it
+// 4. Updates the bead with new fields regardless of prior state
+//
+// This is robust against Dolt backend issues where bd close/reopen may fail:
+// - If nuke used ResetAgentBeadForReuse (preferred), bead is open → update directly
+// - If nuke used CloseAndClearAgentBead (legacy), bead is closed → reopen then update
+// - If bead is in unknown state, falls back to show+update
 func (b *Beads) CreateOrReopenAgentBead(id, title string, fields *AgentFields) (*Issue, error) {
 	// First try to create the bead
 	issue, err := b.CreateAgentBead(id, title, fields)
@@ -229,19 +230,28 @@ func (b *Beads) CreateOrReopenAgentBead(id, title string, fields *AgentFields) (
 		return issue, nil
 	}
 
-	// Create failed - try to reopen existing bead instead of parsing error messages
-	// (error formats differ between SQLite and Dolt backends)
+	// Create failed - check if bead already exists (handles both open and closed states)
 	createErr := err
+
+	existing, showErr := b.Show(id)
+	if showErr != nil {
+		// Bead doesn't exist (or can't be read) - return original create error
+		return nil, createErr
+	}
 
 	// Resolve where this bead lives (for slot operations)
 	targetDir := ResolveRoutingTarget(b.getTownRoot(), id, b.getResolvedBeadsDir())
 
-	// Try to reopen - if bead doesn't exist, this will fail and we return createErr
-	if _, reopenErr := b.run("reopen", id, "--reason=re-spawning agent"); reopenErr != nil {
-		// If reopen fails, the bead might already be open - continue with update
-		// Otherwise return the original create error (more informative than reopen error)
-		if !strings.Contains(reopenErr.Error(), "already open") {
-			return nil, createErr
+	// If bead is closed, reopen it first
+	if existing.Status == "closed" {
+		if _, reopenErr := b.run("reopen", id, "--reason=re-spawning agent"); reopenErr != nil {
+			// Reopen failed - try setting status to open via update as fallback
+			// This handles Dolt backends where bd reopen may not work
+			openStatus := "open"
+			if updateErr := b.Update(id, UpdateOptions{Status: &openStatus}); updateErr != nil {
+				return nil, fmt.Errorf("could not reopen agent bead %s (reopen: %v, update: %v, original: %v)",
+					id, reopenErr, updateErr, createErr)
+			}
 		}
 	}
 
@@ -254,7 +264,7 @@ func (b *Beads) CreateOrReopenAgentBead(id, title string, fields *AgentFields) (
 		SetLabels:   []string{"gt:agent"},
 	}
 	if err := b.Update(id, updateOpts); err != nil {
-		return nil, fmt.Errorf("updating reopened agent bead: %w", err)
+		return nil, fmt.Errorf("updating agent bead: %w", err)
 	}
 	// Fix type separately — UpdateOptions doesn't support type changes
 	if _, err := b.run("update", id, "--type=agent"); err != nil {
@@ -278,6 +288,39 @@ func (b *Beads) CreateOrReopenAgentBead(id, title string, fields *AgentFields) (
 
 	// Return the updated bead
 	return b.Show(id)
+}
+
+// ResetAgentBeadForReuse clears all mutable fields on an agent bead without closing it.
+// This is the preferred cleanup method during polecat nuke because it avoids the
+// close/reopen cycle that fails on Dolt backends (tombstone operations not supported,
+// bd reopen failures). By keeping the bead open with agent_state="nuked",
+// CreateOrReopenAgentBead can simply update it on re-spawn without needing reopen.
+//
+// This replaces CloseAndClearAgentBead for the nuke path (gt-14b8o).
+func (b *Beads) ResetAgentBeadForReuse(id, reason string) error {
+	// Get current issue to preserve immutable fields (title, role_type, rig)
+	issue, err := b.Show(id)
+	if err != nil {
+		return err
+	}
+
+	// Parse existing fields and clear mutable ones
+	fields := ParseAgentFields(issue.Description)
+	fields.HookBead = ""      // Clear hook_bead
+	fields.ActiveMR = ""      // Clear active_mr
+	fields.CleanupStatus = "" // Clear cleanup_status
+	fields.AgentState = "nuked"
+
+	// Update description with cleared fields
+	description := FormatAgentDescription(issue.Title, fields)
+	if err := b.Update(id, UpdateOptions{Description: &description}); err != nil {
+		return fmt.Errorf("resetting agent bead fields: %w", err)
+	}
+
+	// Also clear the hook slot in the database
+	_ = b.ClearHookBead(id)
+
+	return nil
 }
 
 // UpdateAgentState updates the agent_state field in an agent bead.
