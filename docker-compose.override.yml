@@ -1,0 +1,31 @@
+# =============================================================================
+# Gas Town — Development Overrides
+# =============================================================================
+#
+# This file is automatically loaded by `docker compose up` and provides
+# development-friendly defaults. For production, use:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# =============================================================================
+
+services:
+  gastown:
+    # Rebuild from source on every `docker compose up --build`
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Mount source for faster iteration (rebuild still required for Go)
+    volumes:
+      - ${GT_HOME:-./data/gt}:/home/gt/gt
+      - ${GT_SPOOL_DIR:-./data/spool}:/home/gt/.local/share/gt/spool
+      - ${SSH_KEY_DIR:-~/.ssh}:/home/gt/.ssh:ro
+    environment:
+      # Development defaults
+      - GT_NOSTR_ENABLED=1
+      - GT_LOG_LEVEL=debug
+
+  relay:
+    # In dev, expose relay on a predictable port
+    ports:
+      - "7777:7000"

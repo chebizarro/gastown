@@ -1,6 +1,7 @@
 package events
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"os"
@@ -10,16 +11,9 @@ import (
 	gtnostr "github.com/steveyegge/gastown/internal/nostr"
 )
 
-// Correlations holds cross-reference data extracted from event payloads.
-// These become Nostr tags for filtering and discovery.
-type Correlations struct {
-	IssueID   string
-	ConvoyID  string
-	BeadID    string
-	SessionID string
-	Branch    string
-	MergeReq  string
-}
+// correlations is a local alias for the canonical nostr.Correlations type.
+// We use the local type for internal extraction then convert for publishing.
+type correlations = gtnostr.Correlations
 
 // Global publisher singleton for Nostr event publishing.
 var (
@@ -55,7 +49,7 @@ func getPublisher() *gtnostr.Publisher {
 		}
 
 		// Create signer from deacon identity
-		signer, err := gtnostr.NewNIP46Signer(nil, deaconID.Signer.Bunker)
+		signer, err := gtnostr.NewNIP46Signer(context.Background(), deaconID.Signer.Bunker)
 		if err != nil {
 			log.Printf("[events/nostr] Failed to create signer: %v", err)
 			publisherErr = err
@@ -68,7 +62,7 @@ func getPublisher() *gtnostr.Publisher {
 			runtimeDir = "."
 		}
 
-		publisher, err := gtnostr.NewPublisher(nil, cfg, signer, runtimeDir)
+		publisher, err := gtnostr.NewPublisher(context.Background(), cfg, signer, runtimeDir)
 		if err != nil {
 			log.Printf("[events/nostr] Failed to create publisher: %v", err)
 			publisherErr = err
@@ -113,19 +107,19 @@ func publishToNostr(event Event) {
 	}
 
 	// Publish (async - publisher handles spool fallback)
-	if err := publisher.Publish(nil, nostrEvent); err != nil {
+	if err := publisher.Publish(context.Background(), nostrEvent); err != nil {
 		log.Printf("[events/nostr] Publish failed for %s (spooled): %v", event.Type, err)
 	}
 }
 
 // extractCorrelations extracts cross-reference data from event payloads.
 // Each event type stores different fields in its payload map.
-func extractCorrelations(eventType string, payload map[string]interface{}) *Correlations {
+func extractCorrelations(eventType string, payload map[string]interface{}) *correlations {
 	if payload == nil {
 		return nil
 	}
 
-	c := &Correlations{}
+	c := &correlations{}
 
 	switch eventType {
 	case TypeSling:

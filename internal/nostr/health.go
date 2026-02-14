@@ -68,25 +68,43 @@ func CheckHealth(ctx context.Context, pool *RelayPool, spool *Spool, cfg *config
 		return status
 	}
 
-	// Check write relays
-	for _, url := range cfg.WriteRelays {
-		rs := RelayStatus{URL: url, Connected: false}
-		if pool != nil {
-			for _, rURL := range pool.WriteRelayURLs() {
-				if rURL == url {
+	// Check relay connection status
+	if pool != nil {
+		pool.mu.RLock()
+
+		// Check write relays
+		for _, url := range cfg.WriteRelays {
+			rs := RelayStatus{URL: url, Connected: false}
+			for _, relay := range pool.writeRelays {
+				if relay.URL == url && relay.IsConnected() {
 					rs.Connected = true
 					break
 				}
 			}
+			status.WriteRelays = append(status.WriteRelays, rs)
 		}
-		status.WriteRelays = append(status.WriteRelays, rs)
-	}
 
-	// Check read relays
-	for _, url := range cfg.ReadRelays {
-		rs := RelayStatus{URL: url, Connected: false}
-		// Read relay connection check is similar
-		status.ReadRelays = append(status.ReadRelays, rs)
+		// Check read relays
+		for _, url := range cfg.ReadRelays {
+			rs := RelayStatus{URL: url, Connected: false}
+			for _, relay := range pool.readRelays {
+				if relay.URL == url && relay.IsConnected() {
+					rs.Connected = true
+					break
+				}
+			}
+			status.ReadRelays = append(status.ReadRelays, rs)
+		}
+
+		pool.mu.RUnlock()
+	} else {
+		// No pool - all relays disconnected
+		for _, url := range cfg.WriteRelays {
+			status.WriteRelays = append(status.WriteRelays, RelayStatus{URL: url, Connected: false})
+		}
+		for _, url := range cfg.ReadRelays {
+			status.ReadRelays = append(status.ReadRelays, RelayStatus{URL: url, Connected: false})
+		}
 	}
 
 	// Signer status

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/config"
@@ -32,7 +33,7 @@ func NewOpenAIClient(cfg *config.APIConfig, apiKey string) (*OpenAIClient, error
 	}
 
 	return &OpenAIClient{
-		baseURL: cfg.BaseURL,
+		baseURL: strings.TrimRight(cfg.BaseURL, "/"),
 		apiKey:  apiKey,
 		model:   cfg.Model,
 		httpClient: &http.Client{
@@ -278,28 +279,15 @@ func convertTools(tools []ToolDef) []map[string]interface{} {
 
 func detectProvider(baseURL string) string {
 	switch {
-	case contains(baseURL, "ollama") || contains(baseURL, ":11434"):
+	case strings.Contains(baseURL, "ollama") || strings.Contains(baseURL, ":11434"):
 		return "ollama"
-	case contains(baseURL, "openai.com"):
+	case strings.Contains(baseURL, "openai.com"):
 		return "openai"
-	case contains(baseURL, "anthropic.com"):
+	case strings.Contains(baseURL, "anthropic.com"):
 		return "anthropic"
-	case contains(baseURL, ":8000"):
+	case strings.Contains(baseURL, ":8000"):
 		return "vllm"
 	default:
 		return "openai-compatible"
 	}
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && searchSubstring(s, substr))
-}
-
-func searchSubstring(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }

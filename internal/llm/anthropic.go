@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/config"
@@ -35,6 +36,7 @@ func NewAnthropicClient(cfg *config.APIConfig, apiKey string) (*AnthropicClient,
 	if baseURL == "" {
 		baseURL = "https://api.anthropic.com"
 	}
+	baseURL = strings.TrimRight(baseURL, "/")
 
 	timeout := 300 * time.Second
 	if cfg.TimeoutSeconds > 0 {

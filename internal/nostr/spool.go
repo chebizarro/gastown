@@ -294,7 +294,8 @@ func (s *Spool) readAllLocked() ([]SpoolEntry, error) {
 }
 
 func (s *Spool) writeAllLocked(entries []SpoolEntry) error {
-	f, err := os.Create(s.path)
+	// Use 0600 permissions for spool files (contain event data)
+	f, err := os.OpenFile(s.path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
 	}

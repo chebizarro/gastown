@@ -32,16 +32,21 @@ type Executor struct {
 	rigPath  string
 	townRoot string
 	actor    string // e.g., "rig/polecats/Toast"
+	role     string // e.g., "polecat", "witness", "deacon"
 }
 
 // NewExecutor creates a tool executor for a specific working directory.
-func NewExecutor(workDir, rigName, rigPath, townRoot, actor string) *Executor {
+func NewExecutor(workDir, rigName, rigPath, townRoot, actor, role string) *Executor {
+	if role == "" {
+		role = "polecat" // default for backward compatibility
+	}
 	return &Executor{
 		workDir:  workDir,
 		rigName:  rigName,
 		rigPath:  rigPath,
 		townRoot: townRoot,
 		actor:    actor,
+		role:     role,
 	}
 }
 
@@ -564,9 +569,10 @@ func (e *Executor) runCommand(ctx context.Context, name string, args []string, t
 
 	// Set GT environment variables
 	cmd.Env = append(os.Environ(),
-		"GT_ROLE=polecat",
+		"GT_ROLE="+e.role,
 		"GT_RIG="+e.rigName,
 		"GT_TOWN_ROOT="+e.townRoot,
+		"GT_ROOT="+e.townRoot, // alias for compatibility
 		"GT_ACTOR="+e.actor,
 	)
 
@@ -609,8 +615,35 @@ func (e *Executor) safePath(path string) (string, error) {
 		absPath = filepath.Clean(filepath.Join(e.workDir, path))
 	}
 
-	// Verify it's within the working directory
-	if !strings.HasPrefix(absPath, e.workDir) {
+	// Evaluate symlinks to prevent escaping via symlink chains
+	resolved, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		// If the target doesn't exist yet (e.g., file_write to new file),
+		// check the parent directory instead
+		parentDir := filepath.Dir(absPath)
+		resolvedParent, parentErr := filepath.EvalSymlinks(parentDir)
+		if parentErr != nil {
+			// Parent doesn't exist either - check without symlink resolution
+			resolved = absPath
+		} else {
+			resolved = filepath.Join(resolvedParent, filepath.Base(absPath))
+		}
+	}
+
+	// Also resolve workDir symlinks for a fair comparison
+	resolvedWorkDir, err := filepath.EvalSymlinks(e.workDir)
+	if err != nil {
+		resolvedWorkDir = e.workDir
+	}
+
+	// Use filepath.Rel to verify containment (more robust than HasPrefix)
+	rel, err := filepath.Rel(resolvedWorkDir, resolved)
+	if err != nil {
+		return "", fmt.Errorf("path %q is outside working directory", path)
+	}
+
+	// If the relative path escapes (starts with ".."), reject it
+	if strings.HasPrefix(rel, "..") {
 		return "", fmt.Errorf("path %q is outside working directory", path)
 	}
 

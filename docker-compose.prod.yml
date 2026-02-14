@@ -1,0 +1,64 @@
+# =============================================================================
+# Gas Town — Production Overrides
+# =============================================================================
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# This file:
+#   - Disables build (uses pre-built images)
+#   - Adds resource limits
+#   - Enables restart policies
+#   - Tightens security
+# =============================================================================
+
+services:
+  gastown:
+    image: gastown:${GT_VERSION:-latest}
+    build: !reset null
+    restart: always
+    environment:
+      - GT_NOSTR_ENABLED=1
+      - GT_LOG_LEVEL=info
+      # In production, sunset local paths once validated
+      - GT_EVENTS_LOCAL=${GT_EVENTS_LOCAL:-0}
+      - GT_FEED_CURATOR=${GT_FEED_CURATOR:-0}
+      - GT_CONVOY_LOCAL=${GT_CONVOY_LOCAL:-0}
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  relay:
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "25m"
+        max-file: "3"
+
+  blossom:
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

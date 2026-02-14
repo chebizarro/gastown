@@ -15,10 +15,6 @@ func NewClient(cfg *config.APIConfig) (Client, error) {
 		return nil, fmt.Errorf("APIConfig is nil")
 	}
 
-	if cfg.BaseURL == "" {
-		return nil, fmt.Errorf("base_url is required")
-	}
-
 	if cfg.Model == "" {
 		return nil, fmt.Errorf("model is required")
 	}
@@ -32,6 +28,12 @@ func NewClient(cfg *config.APIConfig) (Client, error) {
 	apiType := cfg.APIType
 	if apiType == "" {
 		apiType = "openai" // default
+	}
+
+	// Validate base_url: required for OpenAI-compatible endpoints,
+	// optional for Anthropic (defaults to api.anthropic.com)
+	if cfg.BaseURL == "" && apiType != "anthropic" {
+		return nil, fmt.Errorf("base_url is required for api_type %q", apiType)
 	}
 
 	switch apiType {

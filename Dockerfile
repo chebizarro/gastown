@@ -1,57 +1,132 @@
-# Run with
-# docker build -t gastown:latest -f Dockerfile .
-FROM docker/sandbox-templates:claude-code
+# =============================================================================
+# Gas Town (gt) — Nostr-Native Multi-Agent Orchestrator
+# =============================================================================
+# Multi-stage build producing a minimal runtime image with:
+#   - gt binary (CGO enabled)
+#   - bd (beads) binary
+#   - git, tmux, ssh, curl
+#   - Nostr spool directory + config mount points
+#
+# Build:
+#   docker build -t gastown:latest .
+#   docker build --build-arg GT_VERSION=v0.3.0 -t gastown:v0.3.0 .
+#
+# Run:
+#   docker run -d --name gastown \
+#     -v $HOME/gt:/home/gt/gt \
+#     -e GT_NOSTR_ENABLED=1 \
+#     gastown:latest
+# =============================================================================
 
-ARG GO_VERSION=1.25.8
-ARG DOLT_VERSION=2.0.7
+# ---------------------------------------------------------------------------
+# Stage 1: Build gt binary
+# ---------------------------------------------------------------------------
+FROM golang:1.25-bookworm AS builder
 
-USER root
+ARG GT_VERSION=dev
+ARG GT_COMMIT=unknown
+ARG GT_BUILD_TIME=unknown
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    build-essential \
+# CGO is required for some dependencies
+ENV CGO_ENABLED=1
+
+WORKDIR /build
+
+# Cache Go module downloads
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source and build
+COPY . .
+
+RUN go build \
+    -ldflags "-s -w \
+      -X github.com/steveyegge/gastown/internal/cmd.Version=${GT_VERSION} \
+      -X github.com/steveyegge/gastown/internal/cmd.Commit=${GT_COMMIT} \
+      -X github.com/steveyegge/gastown/internal/cmd.BuildTime=${GT_BUILD_TIME} \
+      -X github.com/steveyegge/gastown/internal/cmd.BuiltProperly=1" \
+    -o /build/gt ./cmd/gt
+
+# ---------------------------------------------------------------------------
+# Stage 2: Build beads (bd) binary
+# ---------------------------------------------------------------------------
+FROM golang:1.25-bookworm AS beads-builder
+
+ENV CGO_ENABLED=1
+
+WORKDIR /build
+
+# Install beads from the latest release
+RUN go install github.com/steveyegge/beads/cmd/bd@latest && \
+    cp $(go env GOPATH)/bin/bd /build/bd
+
+# ---------------------------------------------------------------------------
+# Stage 3: Runtime image
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+
+# Labels
+LABEL org.opencontainers.image.title="Gas Town"
+LABEL org.opencontainers.image.description="Nostr-native multi-agent orchestrator"
+LABEL org.opencontainers.image.source="https://github.com/steveyegge/gastown"
+LABEL org.opencontainers.image.licenses="MIT"
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
-    sqlite3 \
     tmux \
+    openssh-client \
+    ca-certificates \
     curl \
-    ripgrep \
-    zsh \
-    gh \
-    netcat-openbsd \
-    tini \
-    vim \
-    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+    jq \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install Go from official tarball (apt golang-go is too old)
-RUN ARCH=$(dpkg --print-architecture) && \
-    curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz" | tar -C /usr/local -xz
-ENV PATH="/app/gastown:/usr/local/go/bin:/home/agent/go/bin:${PATH}"
+# Create non-root user for gastown
+RUN groupadd -r gt && useradd -r -g gt -m -d /home/gt -s /bin/bash gt
 
-# Install beads (bd) and dolt
-RUN curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
-RUN curl -fsSL https://github.com/dolthub/dolt/releases/download/v${DOLT_VERSION}/install.sh | bash
+# Copy binaries from build stages
+COPY --from=builder /build/gt /usr/local/bin/gt
+COPY --from=beads-builder /build/bd /usr/local/bin/bd
 
-# Set up directories
-RUN mkdir -p /app /gt /gt/.dolt-data && chown -R agent:agent /app /gt
+# Copy example configs for reference
+COPY docs/examples/ /usr/share/gastown/examples/
+COPY templates/ /usr/share/gastown/templates/
 
-# Environment setup for bash and zsh
-RUN echo 'export PATH="/app/gastown:$PATH"' >> /etc/profile.d/gastown.sh && \
-    echo 'export PATH="/app/gastown:$PATH"' >> /etc/zsh/zshenv
-RUN echo 'export COLORTERM="truecolor"' >> /etc/profile.d/colorterm.sh && \
-    echo 'export COLORTERM="truecolor"' >> /etc/zsh/zshenv
-RUN echo 'export TERM="xterm-256color"' >> /etc/profile.d/term.sh && \
-    echo 'export TERM="xterm-256color"' >> /etc/zsh/zshenv
+# Create standard directories
+RUN mkdir -p \
+    /home/gt/gt \
+    /home/gt/.config/gt \
+    /home/gt/.local/share/gt/spool \
+    /home/gt/.ssh \
+    && chown -R gt:gt /home/gt
 
-USER agent
+# Configure git for container use
+RUN git config --system init.defaultBranch main && \
+    git config --system safe.directory '*'
 
-COPY --chown=agent:agent . /app/gastown
+# Switch to non-root user
+USER gt
+WORKDIR /home/gt
 
-RUN cd /app/gastown && make build
+# Configure git identity (can be overridden via env)
+RUN git config --global user.name "Gas Town" && \
+    git config --global user.email "gt@gastown.local"
 
-COPY --chown=agent:agent docker-entrypoint.sh /app/docker-entrypoint.sh
-RUN chmod +x /app/docker-entrypoint.sh
+# Environment defaults
+ENV GT_HOME=/home/gt/gt
+ENV GT_NOSTR_ENABLED=0
+ENV GT_NOSTR_CONFIG=/home/gt/gt/.nostr.json
+ENV GT_SPOOL_DIR=/home/gt/.local/share/gt/spool
+ENV PATH="/usr/local/bin:${PATH}"
 
-WORKDIR /gt
+# Health check — uses gt doctor when available, falls back to process check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD gt doctor --quiet 2>/dev/null || pgrep -x gt > /dev/null || exit 1
 
-ENTRYPOINT ["tini", "--", "/app/docker-entrypoint.sh"]
-CMD ["sleep", "infinity"]
+# Expose MCP server port (when running in MCP provider mode)
+EXPOSE 9500
+
+# Default entrypoint — starts the gt daemon
+# Override with: docker run gastown gt <any-command>
+ENTRYPOINT ["gt"]
+CMD ["daemon", "start", "--foreground"]
