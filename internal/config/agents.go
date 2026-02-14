@@ -76,6 +76,98 @@ type AgentPresetInfo struct {
 
 	// NonInteractive contains settings for non-interactive mode.
 	NonInteractive *NonInteractiveConfig `json:"non_interactive,omitempty"`
+
+	// ProviderType determines the execution model.
+	// "cli" (default) = tmux session, "api" = Go agent loop, "mcp" = external MCP agent.
+	ProviderType ProviderType `json:"provider_type,omitempty"`
+
+	// API holds configuration for provider_type="api" agents.
+	API *APIConfig `json:"api,omitempty"`
+
+	// MCP holds configuration for provider_type="mcp" agents.
+	MCP *MCPConfig `json:"mcp,omitempty"`
+}
+
+// ProviderType determines how an agent process is managed.
+type ProviderType string
+
+const (
+	// ProviderCLI is the default — agent runs as a CLI process in a tmux session.
+	ProviderCLI ProviderType = "cli"
+	// ProviderAPI means Gastown runs an agent loop in Go, calling a remote LLM API.
+	ProviderAPI ProviderType = "api"
+	// ProviderMCP means the agent runs externally and connects back via MCP for tools.
+	ProviderMCP ProviderType = "mcp"
+)
+
+// APIConfig holds configuration for ProviderAPI agents.
+// This enables calling remote LLMs via OpenAI-compatible or Anthropic APIs.
+type APIConfig struct {
+	// BaseURL is the API endpoint.
+	// Examples: "http://192.168.1.50:11434/v1" (Ollama), "https://api.openai.com/v1"
+	BaseURL string `json:"base_url"`
+
+	// Model is the model identifier (e.g., "llama3.1:70b", "gpt-4o").
+	Model string `json:"model"`
+
+	// APIKey is the API key. Can reference env var: "$OPENAI_API_KEY".
+	APIKey string `json:"api_key,omitempty"`
+
+	// APIType selects the wire protocol: "openai" (default) or "anthropic".
+	APIType string `json:"api_type,omitempty"`
+
+	// MaxTokens is the maximum tokens per response. Default: 4096.
+	MaxTokens int `json:"max_tokens,omitempty"`
+
+	// Temperature controls randomness. Default: 0.0 (deterministic).
+	Temperature *float64 `json:"temperature,omitempty"`
+
+	// SupportsTools indicates if the model supports function-calling.
+	SupportsTools bool `json:"supports_tools"`
+
+	// SupportsVision indicates if the model can process images.
+	SupportsVision bool `json:"supports_vision,omitempty"`
+
+	// ContextWindow is the model's context window size in tokens.
+	ContextWindow int `json:"context_window,omitempty"`
+
+	// SystemPrompt overrides the role-specific default system prompt.
+	SystemPrompt string `json:"system_prompt,omitempty"`
+
+	// Headers are additional HTTP headers for the API request.
+	Headers map[string]string `json:"headers,omitempty"`
+
+	// TimeoutSeconds is the HTTP request timeout. Default: 300.
+	TimeoutSeconds int `json:"timeout_seconds,omitempty"`
+
+	// Retry controls retry behavior on transient failures.
+	Retry *RetryConfig `json:"retry,omitempty"`
+}
+
+// RetryConfig controls retry behavior for API calls.
+type RetryConfig struct {
+	MaxRetries     int `json:"max_retries"`        // Default: 3
+	InitialBackoff int `json:"initial_backoff_ms"`  // Default: 1000
+	MaxBackoff     int `json:"max_backoff_ms"`      // Default: 30000
+}
+
+// MCPConfig holds configuration for ProviderMCP agents.
+type MCPConfig struct {
+	// ServerURL is the MCP server endpoint that Gastown runs.
+	ServerURL string `json:"server_url"`
+
+	// TransportType is the MCP transport: "sse" (default), "stdio", "ws".
+	TransportType string `json:"transport_type,omitempty"`
+
+	// AuthToken is a bearer token for MCP server authentication.
+	// Can reference env var: "$GT_MCP_TOKEN".
+	AuthToken string `json:"auth_token,omitempty"`
+
+	// ExposedTools restricts which GT tools are exposed. Default: all.
+	ExposedTools []string `json:"exposed_tools,omitempty"`
+
+	// RemoteAgentURL is optional — for bidirectional MCP communication.
+	RemoteAgentURL string `json:"remote_agent_url,omitempty"`
 }
 
 // NonInteractiveConfig contains settings for running agents non-interactively.
@@ -364,10 +456,13 @@ func RuntimeConfigFromPreset(preset AgentPreset) *RuntimeConfig {
 	}
 
 	rc := &RuntimeConfig{
-		Provider: string(info.Name),
-		Command: info.Command,
-		Args:    append([]string(nil), info.Args...), // Copy to avoid mutation
-		Env:     envCopy,
+		Provider:     string(info.Name),
+		Command:      info.Command,
+		Args:         append([]string(nil), info.Args...), // Copy to avoid mutation
+		Env:          envCopy,
+		ProviderType: info.ProviderType,
+		API:          info.API,
+		MCP:          info.MCP,
 	}
 
 	// Resolve command path for claude preset (handles alias installations)
@@ -454,6 +549,9 @@ func (rc *RuntimeConfig) MergeWithPreset(preset AgentPreset) *RuntimeConfig {
 		Command:       rc.Command,
 		Args:          append([]string(nil), rc.Args...),
 		InitialPrompt: rc.InitialPrompt,
+		ProviderType:  rc.ProviderType,
+		API:           rc.API,
+		MCP:           rc.MCP,
 	}
 
 	// Apply preset defaults only if not overridden
@@ -462,6 +560,17 @@ func (rc *RuntimeConfig) MergeWithPreset(preset AgentPreset) *RuntimeConfig {
 	}
 	if len(result.Args) == 0 {
 		result.Args = append([]string(nil), info.Args...)
+	}
+
+	// Inherit provider type from preset if not set on runtime config
+	if result.ProviderType == "" && info.ProviderType != "" {
+		result.ProviderType = info.ProviderType
+	}
+	if result.API == nil && info.API != nil {
+		result.API = info.API
+	}
+	if result.MCP == nil && info.MCP != nil {
+		result.MCP = info.MCP
 	}
 
 	return result

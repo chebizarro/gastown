@@ -4024,3 +4024,652 @@ func TestMergeQueueConfig_PartialJSON_NilPointers(t *testing.T) {
 		t.Errorf("IntegrationBranchAutoLand should be nil when omitted, got %v", *cfg.IntegrationBranchAutoLand)
 	}
 }
+
+// --- Nostr Config Tests ---
+
+func TestNostrConfigRoundTrip(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings", "nostr.json")
+
+	original := &NostrConfig{
+		Type:    "nostr",
+		Version: 1,
+		Enabled: true,
+		ReadRelays:     []string{"wss://relay1.example.com", "wss://relay2.example.com"},
+		WriteRelays:    []string{"wss://relay1.example.com"},
+		BlossomServers: []string{"https://blossom.example.com"},
+		DMRelays:       []string{"wss://dm.example.com"},
+		Identities: map[string]*NostrIdentity{
+			"deacon": {
+				Pubkey: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+				Signer: SignerConfig{
+					Type:   "nip46",
+					Bunker: "bunker://npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq9test?relay=wss://bunker.example.com",
+				},
+				Profile: &AgentProfile{
+					Name:        "deacon",
+					DisplayName: "Test Deacon",
+					About:       "Test deacon agent",
+					Bot:         true,
+				},
+			},
+		},
+		Defaults: DefaultNostrDefaults(),
+	}
+
+	if err := SaveNostrConfig(path, original); err != nil {
+		t.Fatalf("SaveNostrConfig: %v", err)
+	}
+
+	// Verify file permissions (0600 for sensitive bunker URIs)
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if runtime.GOOS != "windows" {
+		if perm := info.Mode().Perm(); perm != 0600 {
+			t.Errorf("file permissions = %o, want 0600", perm)
+		}
+	}
+
+	loaded, err := LoadNostrConfig(path)
+	if err != nil {
+		t.Fatalf("LoadNostrConfig: %v", err)
+	}
+
+	if !loaded.Enabled {
+		t.Error("Enabled = false, want true")
+	}
+	if len(loaded.ReadRelays) != 2 {
+		t.Errorf("ReadRelays count = %d, want 2", len(loaded.ReadRelays))
+	}
+	if len(loaded.WriteRelays) != 1 {
+		t.Errorf("WriteRelays count = %d, want 1", len(loaded.WriteRelays))
+	}
+	if len(loaded.BlossomServers) != 1 {
+		t.Errorf("BlossomServers count = %d, want 1", len(loaded.BlossomServers))
+	}
+
+	deacon, ok := loaded.Identities["deacon"]
+	if !ok {
+		t.Fatal("missing 'deacon' identity")
+	}
+	if deacon.Profile == nil || deacon.Profile.DisplayName != "Test Deacon" {
+		t.Errorf("deacon profile = %v, want DisplayName='Test Deacon'", deacon.Profile)
+	}
+	if !deacon.Profile.Bot {
+		t.Error("deacon Profile.Bot = false, want true")
+	}
+}
+
+func TestNostrConfigDefaults(t *testing.T) {
+	t.Parallel()
+
+	config := NewNostrConfig()
+
+	if config.Enabled {
+		t.Error("default Enabled should be false")
+	}
+	if config.Type != "nostr" {
+		t.Errorf("Type = %q, want 'nostr'", config.Type)
+	}
+	if config.Version != CurrentNostrConfigVersion {
+		t.Errorf("Version = %d, want %d", config.Version, CurrentNostrConfigVersion)
+	}
+	if config.Defaults == nil {
+		t.Fatal("Defaults should not be nil")
+	}
+	if config.Defaults.HeartbeatIntervalSec != 60 {
+		t.Errorf("HeartbeatIntervalSec = %d, want 60", config.Defaults.HeartbeatIntervalSec)
+	}
+	if config.Defaults.SpoolDrainIntervalSec != 30 {
+		t.Errorf("SpoolDrainIntervalSec = %d, want 30", config.Defaults.SpoolDrainIntervalSec)
+	}
+}
+
+func TestNostrConfigValidation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		config  *NostrConfig
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name: "valid disabled config (no write relays needed)",
+			config: &NostrConfig{
+				Type:    "nostr",
+				Version: 1,
+				Enabled: false,
+			},
+			wantErr: false,
+		},
+		{
+			name: "enabled requires write relays",
+			config: &NostrConfig{
+				Type:    "nostr",
+				Version: 1,
+				Enabled: true,
+			},
+			wantErr: true,
+			errMsg:  "write_relays",
+		},
+		{
+			name: "invalid type",
+			config: &NostrConfig{
+				Type:    "wrong",
+				Version: 1,
+			},
+			wantErr: true,
+			errMsg:  "expected type 'nostr'",
+		},
+		{
+			name: "future version",
+			config: &NostrConfig{
+				Type:    "nostr",
+				Version: 999,
+			},
+			wantErr: true,
+			errMsg:  "unsupported config version",
+		},
+		{
+			name: "invalid relay URL",
+			config: &NostrConfig{
+				Type:        "nostr",
+				Version:     1,
+				Enabled:     true,
+				WriteRelays: []string{"wss://good.example.com"},
+				ReadRelays:  []string{"http://not-a-relay.com"},
+			},
+			wantErr: true,
+			errMsg:  "must start with wss://",
+		},
+		{
+			name: "invalid blossom URL",
+			config: &NostrConfig{
+				Type:           "nostr",
+				Version:        1,
+				Enabled:        true,
+				WriteRelays:    []string{"wss://relay.example.com"},
+				BlossomServers: []string{"ftp://wrong.com"},
+			},
+			wantErr: true,
+			errMsg:  "blossom_servers",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "nostr.json")
+
+			data, _ := json.MarshalIndent(tc.config, "", "  ")
+			if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err := LoadNostrConfig(path)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				if tc.errMsg != "" && !strings.Contains(err.Error(), tc.errMsg) {
+					t.Errorf("error %q should contain %q", err.Error(), tc.errMsg)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestNostrConfigNsecRejection(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nostr.json")
+
+	// Config with nsec in pubkey field
+	config := &NostrConfig{
+		Type:    "nostr",
+		Version: 1,
+		Enabled: true,
+		WriteRelays: []string{"wss://relay.example.com"},
+		Identities: map[string]*NostrIdentity{
+			"deacon": {
+				Pubkey: "nsec1badbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadb",
+				Signer: SignerConfig{
+					Type:   "nip46",
+					Bunker: "bunker://npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq9test?relay=wss://bunker.example.com",
+				},
+			},
+		},
+	}
+
+	data, _ := json.MarshalIndent(config, "", "  ")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := LoadNostrConfig(path)
+	if err == nil {
+		t.Fatal("expected error for nsec in config")
+	}
+	if !strings.Contains(err.Error(), "nsec detected") {
+		t.Errorf("error %q should mention nsec detection", err.Error())
+	}
+}
+
+func TestNostrConfigBunkerValidation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		bunker  string
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name:    "valid bunker URI",
+			bunker:  "bunker://npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq9test?relay=wss://bunker.example.com",
+			wantErr: false,
+		},
+		{
+			name:    "missing scheme",
+			bunker:  "npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq9test?relay=wss://bunker.example.com",
+			wantErr: true,
+			errMsg:  "must start with bunker://",
+		},
+		{
+			name:    "missing relay param",
+			bunker:  "bunker://npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq9test",
+			wantErr: true,
+			errMsg:  "relay=",
+		},
+		{
+			name:    "missing npub",
+			bunker:  "bunker://deadbeef?relay=wss://bunker.example.com",
+			wantErr: true,
+			errMsg:  "npub1",
+		},
+		{
+			name:    "empty URI",
+			bunker:  "",
+			wantErr: true,
+			errMsg:  "bunker URI is empty",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateBunkerURI(tc.bunker)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				if tc.errMsg != "" && !strings.Contains(err.Error(), tc.errMsg) {
+					t.Errorf("error %q should contain %q", err.Error(), tc.errMsg)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestNostrConfigPubkeyValidation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		pubkey  string
+		wantErr bool
+	}{
+		{
+			name:    "valid hex pubkey",
+			pubkey:  "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+			wantErr: false,
+		},
+		{
+			name:    "valid npub",
+			pubkey:  "npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq9test",
+			wantErr: false,
+		},
+		{
+			name:    "hex too short",
+			pubkey:  "abcdef1234",
+			wantErr: true,
+		},
+		{
+			name:    "hex with invalid chars",
+			pubkey:  "zzzzzz1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+			wantErr: true,
+		},
+		{
+			name:    "empty pubkey",
+			pubkey:  "",
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validatePubkey(tc.pubkey)
+			if tc.wantErr && err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadNostrConfigNotFound(t *testing.T) {
+	t.Parallel()
+	_, err := LoadNostrConfig("/nonexistent/path.json")
+	if err == nil {
+		t.Fatal("expected error for nonexistent file")
+	}
+}
+
+func TestLoadOrCreateNostrConfig(t *testing.T) {
+	t.Parallel()
+
+	t.Run("creates default when not found", func(t *testing.T) {
+		config, err := LoadOrCreateNostrConfig("/nonexistent/path.json")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if config.Enabled {
+			t.Error("default should be disabled")
+		}
+		if config.Type != "nostr" {
+			t.Errorf("Type = %q, want 'nostr'", config.Type)
+		}
+	})
+
+	t.Run("loads existing config", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "nostr.json")
+
+		config := &NostrConfig{
+			Type:        "nostr",
+			Version:     1,
+			Enabled:     true,
+			WriteRelays: []string{"wss://relay.example.com"},
+		}
+		if err := SaveNostrConfig(path, config); err != nil {
+			t.Fatal(err)
+		}
+
+		loaded, err := LoadOrCreateNostrConfig(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !loaded.Enabled {
+			t.Error("loaded config should be enabled")
+		}
+	})
+}
+
+func TestNostrConfigPath(t *testing.T) {
+	t.Parallel()
+	path := NostrConfigPath("/home/user/gt")
+	want := filepath.Join("/home/user/gt", "settings", "nostr.json")
+	if path != want {
+		t.Errorf("NostrConfigPath = %q, want %q", path, want)
+	}
+}
+
+func TestLoadNostrConfigForRig(t *testing.T) {
+	t.Parallel()
+
+	t.Run("town config only (no rig overrides)", func(t *testing.T) {
+		townRoot := t.TempDir()
+		rigPath := filepath.Join(townRoot, "myrig")
+		if err := os.MkdirAll(rigPath, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Save town config
+		townConfig := &NostrConfig{
+			Type:        "nostr",
+			Version:     1,
+			Enabled:     true,
+			WriteRelays: []string{"wss://town-relay.example.com"},
+			ReadRelays:  []string{"wss://town-read.example.com"},
+			Identities: map[string]*NostrIdentity{
+				"deacon": {
+					Pubkey: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+					Signer: SignerConfig{
+						Type:   "nip46",
+						Bunker: "bunker://npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq9test?relay=wss://bunker.example.com",
+					},
+				},
+			},
+		}
+		if err := SaveNostrConfig(NostrConfigPath(townRoot), townConfig); err != nil {
+			t.Fatal(err)
+		}
+
+		loaded, err := LoadNostrConfigForRig(townRoot, rigPath)
+		if err != nil {
+			t.Fatalf("LoadNostrConfigForRig: %v", err)
+		}
+
+		if len(loaded.WriteRelays) != 1 || loaded.WriteRelays[0] != "wss://town-relay.example.com" {
+			t.Errorf("WriteRelays = %v, want [wss://town-relay.example.com]", loaded.WriteRelays)
+		}
+	})
+
+	t.Run("rig overrides town relays", func(t *testing.T) {
+		townRoot := t.TempDir()
+		rigPath := filepath.Join(townRoot, "myrig")
+		if err := os.MkdirAll(rigPath, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Save town config
+		townConfig := &NostrConfig{
+			Type:        "nostr",
+			Version:     1,
+			Enabled:     true,
+			WriteRelays: []string{"wss://town-relay.example.com"},
+			ReadRelays:  []string{"wss://town-read.example.com"},
+		}
+		if err := SaveNostrConfig(NostrConfigPath(townRoot), townConfig); err != nil {
+			t.Fatal(err)
+		}
+
+		// Save rig config with nostr overrides
+		rigConfig := map[string]interface{}{
+			"type":    "rig",
+			"version": 1,
+			"name":    "myrig",
+			"git_url": "git@github.com:test/repo.git",
+			"nostr": map[string]interface{}{
+				"write_relays": []string{"wss://rig-relay.example.com"},
+			},
+		}
+		rigData, _ := json.MarshalIndent(rigConfig, "", "  ")
+		if err := os.WriteFile(filepath.Join(rigPath, "config.json"), rigData, 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		loaded, err := LoadNostrConfigForRig(townRoot, rigPath)
+		if err != nil {
+			t.Fatalf("LoadNostrConfigForRig: %v", err)
+		}
+
+		// Write relays should be overridden by rig
+		if len(loaded.WriteRelays) != 1 || loaded.WriteRelays[0] != "wss://rig-relay.example.com" {
+			t.Errorf("WriteRelays = %v, want [wss://rig-relay.example.com]", loaded.WriteRelays)
+		}
+		// Read relays should still come from town (not overridden)
+		if len(loaded.ReadRelays) != 1 || loaded.ReadRelays[0] != "wss://town-read.example.com" {
+			t.Errorf("ReadRelays = %v, want [wss://town-read.example.com]", loaded.ReadRelays)
+		}
+	})
+
+	t.Run("rig identity merges with town", func(t *testing.T) {
+		townRoot := t.TempDir()
+		rigPath := filepath.Join(townRoot, "myrig")
+		if err := os.MkdirAll(rigPath, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Town has deacon identity
+		townConfig := &NostrConfig{
+			Type:        "nostr",
+			Version:     1,
+			Enabled:     true,
+			WriteRelays: []string{"wss://relay.example.com"},
+			Identities: map[string]*NostrIdentity{
+				"deacon": {
+					Pubkey: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+					Signer: SignerConfig{
+						Type:   "nip46",
+						Bunker: "bunker://npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq9test?relay=wss://bunker.example.com",
+					},
+				},
+			},
+		}
+		if err := SaveNostrConfig(NostrConfigPath(townRoot), townConfig); err != nil {
+			t.Fatal(err)
+		}
+
+		// Rig adds witness identity
+		rigConfig := map[string]interface{}{
+			"type":    "rig",
+			"version": 1,
+			"name":    "myrig",
+			"git_url": "git@github.com:test/repo.git",
+			"nostr": map[string]interface{}{
+				"identities": map[string]interface{}{
+					"witness": map[string]interface{}{
+						"pubkey": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+						"signer": map[string]interface{}{
+							"type":   "nip46",
+							"bunker": "bunker://npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq9test?relay=wss://bunker.example.com",
+						},
+					},
+				},
+			},
+		}
+		rigData, _ := json.MarshalIndent(rigConfig, "", "  ")
+		if err := os.WriteFile(filepath.Join(rigPath, "config.json"), rigData, 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		loaded, err := LoadNostrConfigForRig(townRoot, rigPath)
+		if err != nil {
+			t.Fatalf("LoadNostrConfigForRig: %v", err)
+		}
+
+		// Should have both deacon (from town) and witness (from rig)
+		if len(loaded.Identities) != 2 {
+			t.Errorf("Identities count = %d, want 2", len(loaded.Identities))
+		}
+		if _, ok := loaded.Identities["deacon"]; !ok {
+			t.Error("missing 'deacon' identity from town config")
+		}
+		if _, ok := loaded.Identities["witness"]; !ok {
+			t.Error("missing 'witness' identity from rig config")
+		}
+	})
+}
+
+func TestApplyNostrEnvOverrides(t *testing.T) {
+	// Not parallel: uses t.Setenv
+
+	t.Run("GT_NOSTR_ENABLED overrides config", func(t *testing.T) {
+		config := NewNostrConfig()
+		t.Setenv("GT_NOSTR_ENABLED", "1")
+		ApplyNostrEnvOverrides(config)
+		if !config.Enabled {
+			t.Error("expected Enabled=true after GT_NOSTR_ENABLED=1")
+		}
+	})
+
+	t.Run("GT_NOSTR_WRITE_RELAYS overrides config", func(t *testing.T) {
+		config := NewNostrConfig()
+		config.WriteRelays = []string{"wss://old.example.com"}
+		t.Setenv("GT_NOSTR_WRITE_RELAYS", "wss://new1.example.com,wss://new2.example.com")
+		ApplyNostrEnvOverrides(config)
+		if len(config.WriteRelays) != 2 {
+			t.Errorf("WriteRelays count = %d, want 2", len(config.WriteRelays))
+		}
+		if config.WriteRelays[0] != "wss://new1.example.com" {
+			t.Errorf("WriteRelays[0] = %q, want 'wss://new1.example.com'", config.WriteRelays[0])
+		}
+	})
+
+	t.Run("GT_NOSTR_PUBKEY creates default identity", func(t *testing.T) {
+		config := NewNostrConfig()
+		t.Setenv("GT_NOSTR_PUBKEY", "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890")
+		t.Setenv("GT_NOSTR_SIGNER_TYPE", "nip46")
+		t.Setenv("GT_NOSTR_BUNKER", "bunker://npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq9test?relay=wss://bunker.example.com")
+		ApplyNostrEnvOverrides(config)
+
+		defaultID, ok := config.Identities["default"]
+		if !ok {
+			t.Fatal("expected 'default' identity from env vars")
+		}
+		if defaultID.Pubkey != "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890" {
+			t.Errorf("Pubkey = %q", defaultID.Pubkey)
+		}
+		if defaultID.Signer.Type != "nip46" {
+			t.Errorf("Signer.Type = %q, want 'nip46'", defaultID.Signer.Type)
+		}
+	})
+
+	t.Run("GT_NOSTR_HEARTBEAT_INTERVAL overrides defaults", func(t *testing.T) {
+		config := NewNostrConfig()
+		t.Setenv("GT_NOSTR_HEARTBEAT_INTERVAL", "120")
+		ApplyNostrEnvOverrides(config)
+		if config.Defaults.HeartbeatIntervalSec != 120 {
+			t.Errorf("HeartbeatIntervalSec = %d, want 120", config.Defaults.HeartbeatIntervalSec)
+		}
+	})
+}
+
+func TestIsNostrEnabled(t *testing.T) {
+	// Not parallel: uses t.Setenv
+
+	t.Run("returns false by default", func(t *testing.T) {
+		t.Setenv("GT_NOSTR_ENABLED", "")
+		if IsNostrEnabled() {
+			t.Error("expected false when GT_NOSTR_ENABLED is empty")
+		}
+	})
+
+	t.Run("returns true when env var set", func(t *testing.T) {
+		t.Setenv("GT_NOSTR_ENABLED", "1")
+		if !IsNostrEnabled() {
+			t.Error("expected true when GT_NOSTR_ENABLED=1")
+		}
+	})
+
+	t.Run("accepts true string", func(t *testing.T) {
+		t.Setenv("GT_NOSTR_ENABLED", "true")
+		if !IsNostrEnabled() {
+			t.Error("expected true when GT_NOSTR_ENABLED=true")
+		}
+	})
+
+	t.Run("returns false for other values", func(t *testing.T) {
+		t.Setenv("GT_NOSTR_ENABLED", "0")
+		if IsNostrEnabled() {
+			t.Error("expected false when GT_NOSTR_ENABLED=0")
+		}
+	})
+}

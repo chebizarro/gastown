@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "agents": {
+    "gpt4-api": {
+      "name": "gpt4-api",
+      "provider_type": "api",
+      "api": {
+        "base_url": "https://api.openai.com/v1",
+        "model": "gpt-4o",
+        "api_key": "$OPENAI_API_KEY",
+        "api_type": "openai",
+        "supports_tools": true,
+        "context_window": 128000,
+        "max_tokens": 4096,
+        "timeout_seconds": 300,
+        "retry": {
+          "max_retries": 3,
+          "initial_backoff_ms": 1000,
+          "max_backoff_ms": 30000
+        }
+      }
+    },
+    "claude-api": {
+      "name": "claude-api",
+      "provider_type": "api",
+      "api": {
+        "base_url": "https://api.anthropic.com",
+        "model": "claude-sonnet-4-20250514",
+        "api_key": "$ANTHROPIC_API_KEY",
+        "api_type": "anthropic",
+        "supports_tools": true,
+        "supports_vision": true,
+        "context_window": 200000,
+        "max_tokens": 8192
+      }
+    },
+    "local-ollama": {
+      "name": "local-ollama",
+      "provider_type": "api",
+      "api": {
+        "base_url": "http://localhost:11434/v1",
+        "model": "llama3.1:8b",
+        "api_type": "openai",
+        "supports_tools": true,
+        "context_window": 131072,
+        "max_tokens": 4096,
+        "timeout_seconds": 600
+      }
+    }
+  }
+}

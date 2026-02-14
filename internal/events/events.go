@@ -135,6 +135,11 @@ func write(event Event) error {
 		return fmt.Errorf("writing event: %w", err)
 	}
 
+	// Dual-write: publish to Nostr if enabled (async, non-blocking).
+	// JSONL file is the source of truth; Nostr publish is best-effort.
+	// On relay failure, the spool catches events for later delivery.
+	go publishToNostr(event)
+
 	return nil
 }
 

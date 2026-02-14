@@ -1,0 +1,47 @@
+{
+  "_comment": "Mixed setup: CLI agents for interactive roles, API agents for background workers",
+  "version": 1,
+  "agents": {
+    "claude": {
+      "name": "claude",
+      "command": "claude",
+      "args": ["--dangerously-skip-permissions"]
+    },
+    "lan-llama": {
+      "name": "lan-llama",
+      "provider_type": "api",
+      "api": {
+        "base_url": "http://192.168.1.50:11434/v1",
+        "model": "llama3.1:70b",
+        "api_type": "openai",
+        "supports_tools": true,
+        "context_window": 131072
+      }
+    },
+    "remote-worker": {
+      "name": "remote-worker",
+      "provider_type": "mcp",
+      "mcp": {
+        "server_url": "http://192.168.1.10:9500/mcp",
+        "transport_type": "sse",
+        "auth_token": "$GT_MCP_TOKEN",
+        "exposed_tools": [
+          "gt_prime", "gt_done", "bd_show", "bd_list",
+          "file_read", "file_write", "file_edit",
+          "git_diff", "git_status", "git_commit"
+        ]
+      }
+    }
+  },
+  "_role_agents_example": {
+    "_comment": "Put this in town-settings.json or rig-settings.json",
+    "role_agents": {
+      "mayor": "claude",
+      "deacon": "claude",
+      "witness": "lan-llama",
+      "polecat": "lan-llama",
+      "refinery": "lan-llama",
+      "crew": "claude"
+    }
+  }
+}

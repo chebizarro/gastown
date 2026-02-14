@@ -2038,3 +2038,414 @@ func (c *EscalationConfig) GetMaxReescalations() int {
 	}
 	return *c.MaxReescalations
 }
+
+// --- Nostr Config Loader ---
+
+// NostrConfigPath returns the standard path for town-level Nostr config.
+func NostrConfigPath(townRoot string) string {
+	return filepath.Join(townRoot, "settings", NostrConfigFileName)
+}
+
+// LoadNostrConfig loads and validates a town-level Nostr configuration file.
+// The file is expected at ~/gt/settings/nostr.json with 0600 permissions.
+func LoadNostrConfig(path string) (*NostrConfig, error) {
+	data, err := os.ReadFile(path) //nolint:gosec // G304: path is constructed internally
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("%w: %s", ErrNotFound, path)
+		}
+		return nil, fmt.Errorf("reading nostr config: %w", err)
+	}
+
+	var config NostrConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("parsing nostr config: %w", err)
+	}
+
+	if err := validateNostrConfig(&config); err != nil {
+		return nil, err
+	}
+
+	return &config, nil
+}
+
+// LoadOrCreateNostrConfig loads the Nostr config, returning defaults if not found.
+func LoadOrCreateNostrConfig(path string) (*NostrConfig, error) {
+	config, err := LoadNostrConfig(path)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return NewNostrConfig(), nil
+		}
+		return nil, err
+	}
+	return config, nil
+}
+
+// SaveNostrConfig saves a Nostr configuration to a file with 0600 permissions
+// (the file may contain bunker URIs which are sensitive).
+func SaveNostrConfig(path string, config *NostrConfig) error {
+	if err := validateNostrConfig(config); err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("creating directory: %w", err)
+	}
+
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encoding nostr config: %w", err)
+	}
+
+	// 0600: bunker URIs are sensitive (they grant signing access)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return fmt.Errorf("writing nostr config: %w", err)
+	}
+
+	return nil
+}
+
+// ErrNsecDetected indicates that a secret key (nsec) was found in config.
+var ErrNsecDetected = errors.New("nsec detected in config — Gas Town never stores secret keys; use NIP-46 bunker signing")
+
+// ErrInvalidBunkerURI indicates an invalid NIP-46 bunker URI.
+var ErrInvalidBunkerURI = errors.New("invalid bunker URI")
+
+// ErrInvalidPubkey indicates an invalid Nostr public key.
+var ErrInvalidPubkey = errors.New("invalid pubkey")
+
+// validateNostrConfig validates a NostrConfig.
+func validateNostrConfig(c *NostrConfig) error {
+	if c.Type != "nostr" && c.Type != "" {
+		return fmt.Errorf("%w: expected type 'nostr', got '%s'", ErrInvalidType, c.Type)
+	}
+	if c.Version > CurrentNostrConfigVersion {
+		return fmt.Errorf("%w: got %d, max supported %d", ErrInvalidVersion, c.Version, CurrentNostrConfigVersion)
+	}
+
+	// When enabled, at least one write relay is required
+	if c.Enabled && len(c.WriteRelays) == 0 {
+		return fmt.Errorf("%w: write_relays (at least one write relay required when enabled)", ErrMissingField)
+	}
+
+	// Validate relay URLs
+	for _, relay := range c.ReadRelays {
+		if err := validateRelayURL(relay); err != nil {
+			return fmt.Errorf("read_relays: %w", err)
+		}
+	}
+	for _, relay := range c.WriteRelays {
+		if err := validateRelayURL(relay); err != nil {
+			return fmt.Errorf("write_relays: %w", err)
+		}
+	}
+	for _, relay := range c.DMRelays {
+		if err := validateRelayURL(relay); err != nil {
+			return fmt.Errorf("dm_relays: %w", err)
+		}
+	}
+
+	// Validate Blossom server URLs
+	for _, server := range c.BlossomServers {
+		if !strings.HasPrefix(server, "http://") && !strings.HasPrefix(server, "https://") {
+			return fmt.Errorf("blossom_servers: invalid URL %q (must start with http:// or https://)", server)
+		}
+	}
+
+	// Validate identities
+	if c.Identities == nil {
+		c.Identities = make(map[string]*NostrIdentity)
+	}
+	for role, identity := range c.Identities {
+		if identity == nil {
+			continue
+		}
+		if err := validateNostrIdentity(role, identity); err != nil {
+			return err
+		}
+	}
+
+	// Initialize defaults if nil
+	if c.Defaults == nil {
+		c.Defaults = DefaultNostrDefaults()
+	}
+
+	return nil
+}
+
+// validateRelayURL checks that a relay URL uses the wss:// or ws:// scheme.
+func validateRelayURL(url string) error {
+	if !strings.HasPrefix(url, "wss://") && !strings.HasPrefix(url, "ws://") {
+		return fmt.Errorf("invalid relay URL %q (must start with wss:// or ws://)", url)
+	}
+	return nil
+}
+
+// validateNostrIdentity validates a single Nostr identity entry.
+func validateNostrIdentity(role string, id *NostrIdentity) error {
+	// Reject nsec in pubkey field
+	if strings.HasPrefix(id.Pubkey, "nsec1") {
+		return fmt.Errorf("identity %q: %w", role, ErrNsecDetected)
+	}
+
+	// Validate pubkey format (hex or npub)
+	if id.Pubkey != "" {
+		if err := validatePubkey(id.Pubkey); err != nil {
+			return fmt.Errorf("identity %q: %w", role, err)
+		}
+	}
+
+	// Validate signer
+	if id.Signer.Type != "" {
+		if id.Signer.Type != "nip46" {
+			return fmt.Errorf("identity %q: unsupported signer type %q (only \"nip46\" is supported)", role, id.Signer.Type)
+		}
+		if err := validateBunkerURI(id.Signer.Bunker); err != nil {
+			return fmt.Errorf("identity %q: %w", role, err)
+		}
+	}
+
+	// Reject nsec anywhere in the bunker URI (paranoia check)
+	if strings.Contains(id.Signer.Bunker, "nsec1") {
+		return fmt.Errorf("identity %q bunker URI: %w", role, ErrNsecDetected)
+	}
+
+	return nil
+}
+
+// validatePubkey validates a Nostr public key.
+// Accepts either:
+//   - 64-character hex string
+//   - npub1... bech32-encoded public key
+func validatePubkey(pubkey string) error {
+	if pubkey == "" {
+		return fmt.Errorf("%w: pubkey is empty", ErrInvalidPubkey)
+	}
+
+	if strings.HasPrefix(pubkey, "npub1") {
+		// npub1 bech32 encoding: "npub1" + 58 bech32 chars = 63 total
+		// Allow some flexibility in length for different implementations
+		if len(pubkey) < 60 || len(pubkey) > 70 {
+			return fmt.Errorf("%w: npub %q has unexpected length %d", ErrInvalidPubkey, pubkey, len(pubkey))
+		}
+		return nil
+	}
+
+	// Hex format: exactly 64 hex characters
+	if len(pubkey) != 64 {
+		return fmt.Errorf("%w: hex pubkey must be 64 characters, got %d", ErrInvalidPubkey, len(pubkey))
+	}
+	for _, c := range pubkey {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return fmt.Errorf("%w: hex pubkey contains invalid character %q", ErrInvalidPubkey, string(c))
+		}
+	}
+
+	return nil
+}
+
+// validateBunkerURI validates a NIP-46 bunker URI.
+// Format: bunker://npub1...?relay=wss://...
+func validateBunkerURI(uri string) error {
+	if uri == "" {
+		return fmt.Errorf("%w: bunker URI is empty", ErrInvalidBunkerURI)
+	}
+
+	if !strings.HasPrefix(uri, "bunker://") {
+		return fmt.Errorf("%w: %q must start with bunker://", ErrInvalidBunkerURI, uri)
+	}
+
+	// Extract the npub from the URI path
+	rest := strings.TrimPrefix(uri, "bunker://")
+	// Split on ? to separate npub from query params
+	parts := strings.SplitN(rest, "?", 2)
+	npub := parts[0]
+
+	if !strings.HasPrefix(npub, "npub1") {
+		return fmt.Errorf("%w: %q bunker URI must contain an npub1 pubkey", ErrInvalidBunkerURI, uri)
+	}
+
+	// Check for relay parameter
+	if len(parts) < 2 || !strings.Contains(parts[1], "relay=") {
+		return fmt.Errorf("%w: %q must include relay= parameter", ErrInvalidBunkerURI, uri)
+	}
+
+	return nil
+}
+
+// LoadNostrConfigForRig loads the merged Nostr config for a specific rig.
+// It loads the town-level config first, then applies any rig-level overrides
+// from the rig's config.json "nostr" section.
+//
+// Merge strategy:
+//   - Rig relays override town relays (full replacement, not append)
+//   - Rig identities merge with town identities (rig takes precedence per role)
+//   - Rig defaults are not supported (use town-level only)
+//   - Enabled flag: rig cannot enable if town has it disabled
+func LoadNostrConfigForRig(townRoot, rigPath string) (*NostrConfig, error) {
+	// Load town-level config
+	townConfig, err := LoadOrCreateNostrConfig(NostrConfigPath(townRoot))
+	if err != nil {
+		return nil, fmt.Errorf("loading town nostr config: %w", err)
+	}
+
+	// Try to load rig-level overrides from config.json
+	rigConfigPath := filepath.Join(rigPath, "config.json")
+	rigData, err := os.ReadFile(rigConfigPath) //nolint:gosec // G304: path is constructed internally
+	if err != nil {
+		// No rig config or not readable — just use town config
+		return townConfig, nil
+	}
+
+	// Parse rig config looking for "nostr" section
+	var rigRaw map[string]json.RawMessage
+	if err := json.Unmarshal(rigData, &rigRaw); err != nil {
+		// Rig config exists but isn't valid JSON — use town config
+		return townConfig, nil
+	}
+
+	nostrRaw, ok := rigRaw["nostr"]
+	if !ok {
+		// No nostr section in rig config
+		return townConfig, nil
+	}
+
+	// Parse the rig's nostr overrides
+	var rigNostr NostrConfig
+	if err := json.Unmarshal(nostrRaw, &rigNostr); err != nil {
+		return nil, fmt.Errorf("parsing rig nostr overrides: %w", err)
+	}
+
+	// Merge: rig overrides town
+	merged := mergeNostrConfig(townConfig, &rigNostr)
+
+	// Validate the merged result
+	if err := validateNostrConfig(merged); err != nil {
+		return nil, fmt.Errorf("merged nostr config invalid: %w", err)
+	}
+
+	return merged, nil
+}
+
+// mergeNostrConfig merges rig-level overrides into a town-level config.
+// The rig config takes precedence for relay lists and identity entries.
+func mergeNostrConfig(town, rig *NostrConfig) *NostrConfig {
+	merged := *town // shallow copy
+
+	// Rig relay lists replace town lists (if specified)
+	if len(rig.ReadRelays) > 0 {
+		merged.ReadRelays = rig.ReadRelays
+	}
+	if len(rig.WriteRelays) > 0 {
+		merged.WriteRelays = rig.WriteRelays
+	}
+	if len(rig.BlossomServers) > 0 {
+		merged.BlossomServers = rig.BlossomServers
+	}
+	if len(rig.DMRelays) > 0 {
+		merged.DMRelays = rig.DMRelays
+	}
+
+	// Merge identities: start with town, overlay rig
+	mergedIdentities := make(map[string]*NostrIdentity)
+	for role, id := range town.Identities {
+		mergedIdentities[role] = id
+	}
+	for role, id := range rig.Identities {
+		mergedIdentities[role] = id
+	}
+	merged.Identities = mergedIdentities
+
+	return &merged
+}
+
+// ApplyNostrEnvOverrides applies environment variable overrides to a NostrConfig.
+// Environment variables take precedence over file-based configuration.
+// This mutates the config in place.
+func ApplyNostrEnvOverrides(config *NostrConfig) {
+	if v := os.Getenv("GT_NOSTR_ENABLED"); v != "" {
+		config.Enabled = v == "1" || v == "true" || v == "yes"
+	}
+
+	if v := os.Getenv("GT_NOSTR_READ_RELAYS"); v != "" {
+		config.ReadRelays = strings.Split(v, ",")
+	}
+
+	if v := os.Getenv("GT_NOSTR_WRITE_RELAYS"); v != "" {
+		config.WriteRelays = strings.Split(v, ",")
+	}
+
+	if v := os.Getenv("GT_NOSTR_BLOSSOM_SERVERS"); v != "" {
+		config.BlossomServers = strings.Split(v, ",")
+	}
+
+	// Single-identity env vars: create/update a "default" identity
+	pubkey := os.Getenv("GT_NOSTR_PUBKEY")
+	signerType := os.Getenv("GT_NOSTR_SIGNER_TYPE")
+	bunker := os.Getenv("GT_NOSTR_BUNKER")
+
+	if pubkey != "" || signerType != "" || bunker != "" {
+		if config.Identities == nil {
+			config.Identities = make(map[string]*NostrIdentity)
+		}
+
+		// Apply to "default" identity (callers resolve role→identity)
+		identity := config.Identities["default"]
+		if identity == nil {
+			identity = &NostrIdentity{}
+			config.Identities["default"] = identity
+		}
+
+		if pubkey != "" {
+			identity.Pubkey = pubkey
+		}
+		if signerType != "" {
+			identity.Signer.Type = signerType
+		}
+		if bunker != "" {
+			identity.Signer.Bunker = bunker
+		}
+	}
+
+	// Defaults overrides
+	if v := os.Getenv("GT_NOSTR_HEARTBEAT_INTERVAL"); v != "" {
+		if n, err := parseInt(v); err == nil && config.Defaults != nil {
+			config.Defaults.HeartbeatIntervalSec = n
+		}
+	}
+}
+
+// parseInt is a simple string-to-int parser for env var overrides.
+func parseInt(s string) (int, error) {
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, fmt.Errorf("invalid integer: %q", s)
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n, nil
+}
+
+// IsNostrEnabled checks whether Nostr publishing is enabled.
+// It checks the environment variable first, then falls back to config file.
+// This is the canonical check — all Nostr code paths must call this before executing.
+func IsNostrEnabled() bool {
+	// Fast path: check env var directly
+	if v := os.Getenv("GT_NOSTR_ENABLED"); v != "" {
+		return v == "1" || v == "true" || v == "yes"
+	}
+
+	// Slow path: try to load config from standard location
+	townRoot, err := findTownRootFromCwd()
+	if err != nil {
+		return false
+	}
+
+	config, err := LoadNostrConfig(NostrConfigPath(townRoot))
+	if err != nil {
+		return false
+	}
+
+	return config.Enabled
+}

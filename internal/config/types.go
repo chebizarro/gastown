@@ -394,6 +394,19 @@ type RuntimeConfig struct {
 
 	// Instructions controls the per-workspace instruction file name.
 	Instructions *RuntimeInstructionsConfig `json:"instructions,omitempty"`
+
+	// ProviderType determines the execution model for this agent.
+	// "cli" (default) = tmux session, "api" = Go agent loop, "mcp" = external MCP agent.
+	// When empty, defaults to "cli" for backward compatibility.
+	ProviderType ProviderType `json:"provider_type,omitempty"`
+
+	// API holds configuration for provider_type="api" agents.
+	// Enables calling remote LLMs via OpenAI-compatible or Anthropic APIs.
+	API *APIConfig `json:"api,omitempty"`
+
+	// MCP holds configuration for provider_type="mcp" agents.
+	// Configures MCP server connection for remote agent processes.
+	MCP *MCPConfig `json:"mcp,omitempty"`
 }
 
 // RuntimeSessionConfig configures how Gas Town discovers runtime session IDs.
@@ -1087,6 +1100,86 @@ type EscalationConfig struct {
 	// Pointer type to distinguish "not configured" (nil) from explicit 0.
 	MaxReescalations *int `json:"max_reescalations,omitempty"`
 }
+
+// --- Nostr Configuration Types ---
+
+// CurrentNostrConfigVersion is the current schema version for NostrConfig.
+const CurrentNostrConfigVersion = 1
+
+// NostrConfig represents the Nostr protocol configuration.
+// Town-level config lives at ~/gt/settings/nostr.json (0600 permissions).
+// Rig-level overrides can appear in ~/gt/<rig>/config.json under the "nostr" key.
+type NostrConfig struct {
+	Type           string                    `json:"type"`                      // "nostr"
+	Version        int                       `json:"version"`                   // schema version
+	Enabled        bool                      `json:"enabled"`                   // master switch for Nostr publishing
+	ReadRelays     []string                  `json:"read_relays,omitempty"`     // relays to subscribe for events
+	WriteRelays    []string                  `json:"write_relays,omitempty"`    // relays to publish events to
+	BlossomServers []string                  `json:"blossom_servers,omitempty"` // Blossom blob storage servers
+	DMRelays       []string                  `json:"dm_relays,omitempty"`       // dedicated relays for NIP-17 DMs
+	Identities     map[string]*NostrIdentity `json:"identities,omitempty"`      // role → identity mapping
+	Defaults       *NostrDefaults            `json:"defaults,omitempty"`        // timing and behavior defaults
+}
+
+// NostrIdentity represents a Nostr identity for an agent role.
+// Each role (deacon, mayor, witness, etc.) can have its own keypair
+// or share one. The Deacon identity is authoritative for replaceable state events.
+type NostrIdentity struct {
+	Pubkey  string        `json:"pubkey"`            // hex or npub1... public key
+	Signer  SignerConfig  `json:"signer"`            // signing configuration (NIP-46)
+	Profile *AgentProfile `json:"profile,omitempty"` // optional Nostr profile metadata
+}
+
+// SignerConfig represents the signing backend configuration.
+// Currently only NIP-46 (bunker) is supported for production use.
+// No nsec values are ever stored — all signing is delegated to an external bunker.
+type SignerConfig struct {
+	Type   string `json:"type"`   // "nip46" (only supported type)
+	Bunker string `json:"bunker"` // bunker://npub1...?relay=wss://...
+}
+
+// AgentProfile represents Nostr profile metadata (NIP-01 kind 0) for an agent.
+// This is published as set_metadata when the agent identity is first used.
+type AgentProfile struct {
+	Name        string `json:"name"`                  // username (lowercase, no spaces)
+	DisplayName string `json:"display_name,omitempty"` // human-readable display name
+	About       string `json:"about,omitempty"`        // profile bio/description
+	Picture     string `json:"picture,omitempty"`      // avatar URL
+	Bot         bool   `json:"bot"`                    // NIP-24: marks profile as automated
+}
+
+// NostrDefaults represents timing and behavior defaults for Nostr operations.
+type NostrDefaults struct {
+	HeartbeatIntervalSec       int `json:"heartbeat_interval_seconds,omitempty"`        // default: 60
+	SpoolDrainIntervalSec      int `json:"spool_drain_interval_seconds,omitempty"`      // default: 30
+	ConvoyRecomputeIntervalSec int `json:"convoy_recompute_interval_seconds,omitempty"` // default: 300
+	IssueMirrorPollIntervalSec int `json:"issue_mirror_poll_interval_seconds,omitempty"` // default: 120
+}
+
+// DefaultNostrDefaults returns NostrDefaults with sensible defaults.
+func DefaultNostrDefaults() *NostrDefaults {
+	return &NostrDefaults{
+		HeartbeatIntervalSec:       60,
+		SpoolDrainIntervalSec:      30,
+		ConvoyRecomputeIntervalSec: 300,
+		IssueMirrorPollIntervalSec: 120,
+	}
+}
+
+// NewNostrConfig creates a new NostrConfig with defaults.
+// Nostr is disabled by default — operators must explicitly enable it.
+func NewNostrConfig() *NostrConfig {
+	return &NostrConfig{
+		Type:       "nostr",
+		Version:    CurrentNostrConfigVersion,
+		Enabled:    false,
+		Identities: make(map[string]*NostrIdentity),
+		Defaults:   DefaultNostrDefaults(),
+	}
+}
+
+// NostrConfigFileName is the filename for town-level Nostr configuration.
+const NostrConfigFileName = "nostr.json"
 
 // EscalationContacts contains contact information for external notification channels.
 type EscalationContacts struct {

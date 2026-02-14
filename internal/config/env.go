@@ -124,6 +124,13 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 	// this empty value with intentional settings like --max-old-space-size.
 	env["NODE_OPTIONS"] = ""
 
+	// Propagate Nostr feature flag if set.
+	// Agents inherit GT_NOSTR_ENABLED so that IsNostrEnabled() works in child processes
+	// without requiring file system access to ~/gt/settings/nostr.json.
+	if v := os.Getenv("GT_NOSTR_ENABLED"); v != "" {
+		env["GT_NOSTR_ENABLED"] = v
+	}
+
 	return env
 }
 
