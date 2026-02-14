@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "agents": {
+    "lan-llama": {
+      "name": "lan-llama",
+      "provider_type": "api",
+      "api": {
+        "base_url": "http://192.168.1.50:11434/v1",
+        "model": "llama3.1:70b",
+        "api_type": "openai",
+        "supports_tools": true,
+        "context_window": 131072,
+        "max_tokens": 4096,
+        "timeout_seconds": 600,
+        "retry": {
+          "max_retries": 3,
+          "initial_backoff_ms": 2000,
+          "max_backoff_ms": 30000
+        }
+      }
+    },
+    "lan-qwen": {
+      "name": "lan-qwen",
+      "provider_type": "api",
+      "api": {
+        "base_url": "http://192.168.1.50:11434/v1",
+        "model": "qwen2.5-coder:32b",
+        "api_type": "openai",
+        "supports_tools": true,
+        "context_window": 32768
+      }
+    },
+    "vllm-deepseek": {
+      "name": "vllm-deepseek",
+      "provider_type": "api",
+      "api": {
+        "base_url": "http://gpu-server.local:8000/v1",
+        "model": "deepseek-coder-v2-instruct",
+        "api_type": "openai",
+        "supports_tools": true,
+        "context_window": 65536
+      }
+    }
+  }
+}

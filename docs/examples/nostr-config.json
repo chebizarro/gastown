@@ -1,0 +1,62 @@
+{
+  "type": "nostr",
+  "version": 1,
+  "enabled": true,
+  "read_relays": [
+    "wss://relay.gastown.example.com",
+    "wss://relay.damus.io"
+  ],
+  "write_relays": [
+    "wss://relay.gastown.example.com"
+  ],
+  "blossom_servers": [
+    "https://blossom.gastown.example.com"
+  ],
+  "dm_relays": [
+    "wss://dm-inbox.gastown.example.com"
+  ],
+  "identities": {
+    "deacon": {
+      "pubkey": "hex-or-npub1-public-key-here",
+      "signer": {
+        "type": "nip46",
+        "bunker": "bunker://npub1-signer-pubkey?relay=wss://bunker.example.com"
+      },
+      "profile": {
+        "name": "deacon",
+        "display_name": "Gas Town Deacon",
+        "about": "Daemon beacon. Receives heartbeats, runs plugins and monitoring.",
+        "picture": "https://blossom.example.com/deacon-avatar.png",
+        "bot": true
+      }
+    },
+    "mayor": {
+      "pubkey": "hex-or-npub1-public-key-here",
+      "signer": {
+        "type": "nip46",
+        "bunker": "bunker://npub1-signer-pubkey?relay=wss://bunker.example.com"
+      },
+      "profile": {
+        "name": "mayor",
+        "display_name": "Gas Town Mayor",
+        "about": "Global coordinator. Handles cross-rig communication and escalations.",
+        "picture": "https://blossom.example.com/mayor-avatar.png",
+        "bot": true
+      }
+    },
+    "overseer": {
+      "pubkey": "hex-or-npub1-public-key-here",
+      "signer": {
+        "type": "nip46",
+        "bunker": "bunker://npub1-signer-pubkey?relay=wss://bunker.example.com"
+      },
+      "profile": null
+    }
+  },
+  "defaults": {
+    "heartbeat_interval_seconds": 60,
+    "spool_drain_interval_seconds": 30,
+    "convoy_recompute_interval_seconds": 300,
+    "issue_mirror_poll_interval_seconds": 120
+  }
+}

@@ -55,9 +55,9 @@ const (
 	TypeMassDeath    = "mass_death"    // Multiple sessions died in short window
 
 	// Witness patrol events
-	TypePatrolStarted   = "patrol_started"
-	TypePolecatChecked  = "polecat_checked"
-	TypePolecatNudged   = "polecat_nudged"
+	TypePatrolStarted    = "patrol_started"
+	TypePolecatChecked   = "polecat_checked"
+	TypePolecatNudged    = "polecat_nudged"
 	TypeEscalationSent   = "escalation_sent"
 	TypeEscalationAcked  = "escalation_acked"
 	TypeEscalationClosed = "escalation_closed"
@@ -144,6 +144,11 @@ func write(event Event) error {
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("closing events file: %w", err)
 	}
+
+	// Dual-write: publish to Nostr if enabled (async, non-blocking).
+	// JSONL file is the source of truth; Nostr publish is best-effort.
+	// On relay failure, the spool catches events for later delivery.
+	go publishToNostr(event)
 
 	return nil
 }
