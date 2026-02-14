@@ -78,15 +78,8 @@ func PublishProtocolEvent(ctx context.Context, publisher *Publisher, msgType, fr
 	return publisher.Publish(ctx, event)
 }
 
-// Correlations holds cross-reference data for Nostr event tags.
-type Correlations struct {
-	IssueID   string
-	ConvoyID  string
-	BeadID    string
-	SessionID string
-	Branch    string
-	MergeReq  string
-}
+// Note: Correlations is defined in types.go as the canonical location
+// for cross-reference data used across the nostr package.
 
 // ProtocolEventRouter dispatches incoming protocol events to handlers.
 type ProtocolEventRouter struct {
@@ -125,10 +118,10 @@ func (r *ProtocolEventRouter) Dispatch(ctx context.Context, event *nostr.Event) 
 }
 
 // SubscribeProtocol creates a Nostr subscription for protocol events addressed to a specific actor.
-func SubscribeProtocol(pool *RelayPool, actor string) []*nostr.Subscription {
+func SubscribeProtocol(ctx context.Context, pool *RelayPool, actor string) []*nostr.Subscription {
 	filter := nostr.Filter{
 		Kinds: []int{KindProtocolEvent},
 		Tags:  nostr.TagMap{"to": []string{actor}},
 	}
-	return pool.Subscribe(context.Background(), nostr.Filters{filter})
+	return pool.Subscribe(ctx, nostr.Filters{filter})
 }

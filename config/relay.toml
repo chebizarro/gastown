@@ -1,0 +1,50 @@
+# =============================================================================
+# nostr-rs-relay Configuration for Gas Town
+# =============================================================================
+# Mount this file into the relay container:
+#   volumes:
+#     - ./config/relay.toml:/usr/src/app/config.toml:ro
+#
+# See: https://github.com/scsibug/nostr-rs-relay
+# =============================================================================
+
+[info]
+relay_url = "ws://localhost:7777/"
+name = "Gas Town Relay"
+description = "Private relay for Gas Town multi-agent orchestration events"
+contact = ""
+
+[database]
+engine = "sqlite"
+data_directory = "/usr/src/app/db"
+
+[network]
+port = 7000
+address = "0.0.0.0"
+
+# Ping interval (seconds) — keep WebSocket connections alive
+ping_interval = 300
+
+[limits]
+# Maximum event size (bytes) — Gas Town issue mirrors can be large
+max_event_bytes = 1048576
+
+# Rate limits per connection
+messages_per_sec = 50
+subscriptions_per_min = 30
+
+# Maximum number of subscriptions per client
+max_subs = 64
+
+[authorization]
+# NIP-42 authentication
+# Uncomment to restrict writes to known pubkeys
+# nip42_auth = true
+
+# Pubkeys allowed to write (hex format, one per line)
+# Add your Deacon pubkey and all agent pubkeys here
+# pubkey_whitelist = [
+#   "abc123...",   # Deacon
+#   "def456...",   # Mayor
+#   "ghi789...",   # Witness
+# ]

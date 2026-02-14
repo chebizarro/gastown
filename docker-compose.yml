@@ -1,0 +1,238 @@
+# =============================================================================
+# Gas Town — Nostr-Native Stack
+# =============================================================================
+#
+# Full deployment stack for the Nostr-native Gas Town orchestrator.
+#
+# Usage:
+#   # Start core services (gastown + relay + blossom)
+#   docker compose up -d
+#
+#   # Start with Flotilla web UI
+#   docker compose --profile ui up -d
+#
+#   # Start with local LLM (Ollama)
+#   docker compose --profile llm up -d
+#
+#   # Start everything
+#   docker compose --profile ui --profile llm up -d
+#
+#   # View logs
+#   docker compose logs -f gastown
+#
+#   # Stop
+#   docker compose down
+#
+# =============================================================================
+
+name: gastown
+
+networks:
+  gt_net:
+    driver: bridge
+    name: gt_net
+
+volumes:
+  relay-data:
+    name: gt_relay_data
+  blossom-data:
+    name: gt_blossom_data
+  ollama-models:
+    name: gt_ollama_models
+
+services:
+
+  # =========================================================================
+  # Gas Town — Core orchestrator
+  # =========================================================================
+  gastown:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        GT_VERSION: ${GT_VERSION:-dev}
+        GT_COMMIT: ${GT_COMMIT:-unknown}
+    image: gastown:${GT_VERSION:-latest}
+    container_name: gastown
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Nostr
+      - GT_NOSTR_ENABLED=${GT_NOSTR_ENABLED:-1}
+      - GT_NOSTR_CONFIG=/home/gt/gt/.nostr.json
+      - GT_NOSTR_READ_RELAYS=${GT_NOSTR_READ_RELAYS:-ws://relay:7000}
+      - GT_NOSTR_WRITE_RELAYS=${GT_NOSTR_WRITE_RELAYS:-ws://relay:7000}
+      - GT_NOSTR_BLOSSOM_SERVERS=${GT_NOSTR_BLOSSOM_SERVERS:-http://blossom:8005}
+      # Signer (NIP-46 bunker URI — set in .env)
+      - GT_NOSTR_SIGNER_TYPE=${GT_NOSTR_SIGNER_TYPE:-nip46}
+      - GT_NOSTR_BUNKER=${GT_NOSTR_BUNKER:-}
+      - GT_NOSTR_PUBKEY=${GT_NOSTR_PUBKEY:-}
+      # Sunset flags (dual-write by default)
+      - GT_EVENTS_LOCAL=${GT_EVENTS_LOCAL:-1}
+      - GT_FEED_CURATOR=${GT_FEED_CURATOR:-1}
+      - GT_CONVOY_LOCAL=${GT_CONVOY_LOCAL:-1}
+      # Agent provider (for API-mode agents on LAN)
+      - GT_MCP_PORT=${GT_MCP_PORT:-9500}
+      - GT_MCP_TOKEN=${GT_MCP_TOKEN:-}
+      # Git
+      - GIT_AUTHOR_NAME=${GIT_AUTHOR_NAME:-Gas Town}
+      - GIT_AUTHOR_EMAIL=${GIT_AUTHOR_EMAIL:-gt@gastown.local}
+      - GIT_COMMITTER_NAME=${GIT_COMMITTER_NAME:-Gas Town}
+      - GIT_COMMITTER_EMAIL=${GIT_COMMITTER_EMAIL:-gt@gastown.local}
+    volumes:
+      # Workspace — the gt home directory with rigs, beads, configs
+      - ${GT_HOME:-./data/gt}:/home/gt/gt
+      # Nostr spool (persisted across restarts)
+      - ${GT_SPOOL_DIR:-./data/spool}:/home/gt/.local/share/gt/spool
+      # SSH keys for git operations
+      - ${SSH_KEY_DIR:-~/.ssh}:/home/gt/.ssh:ro
+      # Nostr keys directory (for NIP-46 bunker connection metadata)
+      - ${GT_KEYS_DIR:-./data/keys}:/home/gt/.config/gt/keys:ro
+    ports:
+      # MCP tool server (for LAN agents)
+      - "${GT_MCP_PORT:-9500}:9500"
+    networks:
+      - gt_net
+    depends_on:
+      relay:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "gt", "doctor", "--quiet"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
+
+  # =========================================================================
+  # Nostr Relay — Local relay for Gas Town events
+  # =========================================================================
+  relay:
+    image: scsibug/nostr-rs-relay:latest
+    container_name: gt_relay
+    restart: unless-stopped
+    environment:
+      - RUST_LOG=${RELAY_LOG_LEVEL:-info}
+    volumes:
+      - relay-data:/usr/src/app/db
+      # Optional: custom relay config
+      - ${RELAY_CONFIG:-/dev/null}:/usr/src/app/config.toml:ro
+    ports:
+      # WebSocket port — expose for external clients (Flotilla, monitoring)
+      - "${RELAY_PORT:-7777}:7000"
+    networks:
+      - gt_net
+    healthcheck:
+      test: ["CMD", "sh", "-c", "exec 3<>/dev/tcp/localhost/7000 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # =========================================================================
+  # Blossom — Content-addressed blob storage for Nostr
+  # =========================================================================
+  blossom:
+    image: ghcr.io/hzrd149/blossom-server:latest
+    container_name: gt_blossom
+    restart: unless-stopped
+    environment:
+      - BLOSSOM_STORAGE_DIR=/data
+    volumes:
+      - blossom-data:/data
+    ports:
+      - "${BLOSSOM_PORT:-8005}:3000"
+    networks:
+      - gt_net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # =========================================================================
+  # Flotilla — Discord-like web UI (Budabit fork)
+  # =========================================================================
+  # Enable with: docker compose --profile ui up -d
+  flotilla:
+    build:
+      context: ${FLOTILLA_PATH:-../flotilla-extensions/flotilla}
+      dockerfile: Dockerfile
+    image: flotilla-budabit:${FLOTILLA_VERSION:-latest}
+    container_name: gt_flotilla
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=1847
+      # Flotilla connects to the relay for Gas Town events
+      - PUBLIC_RELAY_URL=${PUBLIC_RELAY_URL:-ws://localhost:${RELAY_PORT:-7777}}
+      - PUBLIC_BLOSSOM_URL=${PUBLIC_BLOSSOM_URL:-http://localhost:${BLOSSOM_PORT:-8005}}
+    ports:
+      - "${FLOTILLA_PORT:-1847}:1847"
+    networks:
+      - gt_net
+    depends_on:
+      relay:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:1847/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    profiles:
+      - ui
+
+  # =========================================================================
+  # Ollama — Local LLM for API-mode agents
+  # =========================================================================
+  # Enable with: docker compose --profile llm up -d
+  ollama:
+    image: ollama/ollama:latest
+    container_name: gt_ollama
+    restart: unless-stopped
+    volumes:
+      - ollama-models:/root/.ollama
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    networks:
+      - gt_net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    profiles:
+      - llm
+
+  # =========================================================================
+  # Ollama (CPU-only) — For machines without GPU
+  # =========================================================================
+  # Enable with: docker compose --profile llm-cpu up -d
+  ollama-cpu:
+    image: ollama/ollama:latest
+    container_name: gt_ollama_cpu
+    restart: unless-stopped
+    volumes:
+      - ollama-models:/root/.ollama
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    networks:
+      - gt_net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    profiles:
+      - llm-cpu

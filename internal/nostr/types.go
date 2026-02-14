@@ -61,6 +61,19 @@ const (
 	VisibilityBoth  = "both"  // Both audit and feed
 )
 
+// --- Cross-reference Types ---
+
+// Correlations holds cross-reference data for Nostr event tags.
+// Used to link events to issues, convoys, beads, sessions, branches, and MRs.
+type Correlations struct {
+	IssueID   string
+	ConvoyID  string
+	BeadID    string
+	SessionID string
+	Branch    string
+	MergeReq  string
+}
+
 // --- Tag Builder Functions ---
 
 // BaseTags returns the base tags included on every Gas Town Nostr event.

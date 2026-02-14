@@ -16,6 +16,12 @@ type DMSender struct {
 	signer    Signer
 	publisher *Publisher
 	pool      *RelayPool
+
+	// AllowPlaintextFallback enables the kind 4 plaintext DM fallback.
+	// This MUST only be set to true in development/testing environments.
+	// In production, DMs should use NIP-17 gift wrapping with NIP-44 encryption.
+	// When false (default), SendDM returns an error if NIP-17 is not available.
+	AllowPlaintextFallback bool
 }
 
 // NewDMSender creates a DM sender.
@@ -52,14 +58,20 @@ func (d *DMSender) SendDM(ctx context.Context, recipientPubkey, content string, 
 	// 2. Gift wrap seal → kind 1059 with random key
 	// 3. Publish to recipient's 10050 relay list
 	//
-	// For now, publish as a regular event (NIP-17 encryption requires
-	// NIP-44 support in the signer, which will be implemented when
-	// fiatjaf.com/nostr/nip17 and nip44 packages are available).
-	//
-	// Placeholder: publish kind 4 (legacy DM) as a fallback
+	// NIP-17 encryption requires NIP-44 support in the signer,
+	// which will be implemented when fiatjaf.com/nostr/nip17 and
+	// nip44 packages are available.
+
+	if !d.AllowPlaintextFallback {
+		return fmt.Errorf("NIP-17 gift wrap not yet implemented; set AllowPlaintextFallback=true for development (INSECURE: sends plaintext kind 4 DMs)")
+	}
+
+	// INSECURE FALLBACK: publish kind 4 (legacy DM) with plaintext content.
+	// This is only for development/testing. Production must use NIP-17.
+	log.Printf("[nostr/dm] WARNING: sending plaintext kind 4 DM (NIP-17 not yet available)")
 	dm := &nostr.Event{
 		Kind:      4,
-		Content:   content, // TODO: NIP-44 encrypt
+		Content:   content, // PLAINTEXT - not encrypted
 		Tags:      rumor.Tags,
 		CreatedAt: rumor.CreatedAt,
 	}

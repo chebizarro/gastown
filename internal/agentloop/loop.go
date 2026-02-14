@@ -164,13 +164,23 @@ func (l *AgentLoop) Start(ctx context.Context) error {
 
 	log.Printf("[agentloop] Started for %s (role=%s, rig=%s)", l.config.Actor, l.config.Role, l.config.RigName)
 
+	idleTimer := time.NewTimer(l.config.IdleTimeout)
+	defer idleTimer.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			log.Printf("[agentloop] Context cancelled, stopping")
 			return ctx.Err()
 
+		case <-idleTimer.C:
+			log.Printf("[agentloop] Idle timeout reached (%v), sleeping", l.config.IdleTimeout)
+			// Reset and continue - the loop stays alive but logs the idle state.
+			// In production, the deacon may use this signal to scale down.
+			idleTimer.Reset(l.config.IdleTimeout)
+
 		case task := <-l.workCh:
+			idleTimer.Stop()
 			l.mu.Lock()
 			l.state = StateWorking
 			l.currentTask = task
@@ -194,6 +204,9 @@ func (l *AgentLoop) Start(ctx context.Context) error {
 			if l.config.OnTaskComplete != nil {
 				l.config.OnTaskComplete(task, l.iteration, l.totalTokens, err)
 			}
+
+			// Reset idle timer after task completion
+			idleTimer.Reset(l.config.IdleTimeout)
 		}
 	}
 }

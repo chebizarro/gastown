@@ -138,7 +138,18 @@ func write(event Event) error {
 	// Dual-write: publish to Nostr if enabled (async, non-blocking).
 	// JSONL file is the source of truth; Nostr publish is best-effort.
 	// On relay failure, the spool catches events for later delivery.
-	go publishToNostr(event)
+	//
+	// Deep copy the event to avoid a data race: the caller's map
+	// could be mutated after write() returns while the goroutine
+	// is still reading it.
+	eventCopy := event
+	if event.Payload != nil {
+		eventCopy.Payload = make(map[string]interface{}, len(event.Payload))
+		for k, v := range event.Payload {
+			eventCopy.Payload[k] = v
+		}
+	}
+	go publishToNostr(eventCopy)
 
 	return nil
 }

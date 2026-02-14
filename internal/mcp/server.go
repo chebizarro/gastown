@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/agentloop"
+	"github.com/steveyegge/gastown/internal/llm"
 )
 
 const (

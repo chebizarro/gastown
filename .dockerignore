@@ -1,0 +1,50 @@
+# Build artifacts
+gt
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Node (npm-package)
+npm-package/node_modules/
+
+# Docker
+Dockerfile*
+docker-compose*
+.dockerignore
+
+# CI/CD
+.github/
+.goreleaser.yml
+
+# Docs (keep examples for config reference)
+docs/design/
+docs/concepts/
+docs/issues/
+
+# Beads state (runtime, not build)
+.beads/
+
+# Scripts not needed in container
+scripts/migration-test/
