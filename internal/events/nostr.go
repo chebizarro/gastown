@@ -30,7 +30,16 @@ func getPublisher() *gtnostr.Publisher {
 			return
 		}
 
-		cfg, err := config.LoadNostrConfig()
+		// Load config from GT_NOSTR_CONFIG env or default path
+		cfgPath := os.Getenv("GT_NOSTR_CONFIG")
+		if cfgPath == "" {
+			townRoot := os.Getenv("GT_TOWN_ROOT")
+			if townRoot == "" {
+				townRoot = "."
+			}
+			cfgPath = config.NostrConfigPath(townRoot)
+		}
+		cfg, err := config.LoadNostrConfig(cfgPath)
 		if err != nil {
 			log.Printf("[events/nostr] Failed to load nostr config: %v", err)
 			publisherErr = err
@@ -157,7 +166,7 @@ func extractCorrelations(eventType string, payload map[string]interface{}) *corr
 }
 
 // addExtraTags adds event-type-specific tags to the Nostr event.
-func addExtraTags(event interface{}, eventType string, c *Correlations) {
+func addExtraTags(event interface{}, eventType string, c *correlations) {
 	// The nostr.Event type uses Tags field - we need to work with the concrete type
 	// Since we're using fiatjaf.com/nostr, we add tags via the event construction
 	// The event.go helpers already handle base tags; extra tags are added via
