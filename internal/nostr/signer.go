@@ -64,7 +64,7 @@ func (s *NIP46Signer) Sign(ctx context.Context, event *nostr.Event) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	event.PubKey = s.pubkey
+	event.PubKey = nostr.PubKey(s.pubkey)
 
 	return s.bunker.SignEvent(ctx, event)
 }
@@ -110,7 +110,7 @@ func NewLocalSigner(privkeyHex string) (*LocalSigner, error) {
 
 // Sign signs an event with the local private key.
 func (s *LocalSigner) Sign(_ context.Context, event *nostr.Event) error {
-	event.PubKey = s.pubkey
+	event.PubKey = nostr.PubKey(s.pubkey)
 	return event.Sign(s.privkey)
 }
 

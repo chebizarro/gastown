@@ -48,7 +48,7 @@ func (p *Publisher) Publish(ctx context.Context, event *nostr.Event) error {
 
 	// Attempt to broadcast
 	if err := p.pool.Publish(ctx, *event); err != nil {
-		log.Printf("[nostr] publish failed, spooling event %s: %v", event.ID, err)
+		log.Printf("[nostr] publish failed, spooling event %s: %v", string(event.ID), err)
 		// Spool for later retry
 		if spoolErr := p.spool.Enqueue(event, p.pool.WriteRelayURLs()); spoolErr != nil {
 			return fmt.Errorf("publish failed (%v) and spool failed: %w", err, spoolErr)

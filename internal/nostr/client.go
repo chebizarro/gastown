@@ -33,7 +33,7 @@ func NewRelayPool(ctx context.Context, cfg *config.NostrConfig) (*RelayPool, err
 
 	// Connect to write relays (required)
 	for _, url := range cfg.WriteRelays {
-		relay, err := nostr.RelayConnect(ctx, url)
+		relay, err := nostr.RelayConnect(ctx, url, nostr.RelayOptions{})
 		if err != nil {
 			log.Printf("[nostr] warning: failed to connect to write relay %s: %v", url, err)
 			continue
@@ -43,7 +43,7 @@ func NewRelayPool(ctx context.Context, cfg *config.NostrConfig) (*RelayPool, err
 
 	// Connect to read relays (optional)
 	for _, url := range cfg.ReadRelays {
-		relay, err := nostr.RelayConnect(ctx, url)
+		relay, err := nostr.RelayConnect(ctx, url, nostr.RelayOptions{})
 		if err != nil {
 			log.Printf("[nostr] warning: failed to connect to read relay %s: %v", url, err)
 			continue
@@ -89,18 +89,22 @@ func (p *RelayPool) Publish(ctx context.Context, event nostr.Event) error {
 
 // Subscribe creates a subscription across all read relays.
 // The caller is responsible for reading from the returned channel.
-func (p *RelayPool) Subscribe(ctx context.Context, filters nostr.Filters) []*nostr.Subscription {
+func (p *RelayPool) Subscribe(ctx context.Context, filters []nostr.Filter) []*nostr.Subscription {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
 	var subs []*nostr.Subscription
 	for _, relay := range p.readRelays {
-		sub, err := relay.Subscribe(ctx, filters)
-		if err != nil {
-			log.Printf("[nostr] subscribe on %s failed: %v", relay.URL, err)
-			continue
+		// Subscribe to each filter individually since fiatjaf.com/nostr
+		// takes a single Filter per subscription call.
+		for _, f := range filters {
+			sub, err := relay.Subscribe(ctx, f, nostr.SubscriptionOptions{})
+			if err != nil {
+				log.Printf("[nostr] subscribe on %s failed: %v", relay.URL, err)
+				continue
+			}
+			subs = append(subs, sub)
 		}
-		subs = append(subs, sub)
 	}
 
 	return subs
@@ -120,7 +124,7 @@ func (p *RelayPool) Reconnect(ctx context.Context) {
 	for i, relay := range p.writeRelays {
 		if !relay.IsConnected() {
 			log.Printf("[nostr] reconnecting write relay %s", relay.URL)
-			newRelay, err := nostr.RelayConnect(ctx, relay.URL)
+			newRelay, err := nostr.RelayConnect(ctx, relay.URL, nostr.RelayOptions{})
 			if err != nil {
 				log.Printf("[nostr] reconnect failed for %s: %v", relay.URL, err)
 				continue
@@ -133,7 +137,7 @@ func (p *RelayPool) Reconnect(ctx context.Context) {
 	for i, relay := range p.readRelays {
 		if !relay.IsConnected() {
 			log.Printf("[nostr] reconnecting read relay %s", relay.URL)
-			newRelay, err := nostr.RelayConnect(ctx, relay.URL)
+			newRelay, err := nostr.RelayConnect(ctx, relay.URL, nostr.RelayOptions{})
 			if err != nil {
 				log.Printf("[nostr] reconnect failed for %s: %v", relay.URL, err)
 				continue
