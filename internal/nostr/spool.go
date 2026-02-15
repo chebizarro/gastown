@@ -99,7 +99,7 @@ func (s *Spool) Enqueue(event *nostr.Event, targetRelays []string) error {
 		Tags:      event.Tags,
 		Content:   event.Content,
 		PubKey:    PubKeyToString(event.PubKey),
-		Sig:       event.Sig,
+		Sig:       fmt.Sprintf("%x", event.Sig),
 		SpoolMeta: SpoolMeta{
 			SpooledAt:    time.Now(),
 			TargetRelays: targetRelays,
@@ -171,7 +171,7 @@ func (s *Spool) Drain(ctx context.Context, pool *RelayPool) (sent int, failed in
 			Tags:      entry.Tags,
 			Content:   entry.Content,
 			PubKey:    PubKeyFromHex(entry.PubKey),
-			Sig:       entry.Sig,
+			Sig:       SigFromHex(entry.Sig),
 		}
 
 		// Try to publish

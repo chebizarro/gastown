@@ -164,6 +164,18 @@ func PubKeyToString(pk nostr.PubKey) string {
 	return fmt.Sprintf("%x", pk)
 }
 
+// SigFromHex converts a hex string to a nostr Sig byte array ([64]byte).
+// Returns a zero Sig if the hex string is invalid or wrong length.
+func SigFromHex(hexStr string) [64]byte {
+	var sig [64]byte
+	b, err := hex.DecodeString(hexStr)
+	if err != nil || len(b) != 64 {
+		return sig // zero value
+	}
+	copy(sig[:], b)
+	return sig
+}
+
 // KindSlice converts plain int values to a []nostr.Kind slice.
 func KindSlice(kinds ...int) []nostr.Kind {
 	result := make([]nostr.Kind, len(kinds))
