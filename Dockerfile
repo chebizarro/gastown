@@ -4,6 +4,7 @@ FROM golang:1.25-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   build-essential pkg-config git ca-certificates \
+  libicu-dev \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -45,7 +46,7 @@ FROM debian:bookworm-slim AS runtime
 # - curl: health checks
 # - tmux: used by other GT paths; harmless in API-mode deployments
 RUN apt-get update && apt-get install -y --no-install-recommends \
-  ca-certificates git bash grep tmux curl \
+  ca-certificates git bash grep tmux curl libicu72 \
   && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m -u 10001 -s /bin/bash gastown
