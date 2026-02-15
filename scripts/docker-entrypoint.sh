@@ -27,5 +27,26 @@ if [ ! -f "${GT_ROOT}/mayor/town.json" ]; then
 EOF
 fi
 
+# Create default agents.json if missing (agentloop needs this)
+if [ ! -f "${GT_ROOT}/settings/agents.json" ]; then
+  cat > "${GT_ROOT}/settings/agents.json" <<EOF
+{
+  "version": 1,
+  "agents": {
+    "claude-api": {
+      "name": "claude-api",
+      "provider_type": "api",
+      "api": {
+        "api_type": "anthropic",
+        "model": "claude-sonnet-4-20250514",
+        "api_key": "\$ANTHROPIC_API_KEY",
+        "max_tokens": 8192
+      }
+    }
+  }
+}
+EOF
+fi
+
 # Hand off to gt with whatever args were passed (e.g., "daemon run")
 exec gt "$@"

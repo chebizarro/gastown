@@ -77,8 +77,10 @@ services:
 
   agentloop:
     image: gastown:local
+    # Optional — activate with: docker compose --profile agent up
+    # Requires agents.json config; see docs/examples/agents-api.json
+    profiles: [agent]
     depends_on: [deacon]
-    # Requires internal/cmd/agentloop.go (added in this change)
     command:
       - "agentloop"
       - "run"
@@ -122,8 +124,10 @@ services:
 
   mcp:
     image: gastown:local
+    # Optional — activate with: docker compose --profile mcp up
+    # Requires GT_MCP_TOKEN to be set
+    profiles: [mcp]
     depends_on: [deacon]
-    # Requires internal/cmd/mcp.go (added in this change)
     command:
       - "mcp"
       - "serve"
