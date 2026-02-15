@@ -51,7 +51,7 @@ func (d *DMSender) SendDM(ctx context.Context, recipientPubkey, content string, 
 	}
 
 	// Set pubkey from signer
-	rumor.PubKey = d.signer.GetPublicKey()
+	rumor.PubKey = nostr.PubKey(d.signer.GetPublicKey())
 
 	// TODO: Implement full NIP-17 gift wrap pipeline:
 	// 1. NIP-44 encrypt rumor → kind 13 seal
@@ -115,7 +115,7 @@ func (l *DMListener) Start(ctx context.Context) {
 	// Subscribe to gift wraps addressed to this agent (NIP-17)
 	// Fall back to kind 4 (legacy DMs) for now
 	now := nostr.Timestamp(time.Now().Unix())
-	filters := nostr.Filters{
+	filters := []nostr.Filter{
 		{
 			Kinds: []int{1059, 4}, // gift wraps + legacy DMs
 			Tags:  nostr.TagMap{"p": []string{pubkey}},
@@ -162,12 +162,12 @@ func (l *DMListener) processEvent(ctx context.Context, event *nostr.Event) {
 		// 1. Decrypt kind 1059 → kind 13 seal
 		// 2. Decrypt kind 13 → kind 14 rumor
 		// 3. Extract sender pubkey and content
-		log.Printf("[nostr/dm] Received gift wrap from %s (NIP-17 unwrap TODO)", event.PubKey[:8])
+		log.Printf("[nostr/dm] Received gift wrap from %s (NIP-17 unwrap TODO)", string(event.PubKey)[:8])
 
 	case 4:
 		// Legacy DM (NIP-04) — direct content
 		// TODO: NIP-04 decrypt
-		l.handler(event.PubKey, event.Content, event)
+		l.handler(string(event.PubKey), event.Content, event)
 
 	default:
 		log.Printf("[nostr/dm] Unexpected event kind %d", event.Kind)

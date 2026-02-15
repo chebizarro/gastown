@@ -92,12 +92,12 @@ func (s *Spool) Enqueue(event *nostr.Event, targetRelays []string) error {
 
 	// Create entry
 	entry := SpoolEntry{
-		ID:        event.ID,
+		ID:        string(event.ID),
 		CreatedAt: int64(event.CreatedAt),
 		Kind:      event.Kind,
 		Tags:      event.Tags,
 		Content:   event.Content,
-		PubKey:    event.PubKey,
+		PubKey:    string(event.PubKey),
 		Sig:       event.Sig,
 		SpoolMeta: SpoolMeta{
 			SpooledAt:    time.Now(),
@@ -159,12 +159,12 @@ func (s *Spool) Drain(ctx context.Context, pool *RelayPool) (sent int, failed in
 
 		// Reconstruct nostr event
 		event := nostr.Event{
-			ID:        entry.ID,
+			ID:        nostr.ID(entry.ID),
 			CreatedAt: nostr.Timestamp(entry.CreatedAt),
 			Kind:      entry.Kind,
 			Tags:      entry.Tags,
 			Content:   entry.Content,
-			PubKey:    entry.PubKey,
+			PubKey:    nostr.PubKey(entry.PubKey),
 			Sig:       entry.Sig,
 		}
 

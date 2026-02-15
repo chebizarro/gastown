@@ -123,5 +123,5 @@ func SubscribeProtocol(ctx context.Context, pool *RelayPool, actor string) []*no
 		Kinds: []int{KindProtocolEvent},
 		Tags:  nostr.TagMap{"to": []string{actor}},
 	}
-	return pool.Subscribe(ctx, nostr.Filters{filter})
+	return pool.Subscribe(ctx, []nostr.Filter{filter})
 }
