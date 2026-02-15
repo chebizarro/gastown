@@ -94,7 +94,7 @@ func CreateChannel(ctx context.Context, publisher *Publisher, meta ChannelMetada
 		return "", err
 	}
 
-	return string(event.ID), nil
+	return IDToString(event.ID), nil
 }
 
 // PostChannelMessage posts a message to a NIP-28 channel (kind 42 event).

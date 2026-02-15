@@ -3,6 +3,7 @@ package nostr
 import (
 	"bufio"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -92,12 +93,12 @@ func (s *Spool) Enqueue(event *nostr.Event, targetRelays []string) error {
 
 	// Create entry
 	entry := SpoolEntry{
-		ID:        string(event.ID),
+		ID:        IDToString(event.ID),
 		CreatedAt: int64(event.CreatedAt),
-		Kind:      event.Kind,
+		Kind:      int(event.Kind),
 		Tags:      event.Tags,
 		Content:   event.Content,
-		PubKey:    string(event.PubKey),
+		PubKey:    PubKeyToString(event.PubKey),
 		Sig:       event.Sig,
 		SpoolMeta: SpoolMeta{
 			SpooledAt:    time.Now(),
@@ -158,13 +159,18 @@ func (s *Spool) Drain(ctx context.Context, pool *RelayPool) (sent int, failed in
 		}
 
 		// Reconstruct nostr event
+		// Reconstruct event from spool entry
+		var id nostr.ID
+		if b, err := hex.DecodeString(entry.ID); err == nil && len(b) == len(id) {
+			copy(id[:], b)
+		}
 		event := nostr.Event{
-			ID:        nostr.ID(entry.ID),
+			ID:        id,
 			CreatedAt: nostr.Timestamp(entry.CreatedAt),
-			Kind:      entry.Kind,
+			Kind:      nostr.Kind(entry.Kind),
 			Tags:      entry.Tags,
 			Content:   entry.Content,
-			PubKey:    nostr.PubKey(entry.PubKey),
+			PubKey:    PubKeyFromHex(entry.PubKey),
 			Sig:       entry.Sig,
 		}
 

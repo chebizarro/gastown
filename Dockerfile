@@ -21,10 +21,10 @@ ENV CGO_ENABLED=1
 RUN go build -trimpath -o /out/gt \
   -ldflags "\
     -s -w \
-    -X github.com/steveyegge/gastown/internal/cmd.Version=${VERSION} \
-    -X github.com/steveyegge/gastown/internal/cmd.Commit=${COMMIT} \
-    -X github.com/steveyegge/gastown/internal/cmd.BuildTime=${BUILD_TIME} \
-    -X github.com/steveyegge/gastown/internal/cmd.BuiltProperly=1 \
+    -X github.com/chebizarro/gastown/internal/cmd.Version=${VERSION} \
+    -X github.com/chebizarro/gastown/internal/cmd.Commit=${COMMIT} \
+    -X github.com/chebizarro/gastown/internal/cmd.BuildTime=${BUILD_TIME} \
+    -X github.com/chebizarro/gastown/internal/cmd.BuiltProperly=1 \
   " \
   ./cmd/gt
 

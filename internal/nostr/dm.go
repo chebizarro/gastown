@@ -51,7 +51,7 @@ func (d *DMSender) SendDM(ctx context.Context, recipientPubkey, content string, 
 	}
 
 	// Set pubkey from signer
-	rumor.PubKey = nostr.PubKey(d.signer.GetPublicKey())
+	rumor.PubKey = PubKeyFromHex(d.signer.GetPublicKey())
 
 	// TODO: Implement full NIP-17 gift wrap pipeline:
 	// 1. NIP-44 encrypt rumor → kind 13 seal
@@ -117,9 +117,9 @@ func (l *DMListener) Start(ctx context.Context) {
 	now := nostr.Timestamp(time.Now().Unix())
 	filters := []nostr.Filter{
 		{
-			Kinds: []int{1059, 4}, // gift wraps + legacy DMs
+			Kinds: KindSlice(1059, 4), // gift wraps + legacy DMs
 			Tags:  nostr.TagMap{"p": []string{pubkey}},
-			Since: &now,
+			Since: now,
 		},
 	}
 
@@ -131,7 +131,7 @@ func (l *DMListener) Start(ctx context.Context) {
 		for _, sub := range subs {
 			go func(s *nostr.Subscription) {
 				for event := range s.Events {
-					l.processEvent(ctx, event)
+					l.processEvent(ctx, &event)
 				}
 			}(sub)
 		}
@@ -139,7 +139,11 @@ func (l *DMListener) Start(ctx context.Context) {
 		<-ctx.Done()
 	}()
 
-	log.Printf("[nostr/dm] Listening for DMs addressed to %s...", pubkey[:8])
+	pubkeyPrefix := pubkey
+	if len(pubkeyPrefix) > 8 {
+		pubkeyPrefix = pubkeyPrefix[:8]
+	}
+	log.Printf("[nostr/dm] Listening for DMs addressed to %s...", pubkeyPrefix)
 }
 
 // Stop stops the DM listener.
@@ -162,12 +166,12 @@ func (l *DMListener) processEvent(ctx context.Context, event *nostr.Event) {
 		// 1. Decrypt kind 1059 → kind 13 seal
 		// 2. Decrypt kind 13 → kind 14 rumor
 		// 3. Extract sender pubkey and content
-		log.Printf("[nostr/dm] Received gift wrap from %s (NIP-17 unwrap TODO)", string(event.PubKey)[:8])
+		log.Printf("[nostr/dm] Received gift wrap from %s (NIP-17 unwrap TODO)", PubKeyToString(event.PubKey)[:8])
 
 	case 4:
 		// Legacy DM (NIP-04) — direct content
 		// TODO: NIP-04 decrypt
-		l.handler(string(event.PubKey), event.Content, event)
+		l.handler(PubKeyToString(event.PubKey), event.Content, event)
 
 	default:
 		log.Printf("[nostr/dm] Unexpected event kind %d", event.Kind)

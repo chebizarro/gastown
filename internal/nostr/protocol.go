@@ -120,7 +120,7 @@ func (r *ProtocolEventRouter) Dispatch(ctx context.Context, event *nostr.Event) 
 // SubscribeProtocol creates a Nostr subscription for protocol events addressed to a specific actor.
 func SubscribeProtocol(ctx context.Context, pool *RelayPool, actor string) []*nostr.Subscription {
 	filter := nostr.Filter{
-		Kinds: []int{KindProtocolEvent},
+		Kinds: KindSlice(KindProtocolEvent),
 		Tags:  nostr.TagMap{"to": []string{actor}},
 	}
 	return pool.Subscribe(ctx, []nostr.Filter{filter})

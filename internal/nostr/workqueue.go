@@ -76,7 +76,7 @@ func ClaimWorkItem(ctx context.Context, publisher *Publisher, original *nostr.Ev
 	tags = setTagValue(tags, "status", WorkStatusClaimed)
 	tags = append(tags,
 		nostr.Tag{"claimed_by", claimedBy},
-		nostr.Tag{"e", string(original.ID)}, // Reference original
+		nostr.Tag{"e", IDToString(original.ID)}, // Reference original
 	)
 
 	event := &nostr.Event{
@@ -106,7 +106,7 @@ func CompleteWorkItem(ctx context.Context, publisher *Publisher, original *nostr
 	tags = setTagValue(tags, "status", WorkStatusCompleted)
 	tags = append(tags,
 		nostr.Tag{"completed_by", completedBy},
-		nostr.Tag{"e", string(original.ID)},
+		nostr.Tag{"e", IDToString(original.ID)},
 	)
 
 	event := &nostr.Event{
@@ -137,7 +137,7 @@ func FailWorkItem(ctx context.Context, publisher *Publisher, original *nostr.Eve
 	tags = append(tags,
 		nostr.Tag{"failed_by", failedBy},
 		nostr.Tag{"failure_reason", reason},
-		nostr.Tag{"e", string(original.ID)},
+		nostr.Tag{"e", IDToString(original.ID)},
 	)
 
 	event := &nostr.Event{
@@ -153,7 +153,7 @@ func FailWorkItem(ctx context.Context, publisher *Publisher, original *nostr.Eve
 // SubscribeWorkQueue creates a subscription for work items on a queue.
 func SubscribeWorkQueue(pool *RelayPool, queueName string) []*nostr.Subscription {
 	filter := nostr.Filter{
-		Kinds: []int{KindWorkItem},
+		Kinds: KindSlice(KindWorkItem),
 		Tags:  nostr.TagMap{"queue": []string{queueName}, "status": []string{WorkStatusAvailable}},
 	}
 	return pool.Subscribe(context.Background(), []nostr.Filter{filter})
