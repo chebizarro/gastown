@@ -54,11 +54,14 @@ RUN useradd -m -u 10001 -s /bin/bash gastown
 COPY --from=builder /out/gt /usr/local/bin/gt
 COPY --from=builder /out/bd /usr/local/bin/bd
 
-# Pre-create the default workspace root and hand ownership to the runtime user
-# so the daemon can write state files even before host volumes are mounted.
-RUN mkdir -p /gt && chown gastown:gastown /gt
+# Pre-create the default workspace root
+RUN mkdir -p /gt
+
+COPY --chmod=755 scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 WORKDIR /gt
-USER gastown:gastown
 
-ENTRYPOINT ["gt"]
+# Run as root so the entrypoint can fix bind-mount permissions,
+# then exec gt (which doesn't need root — it just writes to /gt).
+# For hardened deployments, use --user in docker-compose.yml instead.
+ENTRYPOINT ["docker-entrypoint.sh"]
