@@ -63,6 +63,11 @@ var beadsExemptCommands = map[string]bool{
 	"dnd":        true,
 	"krc":           true, // KRC doesn't require beads
 	"run-migration": true, // Migration orchestrator handles its own beads checks
+	"daemon":        true, // Daemon manages its own beads checks
+	"run":           true, // Subcommand of daemon/agentloop/mcp — no beads check needed
+	"serve":         true, // Subcommand of mcp — no beads check needed
+	"agentloop":     true, // Agent loop manages its own beads checks
+	"mcp":           true, // MCP server manages its own beads checks
 }
 
 // Commands exempt from the town root branch warning.

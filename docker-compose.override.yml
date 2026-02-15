@@ -10,20 +10,22 @@
 # =============================================================================
 
 services:
-  gastown:
+  deacon:
     # Rebuild from source on every `docker compose up --build`
     build:
       context: .
       dockerfile: Dockerfile
-    # Mount source for faster iteration (rebuild still required for Go)
+      args:
+        VERSION: dev
+        COMMIT: local
+    # Mount source workspace for persistence
     volumes:
-      - ${GT_HOME:-./data/gt}:/home/gt/gt
-      - ${GT_SPOOL_DIR:-./data/spool}:/home/gt/.local/share/gt/spool
-      - ${SSH_KEY_DIR:-~/.ssh}:/home/gt/.ssh:ro
+      - ${GT_HOME:-./rigs}/${GT_RIG:-gastown}:/gt/${GT_RIG:-gastown}
+      - ${GT_SPOOL_DIR:-./runtime}/${GT_RIG:-gastown}:/gt/${GT_RIG:-gastown}/.runtime
     environment:
       # Development defaults
-      - GT_NOSTR_ENABLED=1
-      - GT_LOG_LEVEL=debug
+      GT_NOSTR_ENABLED: "1"
+      GT_LOG_LEVEL: debug
 
   relay:
     # In dev, expose relay on a predictable port
