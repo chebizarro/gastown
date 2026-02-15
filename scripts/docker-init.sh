@@ -39,10 +39,28 @@ echo ""
 # ---------------------------------------------------------------------------
 info "Creating data directories..."
 
-mkdir -p data/{gt,gt/settings,spool,keys}
-chmod 700 data/keys
+# Read rig name from .env if it exists, else default to "gastown"
+GT_RIG="${GT_RIG:-gastown}"
+if [ -f .env ]; then
+    ENV_RIG=$(grep '^GT_RIG=' .env 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
+    [ -n "$ENV_RIG" ] && GT_RIG="$ENV_RIG"
+fi
 
-ok "Data directories created"
+# Create the directories that docker-compose.yml bind-mounts expect
+mkdir -p "rigs/${GT_RIG}"
+mkdir -p "rigs/${GT_RIG}/mayor"
+mkdir -p "rigs/${GT_RIG}/daemon"
+mkdir -p "rigs/${GT_RIG}/settings"
+mkdir -p "runtime/${GT_RIG}"
+
+# Create the primary workspace marker so gt recognises the directory
+TOWN_JSON="rigs/${GT_RIG}/mayor/town.json"
+if [ ! -f "$TOWN_JSON" ]; then
+    echo "{\"name\": \"${GT_RIG}\", \"version\": 1}" > "$TOWN_JSON"
+    ok "Created workspace marker at $TOWN_JSON"
+fi
+
+ok "Data directories created (rig=$GT_RIG)"
 
 # ---------------------------------------------------------------------------
 # 2. Create .env from example if not present
@@ -58,7 +76,7 @@ fi
 # ---------------------------------------------------------------------------
 # 3. Create minimal nostr config if not present
 # ---------------------------------------------------------------------------
-NOSTR_CONFIG="data/gt/.nostr.json"
+NOSTR_CONFIG="rigs/${GT_RIG}/settings/nostr.json"
 if [ ! -f "$NOSTR_CONFIG" ]; then
     info "Creating default Nostr config at $NOSTR_CONFIG..."
     cat > "$NOSTR_CONFIG" << 'NOSTR_EOF'
@@ -93,7 +111,7 @@ if [ ! -f "$NOSTR_CONFIG" ]; then
 }
 NOSTR_EOF
     chmod 600 "$NOSTR_CONFIG"
-    ok "Nostr config created — edit $NOSTR_CONFIG to set your pubkey and bunker URI"
+    ok "Nostr config created — edit $NOSTR_CONFIG to set your pubkey and bunker"
 else
     ok "Nostr config already exists at $NOSTR_CONFIG"
 fi
@@ -171,8 +189,8 @@ echo "========================================="
 echo ""
 echo "  Next steps:"
 echo ""
-echo "  1. Edit .env — set GT_NOSTR_PUBKEY and GT_NOSTR_BUNKER"
-echo "  2. Edit data/gt/.nostr.json — replace placeholder pubkey/bunker"
+  echo "  1. Edit .env — set GT_NOSTR_PUBKEY and GT_NOSTR_BUNKER"
+echo "  2. Edit rigs/${GT_RIG}/settings/nostr.json — replace placeholder pubkey/bunker"
 echo "  3. Start the stack:"
 echo ""
 echo "     docker compose up -d"
@@ -184,7 +202,7 @@ echo ""
 echo "  5. Check health:"
 echo ""
 echo "     docker compose ps"
-echo "     docker compose logs -f gastown"
+echo "     docker compose logs -f deacon"
 echo ""
 echo "  Documentation: docs/DOCKER.md"
 echo ""

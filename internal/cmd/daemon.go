@@ -363,9 +363,24 @@ func runDaemonLogs(cmd *cobra.Command, args []string) error {
 }
 
 func runDaemonRun(cmd *cobra.Command, args []string) error {
-	townRoot, err := workspace.FindFromCwdOrError()
-	if err != nil {
-		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	// In Docker / headless deployments GT_TOWN_ROOT is set explicitly and the
+	// workspace marker (mayor/town.json) may not exist yet.  Prefer the env
+	// var when available; fall back to workspace detection for the native CLI
+	// path.
+	var townRoot string
+	if envRoot := os.Getenv("GT_TOWN_ROOT"); envRoot != "" {
+		townRoot = filepath.Clean(envRoot)
+		// Ensure the workspace skeleton exists so the daemon (and agents)
+		// can write state files even on a fresh deployment.
+		if err := ensureWorkspaceSkeleton(townRoot); err != nil {
+			return fmt.Errorf("initializing workspace skeleton: %w", err)
+		}
+	} else {
+		var err error
+		townRoot, err = workspace.FindFromCwdOrError()
+		if err != nil {
+			return fmt.Errorf("not in a Gas Town workspace: %w", err)
+		}
 	}
 
 	// Clear agent identity env vars inherited from the launch environment.
@@ -474,5 +489,31 @@ func runDaemonRotateLogs(cmd *cobra.Command, args []string) error {
 		fmt.Printf("%s No logs needed rotation\n", style.Bold.Render("✓"))
 	}
 
+	return nil
+}
+
+// ensureWorkspaceSkeleton creates the minimal directory structure that Gas Town
+// expects so the daemon can start in a bare Docker volume.  This is idempotent.
+func ensureWorkspaceSkeleton(townRoot string) error {
+	dirs := []string{
+		filepath.Join(townRoot, "mayor"),
+		filepath.Join(townRoot, "daemon"),
+		filepath.Join(townRoot, "settings"),
+		filepath.Join(townRoot, ".runtime"),
+	}
+	for _, d := range dirs {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			return err
+		}
+	}
+	// Create the primary workspace marker if missing.
+	townJSON := filepath.Join(townRoot, "mayor", "town.json")
+	if _, err := os.Stat(townJSON); os.IsNotExist(err) {
+		rigName := filepath.Base(townRoot)
+		content := fmt.Sprintf(`{"name": %q, "version": 1}`, rigName)
+		if err := os.WriteFile(townJSON, []byte(content), 0644); err != nil {
+			return err
+		}
+	}
 	return nil
 }

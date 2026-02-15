@@ -54,6 +54,10 @@ RUN useradd -m -u 10001 -s /bin/bash gastown
 COPY --from=builder /out/gt /usr/local/bin/gt
 COPY --from=builder /out/bd /usr/local/bin/bd
 
+# Pre-create the default workspace root and hand ownership to the runtime user
+# so the daemon can write state files even before host volumes are mounted.
+RUN mkdir -p /gt && chown gastown:gastown /gt
+
 WORKDIR /gt
 USER gastown:gastown
 
