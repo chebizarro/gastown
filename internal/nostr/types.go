@@ -10,7 +10,12 @@
 //   - IdentityManager: per-agent keypair provisioning
 package nostr
 
-import "fiatjaf.com/nostr"
+import (
+	"encoding/hex"
+	"fmt"
+
+	"fiatjaf.com/nostr"
+)
 
 // --- Event Kind Constants ---
 
@@ -131,6 +136,41 @@ func VisibilityTag(visibility string) nostr.Tag {
 // SchemaVersion returns a schema identifier string like "gt/log@1".
 func SchemaVersion(name string, version int) string {
 	return SchemaPrefix + name + "@" + itoa(version)
+}
+
+// --- Type Conversion Helpers ---
+// The fiatjaf.com/nostr library uses fixed-size byte array types for ID and PubKey
+// (not string aliases). These helpers provide safe conversions.
+
+// IDToString converts a nostr.ID (byte array) to its hex string representation.
+func IDToString(id nostr.ID) string {
+	return fmt.Sprintf("%x", id)
+}
+
+// PubKeyFromHex converts a hex string to a nostr.PubKey byte array.
+// Returns a zero PubKey if the hex string is invalid or wrong length.
+func PubKeyFromHex(hexStr string) nostr.PubKey {
+	var pk nostr.PubKey
+	b, err := hex.DecodeString(hexStr)
+	if err != nil || len(b) != len(pk) {
+		return pk // zero value
+	}
+	copy(pk[:], b)
+	return pk
+}
+
+// PubKeyToString converts a nostr.PubKey (byte array) to its hex string representation.
+func PubKeyToString(pk nostr.PubKey) string {
+	return fmt.Sprintf("%x", pk)
+}
+
+// KindSlice converts plain int values to a []nostr.Kind slice.
+func KindSlice(kinds ...int) []nostr.Kind {
+	result := make([]nostr.Kind, len(kinds))
+	for i, k := range kinds {
+		result[i] = nostr.Kind(k)
+	}
+	return result
 }
 
 // itoa is a simple int-to-string without importing strconv.
