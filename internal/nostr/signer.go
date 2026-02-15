@@ -45,13 +45,7 @@ func NewNIP46Signer(ctx context.Context, bunkerURI string) (*NIP46Signer, error)
 
 	// ConnectBunker requires: ctx, clientSecretKey, bunkerURI, pool, statusCallback
 	// Generate an ephemeral client secret key for the NIP-46 connection.
-	clientKeyHex := nostr.GeneratePrivateKey()
-	var clientKey nostr.SecretKey
-	if b, err := hex.DecodeString(clientKeyHex); err == nil && len(b) == len(clientKey) {
-		copy(clientKey[:], b)
-	} else {
-		return nil, fmt.Errorf("generating client key: invalid hex from GeneratePrivateKey")
-	}
+	clientKey := nostr.GenerateSecretKey()
 	bunker, err := nip46.ConnectBunker(ctx, clientKey, bunkerURI, nil, func(status string) {
 		log.Printf("[nostr/signer] bunker status: %s", status)
 	})
@@ -59,15 +53,14 @@ func NewNIP46Signer(ctx context.Context, bunkerURI string) (*NIP46Signer, error)
 		return nil, fmt.Errorf("connecting to bunker: %w", err)
 	}
 
-	pubkey, err := bunker.GetPublicKey(ctx)
+	pubkeyBytes, err := bunker.GetPublicKey(ctx)
 	if err != nil {
-		bunker.Close()
 		return nil, fmt.Errorf("getting public key from bunker: %w", err)
 	}
 
 	return &NIP46Signer{
 		bunkerURI: bunkerURI,
-		pubkey:    pubkey,
+		pubkey:    PubKeyToString(pubkeyBytes),
 		bunker:    bunker,
 	}, nil
 }
@@ -92,10 +85,9 @@ func (s *NIP46Signer) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.bunker != nil {
-		s.bunker.Close()
-		s.bunker = nil
-	}
+	// BunkerClient does not expose a Close method.
+	// The underlying connection is managed by the relay pool.
+	s.bunker = nil
 	return nil
 }
 
@@ -119,13 +111,8 @@ func NewLocalSigner(privkeyHex string) (*LocalSigner, error) {
 	} else {
 		return nil, fmt.Errorf("invalid private key hex: %v", decErr)
 	}
-	pubkeyResult, err := nostr.GetPublicKey(sk)
-	if err != nil {
-		return nil, fmt.Errorf("deriving public key: %w", err)
-	}
-	// GetPublicKey may return string or PubKey depending on library version.
-	// We store as hex string for our interface.
-	pubkey := fmt.Sprintf("%x", pubkeyResult)
+	pubkeyResult := nostr.GetPublicKey(sk)
+	pubkey := PubKeyToString(pubkeyResult)
 	return &LocalSigner{
 		privkey:   privkeyHex,
 		secretKey: sk,
