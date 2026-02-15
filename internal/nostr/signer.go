@@ -2,7 +2,6 @@ package nostr
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
 	"log"
 	"strings"
@@ -45,7 +44,7 @@ func NewNIP46Signer(ctx context.Context, bunkerURI string) (*NIP46Signer, error)
 
 	// ConnectBunker requires: ctx, clientSecretKey, bunkerURI, pool, statusCallback
 	// Generate an ephemeral client secret key for the NIP-46 connection.
-	clientKey := nostr.GenerateSecretKey()
+	clientKey := nostr.Generate()
 	bunker, err := nip46.ConnectBunker(ctx, clientKey, bunkerURI, nil, func(status string) {
 		log.Printf("[nostr/signer] bunker status: %s", status)
 	})
@@ -70,7 +69,7 @@ func (s *NIP46Signer) Sign(ctx context.Context, event *nostr.Event) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	event.PubKey = PubKeyFromHex(s.pubkey)
+	event.PubKey = PubKeyFromHexGT(s.pubkey)
 
 	return s.bunker.SignEvent(ctx, event)
 }
@@ -104,12 +103,9 @@ type LocalSigner struct {
 // NewLocalSigner creates a signer from a hex-encoded private key.
 // WARNING: This stores a secret key in memory. Use only for testing.
 func NewLocalSigner(privkeyHex string) (*LocalSigner, error) {
-	// Decode hex to SecretKey byte array first
-	var sk nostr.SecretKey
-	if b, decErr := hex.DecodeString(privkeyHex); decErr == nil && len(b) == len(sk) {
-		copy(sk[:], b)
-	} else {
-		return nil, fmt.Errorf("invalid private key hex: %v", decErr)
+	sk, err := nostr.SecretKeyFromHex(privkeyHex)
+	if err != nil {
+		return nil, fmt.Errorf("invalid private key hex: %w", err)
 	}
 	pubkeyResult := nostr.GetPublicKey(sk)
 	pubkey := PubKeyToString(pubkeyResult)
@@ -122,7 +118,7 @@ func NewLocalSigner(privkeyHex string) (*LocalSigner, error) {
 
 // Sign signs an event with the local private key.
 func (s *LocalSigner) Sign(_ context.Context, event *nostr.Event) error {
-	event.PubKey = PubKeyFromHex(s.pubkey)
+	event.PubKey = PubKeyFromHexGT(s.pubkey)
 	return event.Sign(s.secretKey)
 }
 
