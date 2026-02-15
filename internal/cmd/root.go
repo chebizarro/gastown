@@ -77,6 +77,11 @@ var beadsExemptCommands = map[string]bool{
 	"health":        true, // Health check doesn't require beads
 	"upgrade":       true, // Post-install migration orchestrator
 	"heartbeat":     true, // Heartbeat state update — must be fast and dependency-free
+	"daemon":        true, // Daemon manages its own beads checks
+	"run":           true, // Subcommand of daemon/agentloop/mcp — no beads check needed
+	"serve":         true, // Subcommand of mcp — no beads check needed
+	"agentloop":     true, // Agent loop manages its own beads checks
+	"mcp":           true, // MCP server manages its own beads checks
 }
 
 // Commands exempt from the town root branch warning.

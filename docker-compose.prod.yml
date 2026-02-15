@@ -13,17 +13,17 @@
 # =============================================================================
 
 services:
-  gastown:
+  deacon:
     image: gastown:${GT_VERSION:-latest}
     build: !reset null
     restart: always
     environment:
-      - GT_NOSTR_ENABLED=1
-      - GT_LOG_LEVEL=info
+      GT_NOSTR_ENABLED: "1"
+      GT_LOG_LEVEL: info
       # In production, sunset local paths once validated
-      - GT_EVENTS_LOCAL=${GT_EVENTS_LOCAL:-0}
-      - GT_FEED_CURATOR=${GT_FEED_CURATOR:-0}
-      - GT_CONVOY_LOCAL=${GT_CONVOY_LOCAL:-0}
+      GT_EVENTS_LOCAL: ${GT_EVENTS_LOCAL:-0}
+      GT_FEED_CURATOR: ${GT_FEED_CURATOR:-0}
+      GT_CONVOY_LOCAL: ${GT_CONVOY_LOCAL:-0}
     deploy:
       resources:
         limits:
@@ -36,6 +36,36 @@ services:
       options:
         max-size: "50m"
         max-file: "5"
+
+  agentloop:
+    image: gastown:${GT_VERSION:-latest}
+    build: !reset null
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  mcp:
+    image: gastown:${GT_VERSION:-latest}
+    build: !reset null
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "25m"
+        max-file: "3"
 
   relay:
     restart: always
