@@ -9,12 +9,9 @@ services:
       - relay-data:/usr/src/app/db
     ports:
       - "${GT_RELAY_PORT:-7777}:7000"
-    healthcheck:
-      test: ["CMD-SHELL", "echo '{}' | timeout 2 websocat ws://localhost:7000 || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
+    # Note: no healthcheck — scsibug/nostr-rs-relay is a minimal image
+    # without curl/wget/nc/bash. The relay is considered "ready" once
+    # the container starts. The deacon's spool handles relay unavailability.
     restart: unless-stopped
 
   blossom:
@@ -51,7 +48,7 @@ services:
     command: ["daemon", "run"]
     depends_on:
       relay:
-        condition: service_healthy
+        condition: service_started
       blossom:
         condition: service_healthy
     environment:
@@ -176,7 +173,7 @@ services:
       VITE_DEFAULT_BLOSSOM: "http://blossom:3000"
     depends_on:
       relay:
-        condition: service_healthy
+        condition: service_started
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
