@@ -40,6 +40,11 @@ func runMCPServe(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// In Docker deployments the workspace marker may not exist yet.
+	if err := ensureWorkspaceSkeleton(townRoot); err != nil {
+		return fmt.Errorf("initializing workspace skeleton: %w", err)
+	}
+
 	rigName := strings.TrimSpace(mcpRig)
 	if rigName == "" {
 		// Prefer GT_RIG if present, else derive from townRoot basename.

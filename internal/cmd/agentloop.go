@@ -54,6 +54,11 @@ func runAgentLoopRun(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// In Docker deployments the workspace marker may not exist yet.
+	if err := ensureWorkspaceSkeleton(townRoot); err != nil {
+		return fmt.Errorf("initializing workspace skeleton: %w", err)
+	}
+
 	role := strings.TrimSpace(alRole)
 	if role == "" {
 		return fmt.Errorf("--role is required")
