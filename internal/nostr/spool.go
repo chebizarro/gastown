@@ -170,7 +170,7 @@ func (s *Spool) Drain(ctx context.Context, pool *RelayPool) (sent int, failed in
 			Kind:      nostr.Kind(entry.Kind),
 			Tags:      entry.Tags,
 			Content:   entry.Content,
-			PubKey:    PubKeyFromHex(entry.PubKey),
+			PubKey:    PubKeyFromHexGT(entry.PubKey),
 			Sig:       SigFromHex(entry.Sig),
 		}
 

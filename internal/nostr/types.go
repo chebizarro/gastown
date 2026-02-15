@@ -12,7 +12,6 @@ package nostr
 
 import (
 	"encoding/hex"
-	"fmt"
 
 	"fiatjaf.com/nostr"
 )
@@ -144,24 +143,23 @@ func SchemaVersion(name string, version int) string {
 
 // IDToString converts a nostr.ID (byte array) to its hex string representation.
 func IDToString(id nostr.ID) string {
-	return fmt.Sprintf("%x", id)
+	return id.Hex()
 }
 
-// PubKeyFromHex converts a hex string to a nostr.PubKey byte array.
+// PubKeyFromHexGT converts a hex string to a nostr.PubKey byte array.
 // Returns a zero PubKey if the hex string is invalid or wrong length.
-func PubKeyFromHex(hexStr string) nostr.PubKey {
-	var pk nostr.PubKey
-	b, err := hex.DecodeString(hexStr)
-	if err != nil || len(b) != len(pk) {
-		return pk // zero value
+// Wraps the library's PubKeyFromHex which validates the key.
+func PubKeyFromHexGT(hexStr string) nostr.PubKey {
+	pk, err := nostr.PubKeyFromHex(hexStr)
+	if err != nil {
+		return nostr.PubKey{} // zero value
 	}
-	copy(pk[:], b)
 	return pk
 }
 
 // PubKeyToString converts a nostr.PubKey (byte array) to its hex string representation.
 func PubKeyToString(pk nostr.PubKey) string {
-	return fmt.Sprintf("%x", pk)
+	return pk.Hex()
 }
 
 // SigFromHex converts a hex string to a nostr Sig byte array ([64]byte).
@@ -176,7 +174,7 @@ func SigFromHex(hexStr string) [64]byte {
 	return sig
 }
 
-// KindSlice converts plain int values to a []nostr.Kind slice.
+// KindSlice converts plain int values to a []nostr.Kind (uint16) slice.
 func KindSlice(kinds ...int) []nostr.Kind {
 	result := make([]nostr.Kind, len(kinds))
 	for i, k := range kinds {

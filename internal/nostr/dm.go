@@ -51,7 +51,7 @@ func (d *DMSender) SendDM(ctx context.Context, recipientPubkey, content string, 
 	}
 
 	// Set pubkey from signer
-	rumor.PubKey = PubKeyFromHex(d.signer.GetPublicKey())
+	rumor.PubKey = PubKeyFromHexGT(d.signer.GetPublicKey())
 
 	// TODO: Implement full NIP-17 gift wrap pipeline:
 	// 1. NIP-44 encrypt rumor → kind 13 seal
