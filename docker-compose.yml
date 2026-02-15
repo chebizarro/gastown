@@ -1,4 +1,44 @@
 services:
+  # ---------------------------------------------------------------------------
+  # Infrastructure: Nostr Relay + Blossom blob storage
+  # ---------------------------------------------------------------------------
+  relay:
+    image: scsibug/nostr-rs-relay:latest
+    volumes:
+      - ./config/relay.toml:/usr/src/app/config.toml:ro
+      - relay-data:/usr/src/app/db
+    ports:
+      - "${GT_RELAY_PORT:-7777}:7000"
+    healthcheck:
+      test: ["CMD-SHELL", "echo '{}' | timeout 2 websocat ws://localhost:7000 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  blossom:
+    image: ghcr.io/hzrd149/blossom-server:latest
+    environment:
+      DATA_DIR: /data
+      PORT: "3000"
+      # Optional: restrict uploads to known pubkeys
+      # AUTHORIZED_PUBKEYS: "${GT_BLOSSOM_PUBKEYS:-}"
+    volumes:
+      - blossom-data:/data
+    ports:
+      - "${GT_BLOSSOM_PORT:-8005}:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Gas Town services
+  # ---------------------------------------------------------------------------
   deacon:
     build:
       context: .
@@ -9,6 +49,11 @@ services:
         BUILD_TIME: ${GT_BUILD_TIME:-1970-01-01T00:00:00Z}
     image: gastown:local
     command: ["daemon", "run"]
+    depends_on:
+      relay:
+        condition: service_healthy
+      blossom:
+        condition: service_healthy
     environment:
       GT_RIG: ${GT_RIG:-gastown}
 
@@ -16,9 +61,12 @@ services:
       GT_TOWN_ROOT: /gt/${GT_RIG}
       GT_ROOT: /gt/${GT_RIG}
 
-      # Nostr support
+      # Nostr support — relay/blossom via Docker internal DNS
       GT_NOSTR_ENABLED: "1"
       GT_NOSTR_CONFIG: /gt/${GT_RIG}/settings/nostr.json
+      GT_NOSTR_WRITE_RELAYS: "ws://relay:7000"
+      GT_NOSTR_READ_RELAYS: "ws://relay:7000"
+      GT_NOSTR_BLOSSOM_SERVERS: "http://blossom:3000"
 
       # Optional migration/sunset flags (defaults preserve local behavior)
       GT_EVENTS_LOCAL: ${GT_EVENTS_LOCAL:-1}
@@ -62,6 +110,9 @@ services:
 
       GT_NOSTR_ENABLED: "1"
       GT_NOSTR_CONFIG: /gt/${GT_RIG}/settings/nostr.json
+      GT_NOSTR_WRITE_RELAYS: "ws://relay:7000"
+      GT_NOSTR_READ_RELAYS: "ws://relay:7000"
+      GT_NOSTR_BLOSSOM_SERVERS: "http://blossom:3000"
 
       # LLM creds referenced via agents.json (api.api_key: "$OPENAI_API_KEY" etc.)
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
@@ -94,6 +145,9 @@ services:
 
       GT_NOSTR_ENABLED: "1"
       GT_NOSTR_CONFIG: /gt/${GT_RIG}/settings/nostr.json
+      GT_NOSTR_WRITE_RELAYS: "ws://relay:7000"
+      GT_NOSTR_READ_RELAYS: "ws://relay:7000"
+      GT_NOSTR_BLOSSOM_SERVERS: "http://blossom:3000"
     working_dir: /gt/${GT_RIG:-gastown}
     ports:
       - "9500:9500"
@@ -106,3 +160,61 @@ services:
       timeout: 3s
       retries: 10
     restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Optional: Flotilla web UI (activate with --profile ui)
+  # ---------------------------------------------------------------------------
+  flotilla:
+    build:
+      context: ${GT_FLOTILLA_PATH:-../flotilla}
+      dockerfile: Dockerfile
+    profiles: [ui]
+    ports:
+      - "${GT_FLOTILLA_PORT:-1847}:1847"
+    environment:
+      VITE_FORCE_RELAYS: "ws://relay:7000"
+      VITE_DEFAULT_BLOSSOM: "http://blossom:3000"
+    depends_on:
+      relay:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Optional: Local LLM via Ollama (activate with --profile llm)
+  # ---------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    profiles: [llm]
+    ports:
+      - "${GT_OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # CPU-only variant (activate with --profile llm-cpu)
+  ollama-cpu:
+    image: ollama/ollama:latest
+    profiles: [llm-cpu]
+    ports:
+      - "${GT_OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    restart: unless-stopped
+
+# =============================================================================
+# Named volumes for persistent data
+# =============================================================================
+volumes:
+  relay-data:
+    driver: local
+  blossom-data:
+    driver: local
+  ollama-data:
+    driver: local
