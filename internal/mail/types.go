@@ -29,7 +29,6 @@ const (
 // MessageType indicates the purpose of a message.
 type MessageType string
 
-
 const (
 	// TypeTask indicates a message requiring action from the recipient.
 	TypeTask MessageType = "task"
@@ -100,7 +99,7 @@ type Message struct {
 	// Pinned marks the message as pinned (won't be auto-archived).
 	Pinned bool `json:"pinned,omitempty"`
 
-	// Wisp marks this as a transient message (stored in same DB but filtered from JSONL export).
+	// Wisp marks this as a transient message (stored in same DB but not synced to git).
 	// Wisp messages auto-cleanup on patrol squash.
 	Wisp bool `json:"wisp,omitempty"`
 
@@ -123,6 +122,18 @@ type Message struct {
 	// ClaimedAt is when the queue message was claimed.
 	// Only set for queue messages after claiming.
 	ClaimedAt *time.Time `json:"claimed_at,omitempty"`
+
+	// DeliveryState tracks two-phase mailbox delivery state: pending or acked.
+	DeliveryState string `json:"delivery_state,omitempty"`
+	// DeliveryAckedBy is the recipient identity that acknowledged receipt.
+	DeliveryAckedBy string `json:"delivery_acked_by,omitempty"`
+	// DeliveryAckedAt is when receipt was acknowledged.
+	DeliveryAckedAt *time.Time `json:"delivery_acked_at,omitempty"`
+
+	// SuppressNotify tells the router to skip all recipient notification
+	// (no nudge, no banner). Set by the CLI when --no-notify is passed.
+	// In-memory only — not serialized.
+	SuppressNotify bool `json:"-"`
 }
 
 // NewMessage creates a new message with a generated ID and thread ID.
@@ -290,7 +301,7 @@ type BeadsMessage struct {
 	CreatedAt   time.Time `json:"created_at"`
 	Labels      []string  `json:"labels"` // Metadata labels (from:X, thread:X, reply-to:X, msg-type:X, cc:X, queue:X, channel:X, claimed-by:X, claimed-at:X)
 	Pinned      bool      `json:"pinned,omitempty"`
-	Wisp        bool      `json:"wisp,omitempty"` // Ephemeral message (filtered from JSONL export)
+	Wisp        bool      `json:"wisp,omitempty"` // Ephemeral message (not synced to git)
 
 	// Cached parsed values (populated by ParseLabels)
 	sender    string
@@ -302,6 +313,10 @@ type BeadsMessage struct {
 	channel   string     // Channel name (for broadcast messages)
 	claimedBy string     // Who claimed the queue message
 	claimedAt *time.Time // When the queue message was claimed
+	// Two-phase delivery metadata
+	deliveryState   string
+	deliveryAckedBy string
+	deliveryAckedAt *time.Time
 }
 
 // ParseLabels extracts metadata from the labels array.
@@ -316,6 +331,9 @@ func (bm *BeadsMessage) ParseLabels() {
 	bm.channel = ""
 	bm.claimedBy = ""
 	bm.claimedAt = nil
+	bm.deliveryState = ""
+	bm.deliveryAckedBy = ""
+	bm.deliveryAckedAt = nil
 
 	for _, label := range bm.Labels {
 		if strings.HasPrefix(label, "from:") {
@@ -341,6 +359,8 @@ func (bm *BeadsMessage) ParseLabels() {
 			}
 		}
 	}
+
+	bm.deliveryState, bm.deliveryAckedBy, bm.deliveryAckedAt = ParseDeliveryLabels(bm.Labels)
 }
 
 // GetCC returns the parsed CC recipients.
@@ -390,23 +410,26 @@ func (bm *BeadsMessage) ToMessage() *Message {
 	}
 
 	return &Message{
-		ID:        bm.ID,
-		From:      identityToAddress(bm.sender),
-		To:        identityToAddress(bm.Assignee),
-		Subject:   bm.Title,
-		Body:      bm.Description,
-		Timestamp: bm.CreatedAt,
-		Read:      bm.Status == "closed" || bm.HasLabel("read"),
-		Priority:  priority,
-		Type:      msgType,
-		ThreadID:  bm.threadID,
-		ReplyTo:   bm.replyTo,
-		Wisp:      bm.Wisp,
-		CC:        ccAddrs,
-		Queue:     bm.queue,
-		Channel:   bm.channel,
-		ClaimedBy: bm.claimedBy,
-		ClaimedAt: bm.claimedAt,
+		ID:              bm.ID,
+		From:            identityToAddress(bm.sender),
+		To:              identityToAddress(bm.Assignee),
+		Subject:         bm.Title,
+		Body:            bm.Description,
+		Timestamp:       bm.CreatedAt,
+		Read:            bm.Status == "closed" || bm.HasLabel("read"),
+		Priority:        priority,
+		Type:            msgType,
+		ThreadID:        bm.threadID,
+		ReplyTo:         bm.replyTo,
+		Wisp:            bm.Wisp,
+		CC:              ccAddrs,
+		Queue:           bm.queue,
+		Channel:         bm.channel,
+		ClaimedBy:       bm.claimedBy,
+		ClaimedAt:       bm.claimedAt,
+		DeliveryState:   bm.deliveryState,
+		DeliveryAckedBy: bm.deliveryAckedBy,
+		DeliveryAckedAt: bm.deliveryAckedAt,
 	}
 }
 
@@ -511,10 +534,43 @@ func ParseMessageType(s string) MessageType {
 	}
 }
 
-// AddressToIdentity converts a GGT address to a beads identity.
+// normalizeAddress handles the common normalization logic shared by
+// AddressToIdentity and identityToAddress.
 //
-// Liberal normalization: accepts multiple address formats and normalizes
-// to canonical form (Postel's Law - be liberal in what you accept).
+// Liberal normalization (Postel's Law - be liberal in what you accept):
+//   - "overseer" → "overseer" (human operator, no trailing slash)
+//   - "mayor" or "mayor/" → "mayor/" (town-level, trailing slash)
+//   - "deacon" or "deacon/" → "deacon/" (town-level, trailing slash)
+//   - "gastown/polecats/Toast" → "gastown/Toast" (crew/polecats normalized)
+//   - "gastown/crew/max" → "gastown/max" (crew/polecats normalized)
+//   - "gastown/Toast" → "gastown/Toast" (already canonical)
+//   - "gastown/refinery" → "gastown/refinery"
+func normalizeAddress(s string) string {
+	// Overseer (human operator) - no trailing slash, distinct from agents
+	if s == "overseer" {
+		return "overseer"
+	}
+
+	// Town-level agents: mayor and deacon keep trailing slash
+	if s == "mayor" || s == "mayor/" {
+		return "mayor/"
+	}
+	if s == "deacon" || s == "deacon/" {
+		return "deacon/"
+	}
+
+	// Normalize crew/ and polecats/ to canonical form:
+	// "rig/crew/name" → "rig/name"
+	// "rig/polecats/name" → "rig/name"
+	parts := strings.Split(s, "/")
+	if len(parts) == 3 && (parts[1] == "crew" || parts[1] == "polecats") {
+		return parts[0] + "/" + parts[2]
+	}
+
+	return s
+}
+
+// AddressToIdentity converts a GGT address to a beads identity.
 //
 // Addresses use slash format:
 //   - "overseer" → "overseer" (human operator, no trailing slash)
@@ -528,38 +584,17 @@ func ParseMessageType(s string) MessageType {
 //   - "gastown/refinery" → "gastown/refinery"
 //   - "gastown/" → "gastown" (rig broadcast)
 func AddressToIdentity(address string) string {
-	// Overseer (human operator) - no trailing slash, distinct from agents
-	if address == "overseer" {
-		return "overseer"
-	}
-
-	// Town-level agents: mayor and deacon keep trailing slash
-	if address == "mayor" || address == "mayor/" {
-		return "mayor/"
-	}
-	if address == "deacon" || address == "deacon/" {
-		return "deacon/"
-	}
-
-	// Trim trailing slash for rig-level addresses
+	// Trim trailing slash for rig-level addresses before normalization.
+	// normalizeAddress handles mayor/ and deacon/ correctly even after trimming.
 	if len(address) > 0 && address[len(address)-1] == '/' {
 		address = address[:len(address)-1]
 	}
-
-	// Normalize crew/ and polecats/ to canonical form:
-	// "rig/crew/name" → "rig/name"
-	// "rig/polecats/name" → "rig/name"
-	parts := strings.Split(address, "/")
-	if len(parts) == 3 && (parts[1] == "crew" || parts[1] == "polecats") {
-		return parts[0] + "/" + parts[2]
-	}
-
-	return address
+	return normalizeAddress(address)
 }
 
 // identityToAddress converts a beads identity back to a GGT address.
 //
-// Liberal normalization (Postel's Law):
+// Examples:
 //   - "overseer" → "overseer" (human operator)
 //   - "mayor/" → "mayor/"
 //   - "deacon/" → "deacon/"
@@ -568,24 +603,5 @@ func AddressToIdentity(address string) string {
 //   - "gastown/Toast" → "gastown/Toast" (already canonical)
 //   - "gastown/refinery" → "gastown/refinery"
 func identityToAddress(identity string) string {
-	// Overseer (human operator) - no trailing slash
-	if identity == "overseer" {
-		return "overseer"
-	}
-
-	// Town-level agents ensure trailing slash
-	if identity == "mayor" || identity == "mayor/" {
-		return "mayor/"
-	}
-	if identity == "deacon" || identity == "deacon/" {
-		return "deacon/"
-	}
-
-	// Normalize crew/ and polecats/ to canonical form
-	parts := strings.Split(identity, "/")
-	if len(parts) == 3 && (parts[1] == "crew" || parts[1] == "polecats") {
-		return parts[0] + "/" + parts[2]
-	}
-
-	return identity
+	return normalizeAddress(identity)
 }

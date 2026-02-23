@@ -17,6 +17,7 @@ import (
 	"github.com/steveyegge/gastown/internal/crew"
 	"github.com/steveyegge/gastown/internal/daemon"
 	"github.com/steveyegge/gastown/internal/deacon"
+	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mayor"
 	"github.com/steveyegge/gastown/internal/polecat"
@@ -42,6 +43,7 @@ var (
 	startCrewRig                string
 	startCrewAccount            string
 	startCrewAgentOverride      string
+	startCostTier               string
 	shutdownGraceful            bool
 	shutdownWait                int
 	shutdownAll                 bool
@@ -132,6 +134,7 @@ func init() {
 	startCmd.Flags().BoolVarP(&startAll, "all", "a", false,
 		"Also start Witnesses and Refineries for all rigs")
 	startCmd.Flags().StringVar(&startAgentOverride, "agent", "", "Agent alias to run Mayor/Deacon with (overrides town default)")
+	startCmd.Flags().StringVar(&startCostTier, "cost-tier", "", "Ephemeral cost tier for this session (standard/economy/budget)")
 
 	startCrewCmd.Flags().StringVar(&startCrewRig, "rig", "", "Rig to use")
 	startCrewCmd.Flags().StringVar(&startCrewAccount, "account", "", "Claude Code account handle to use")
@@ -179,6 +182,15 @@ func runStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
+	// Apply ephemeral cost tier if specified
+	if startCostTier != "" {
+		if !config.IsValidTier(startCostTier) {
+			return fmt.Errorf("invalid cost tier %q (valid: %s)", startCostTier, strings.Join(config.ValidCostTiers(), ", "))
+		}
+		os.Setenv("GT_COST_TIER", startCostTier)
+		fmt.Printf("Using ephemeral cost tier: %s\n", style.Bold.Render(startCostTier))
+	}
+
 	if err := config.EnsureDaemonPatrolConfig(townRoot); err != nil {
 		fmt.Printf("  %s Could not ensure daemon config: %v\n", style.Dim.Render("○"), err)
 	}
@@ -188,7 +200,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// Clean up orphaned tmux sessions before starting new agents.
 	// This prevents session name conflicts and resource accumulation from
 	// zombie sessions (tmux alive but Claude dead).
-	if cleaned, err := t.CleanupOrphanedSessions(); err != nil {
+	if cleaned, err := t.CleanupOrphanedSessions(session.IsKnownSession); err != nil {
 		fmt.Printf("  %s Could not clean orphaned sessions: %v\n", style.Dim.Render("○"), err)
 	} else if cleaned > 0 {
 		fmt.Printf("  %s Cleaned up %d orphaned session(s)\n", style.Bold.Render("✓"), cleaned)
@@ -209,6 +221,36 @@ func runStart(cmd *cobra.Command, args []string) error {
 	var wg sync.WaitGroup
 	var mu sync.Mutex // Protects stdout
 	var coreErr error
+	var doltOK bool
+
+	// Ensure Dolt server is running (prerequisite for beads)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		cfg := doltserver.DefaultConfig(townRoot)
+		if _, err := os.Stat(cfg.DataDir); os.IsNotExist(err) {
+			// No Dolt data dir — nothing to start
+			return
+		}
+		running, _, _ := doltserver.IsRunning(townRoot)
+		if running {
+			doltOK = true
+			mu.Lock()
+			fmt.Printf("  %s Dolt server already running\n", style.Dim.Render("○"))
+			mu.Unlock()
+			return
+		}
+		if err := doltserver.Start(townRoot); err != nil {
+			mu.Lock()
+			fmt.Printf("  %s Dolt server failed: %v\n", style.Dim.Render("○"), err)
+			mu.Unlock()
+		} else {
+			doltOK = true
+			mu.Lock()
+			fmt.Printf("  %s Dolt server started (port %d)\n", style.Bold.Render("✓"), doltserver.DefaultPort)
+			mu.Unlock()
+		}
+	}()
 
 	// Start core agents (Mayor and Deacon) in background
 	wg.Add(1)
@@ -240,6 +282,11 @@ func runStart(cmd *cobra.Command, args []string) error {
 	}
 
 	wg.Wait()
+
+	// Ensure beads metadata points to the Dolt server
+	if doltOK {
+		_, _ = doltserver.EnsureAllMetadata(townRoot)
+	}
 
 	if coreErr != nil {
 		return coreErr
@@ -406,15 +453,19 @@ func startConfiguredCrew(t *tmux.Tmux, rigs []*rig.Rig, townRoot string, mu *syn
 }
 
 // startOrRestartCrewMember starts or restarts a single crew member and returns a status message.
+// Uses IsAgentAlive for robust zombie detection (checks pane command + descendant processes),
+// and delegates zombie cleanup to crewMgr.Start() which kills the zombie session and recreates
+// it with fresh env vars and runtime settings.
 func startOrRestartCrewMember(t *tmux.Tmux, r *rig.Rig, crewName, townRoot string) (msg string, started bool) {
 	sessionID := crewSessionName(r.Name, crewName)
 	if running, _ := t.HasSession(sessionID); running {
-		// Session exists - check if agent is still running
-		agentCfg := config.ResolveRoleAgentConfig(constants.RoleCrew, townRoot, r.Path)
-		if !t.IsAgentRunning(sessionID, config.ExpectedPaneCommands(agentCfg)...) {
+		// Session exists - check if agent is still alive
+		// Uses descendant process check instead of pane command check,
+		// since crew members launch via bash -c wrappers (see #1315, #1330).
+		if !t.IsAgentAlive(sessionID) {
 			// Agent has exited, restart it
 			// Build startup beacon for predecessor discovery via /resume
-			address := fmt.Sprintf("%s/crew/%s", r.Name, crewName)
+			address := session.BeaconRecipient("crew", crewName, r.Name)
 			beacon := session.FormatStartupBeacon(session.BeaconConfig{
 				Recipient: address,
 				Sender:    "human",
@@ -426,6 +477,7 @@ func startOrRestartCrewMember(t *tmux.Tmux, r *rig.Rig, crewName, townRoot strin
 			}
 			return fmt.Sprintf("  %s %s/%s agent restarted\n", style.Bold.Render("✓"), r.Name, crewName), true
 		}
+		// Agent is alive — nothing to do
 		return fmt.Sprintf("  %s %s/%s already running\n", style.Dim.Render("○"), r.Name, crewName), false
 	}
 
@@ -461,10 +513,7 @@ func runShutdown(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("listing sessions: %w", err)
 	}
 
-	// Get session names for categorization
-	mayorSession := getMayorSessionName()
-	deaconSession := getDeaconSessionName()
-	toStop, preserved := categorizeSessions(sessions, mayorSession, deaconSession)
+	toStop, preserved := categorizeSessions(sessions)
 
 	if len(toStop) == 0 {
 		fmt.Printf("%s Gas Town was not running\n", style.Dim.Render("○"))
@@ -512,26 +561,22 @@ func runShutdown(cmd *cobra.Command, args []string) error {
 }
 
 // categorizeSessions splits sessions into those to stop and those to preserve.
-// mayorSession and deaconSession are the dynamic session names for the current town.
-func categorizeSessions(sessions []string, mayorSession, deaconSession string) (toStop, preserved []string) {
+func categorizeSessions(sessions []string) (toStop, preserved []string) {
 	for _, sess := range sessions {
-		// Gas Town sessions use gt- (rig-level) or hq- (town-level) prefix
-		if !strings.HasPrefix(sess, "gt-") && !strings.HasPrefix(sess, "hq-") {
+		// Gas Town sessions use rig-specific prefixes or hq- (town-level)
+		if !session.IsKnownSession(sess) {
 			continue // Not a Gas Town session
 		}
 
-		// Check if it's a crew session (pattern: gt-<rig>-crew-<name>)
-		isCrew := strings.Contains(sess, "-crew-")
-
-		// Check if it's a polecat session (pattern: gt-<rig>-<name> where name is not crew/witness/refinery)
+		// Parse session to determine role
 		isPolecat := false
-		if !isCrew && sess != mayorSession && sess != deaconSession {
-			parts := strings.Split(sess, "-")
-			if len(parts) >= 3 {
-				role := parts[2]
-				if role != "witness" && role != "refinery" && role != "crew" {
-					isPolecat = true
-				}
+		isCrew := false
+		if identity, err := session.ParseSessionName(sess); err == nil {
+			switch identity.Role {
+			case session.RolePolecat:
+				isPolecat = true
+			case session.RoleCrew:
+				isCrew = true
 			}
 		}
 
@@ -704,13 +749,12 @@ func killSessionsInOrder(t *tmux.Tmux, sessions []string, mayorSession, deaconSe
 			continue
 		}
 
-		// Categorize by role (third component of gt-<rig>-<role> pattern)
-		parts := strings.Split(sess, "-")
-		if len(parts) >= 3 {
-			switch parts[2] {
-			case "witness":
+		// Categorize by role using proper session name parser
+		if identity, err := session.ParseSessionName(sess); err == nil {
+			switch identity.Role {
+			case session.RoleWitness:
 				witnesses = append(witnesses, sess)
-			case "refinery":
+			case session.RoleRefinery:
 				refineries = append(refineries, sess)
 			default:
 				// Polecats, crew, and any other rig-level sessions

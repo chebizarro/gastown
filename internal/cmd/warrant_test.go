@@ -6,7 +6,19 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/session"
 )
+
+func setupWarrantTestRegistry(t *testing.T) {
+	t.Helper()
+	reg := session.NewPrefixRegistry()
+	reg.Register("gt", "gastown")
+	reg.Register("bd", "beads")
+	old := session.DefaultRegistry()
+	session.SetDefaultRegistry(reg)
+	t.Cleanup(func() { session.SetDefaultRegistry(old) })
+}
 
 // =============================================================================
 // Warrant Tests
@@ -164,28 +176,23 @@ func TestWarrantExecute_MarksExecuted(t *testing.T) {
 	}
 }
 
-// TestTargetToSessionName verifies session name conversion.
 func TestTargetToSessionName(t *testing.T) {
+	setupWarrantTestRegistry(t)
 	tests := []struct {
-		target   string
-		wantErr  bool
-		contains string // partial match since town name varies
+		target  string
+		wantErr bool
+		want    string
 	}{
-		{
-			target:   "gastown/polecats/alpha",
-			wantErr:  false,
-			contains: "gt-gastown-alpha",
-		},
-		{
-			target:   "beads/polecats/charlie",
-			wantErr:  false,
-			contains: "gt-beads-charlie",
-		},
-		{
-			target:   "deacon/dogs",
-			wantErr:  true,
-			contains: "",
-		},
+		{"gastown/polecats/alpha", false, "gt-alpha"},
+		{"beads/polecats/charlie", false, "bd-charlie"},
+		{"deacon/dogs", true, ""},
+		{"deacon/dogs/alpha", false, "hq-dog-alpha"},
+		{"gastown/crew/bob", false, "gt-crew-bob"},
+		{"gastown/witness", false, "gt-witness"},
+		{"gastown/refinery", false, "gt-refinery"},
+		{"beads/witness", false, "bd-witness"},
+		{"beads/refinery", false, "bd-refinery"},
+		{"unknownrig/something/else", false, "gt-unknownrig-something-else"},
 	}
 
 	for _, tt := range tests {
@@ -195,8 +202,8 @@ func TestTargetToSessionName(t *testing.T) {
 				t.Errorf("targetToSessionName(%q) error = %v, wantErr %v", tt.target, err, tt.wantErr)
 				return
 			}
-			if !tt.wantErr && got != tt.contains {
-				t.Errorf("targetToSessionName(%q) = %q, want %q", tt.target, got, tt.contains)
+			if !tt.wantErr && got != tt.want {
+				t.Errorf("targetToSessionName(%q) = %q, want %q", tt.target, got, tt.want)
 			}
 		})
 	}

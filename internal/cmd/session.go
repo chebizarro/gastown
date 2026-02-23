@@ -14,6 +14,7 @@ import (
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/suggest"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -23,13 +24,14 @@ import (
 
 // Session command flags
 var (
-	sessionIssue     string
-	sessionForce     bool
-	sessionLines     int
-	sessionMessage   string
-	sessionFile      string
-	sessionRigFilter string
-	sessionListJSON  bool
+	sessionIssue      string
+	sessionForce      bool
+	sessionLines      int
+	sessionMessage    string
+	sessionFile       string
+	sessionRigFilter  string
+	sessionListJSON   bool
+	sessionStatusJSON bool
 )
 
 var sessionCmd = &cobra.Command{
@@ -186,6 +188,9 @@ func init() {
 
 	// Restart flags
 	sessionRestartCmd.Flags().BoolVarP(&sessionForce, "force", "f", false, "Force immediate shutdown")
+
+	// Status flags
+	sessionStatusCmd.Flags().BoolVar(&sessionStatusJSON, "json", false, "Output as JSON")
 
 	// Add subcommands
 	sessionCmd.AddCommand(sessionStartCmd)
@@ -553,13 +558,17 @@ func runSessionStatus(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Get session info
 	info, err := polecatMgr.Status(polecatName)
 	if err != nil {
 		return fmt.Errorf("getting status: %w", err)
 	}
 
-	// Format output
+	if sessionStatusJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(info)
+	}
+
 	fmt.Printf("%s Session: %s/%s\n\n", style.Bold.Render("📺"), rigName, polecatName)
 
 	if info.Running {
@@ -664,7 +673,7 @@ func runSessionCheck(cmd *cobra.Command, args []string) error {
 				continue
 			}
 			polecatName := entry.Name()
-			sessionName := fmt.Sprintf("gt-%s-%s", r.Name, polecatName)
+			sessionName := session.PolecatSessionName(session.PrefixFor(r.Name), polecatName)
 			totalChecked++
 
 			// Check if session exists

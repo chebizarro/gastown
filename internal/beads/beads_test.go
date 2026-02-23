@@ -50,6 +50,38 @@ func TestCreateOptions(t *testing.T) {
 	}
 }
 
+// TestIsFlagLikeTitle verifies flag-like title detection (gt-e0kx5).
+func TestIsFlagLikeTitle(t *testing.T) {
+	tests := []struct {
+		title string
+		want  bool
+	}{
+		// Flag-like (should be rejected)
+		{"--help", true},
+		{"--json", true},
+		{"--verbose", true},
+		{"-h", true},
+		{"-v", true},
+		{"--dry-run", true},
+		{"--type=task", true},
+
+		// Normal titles (should be allowed)
+		{"Fix bug in parser", false},
+		{"Add --help flag handling", false},
+		{"Fix --help flag parsing", false},
+		{"", false},
+		{"hello", false},
+		{"- list item", false}, // single dash with space is fine (markdown)
+	}
+
+	for _, tt := range tests {
+		got := IsFlagLikeTitle(tt.title)
+		if got != tt.want {
+			t.Errorf("IsFlagLikeTitle(%q) = %v, want %v", tt.title, got, tt.want)
+		}
+	}
+}
+
 // TestUpdateOptions verifies UpdateOptions pointer fields.
 func TestUpdateOptions(t *testing.T) {
 	status := "in_progress"
@@ -76,11 +108,9 @@ func TestIsBeadsRepo(t *testing.T) {
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	b := New(tmpDir)
-	// This should return false since there's no .beads directory
-	// and bd list will fail
+	// Should return false since there's no .beads directory
 	if b.IsBeadsRepo() {
-		// This might pass if bd handles missing .beads gracefully
-		t.Log("IsBeadsRepo returned true for non-beads directory (bd might initialize)")
+		t.Error("IsBeadsRepo returned true for non-beads directory")
 	}
 }
 
@@ -141,17 +171,15 @@ func TestIntegration(t *testing.T) {
 	// In multi-worktree setups, worktrees have .beads/redirect pointing to
 	// the canonical beads location (e.g., mayor/rig/.beads)
 	beadsDir := ResolveBeadsDir(dir)
-	dbPath := filepath.Join(beadsDir, "beads.db")
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		t.Skip("no beads.db found (JSONL-only repo)")
+	doltPath := filepath.Join(beadsDir, "dolt")
+	if _, err := os.Stat(doltPath); os.IsNotExist(err) {
+		t.Skip("no dolt database found")
 	}
 
 	b := New(dir)
 
-	// Sync database with JSONL before testing to avoid "Database out of sync" errors.
-	// This can happen when JSONL is updated (e.g., by git pull) but the database
-	// hasn't been imported yet. Running sync --import-only ensures we test against
-	// consistent data and prevents flaky test failures.
+	// Sync database before testing to ensure consistent data and prevent
+	// flaky test failures from stale state.
 	// We use --allow-stale to handle cases where the daemon is actively writing and
 	// the staleness check would otherwise fail spuriously.
 	syncCmd := exec.Command("bd", "--allow-stale", "sync", "--import-only")
@@ -1062,6 +1090,56 @@ func TestResolveBeadsDir(t *testing.T) {
 		}
 	})
 
+	t.Run("absolute path redirect", func(t *testing.T) {
+		// Redirect file contains an absolute path (e.g., /Users/emech/.../gastown/.beads)
+		// This was the path-doubling bug: filepath.Join(workDir, absPath) produces
+		// workDir/Users/emech/... instead of using absPath directly.
+		workDir := filepath.Join(tmpDir, "polecat", "chrome")
+		localBeadsDir := filepath.Join(workDir, ".beads")
+		targetBeadsDir := filepath.Join(tmpDir, "canonical", ".beads")
+
+		if err := os.MkdirAll(localBeadsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(targetBeadsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Write absolute path redirect
+		redirectPath := filepath.Join(localBeadsDir, "redirect")
+		if err := os.WriteFile(redirectPath, []byte(targetBeadsDir+"\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		got := ResolveBeadsDir(workDir)
+		if got != targetBeadsDir {
+			t.Errorf("ResolveBeadsDir() = %q, want %q (absolute redirect should be used as-is)", got, targetBeadsDir)
+		}
+	})
+
+	t.Run("absolute path in redirect chain", func(t *testing.T) {
+		// Test absolute path handling in resolveBeadsDirWithDepth (chained redirects)
+		firstBeadsDir := filepath.Join(tmpDir, "chain-test", "first", ".beads")
+		finalBeadsDir := filepath.Join(tmpDir, "chain-test", "final", ".beads")
+
+		if err := os.MkdirAll(firstBeadsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(finalBeadsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// First beads redirects via absolute path to final
+		if err := os.WriteFile(filepath.Join(firstBeadsDir, "redirect"), []byte(finalBeadsDir+"\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		got := resolveBeadsDirWithDepth(firstBeadsDir, 3)
+		if got != finalBeadsDir {
+			t.Errorf("resolveBeadsDirWithDepth() = %q, want %q", got, finalBeadsDir)
+		}
+	})
+
 	t.Run("circular redirect", func(t *testing.T) {
 		// Redirect that points to itself (e.g., mayor/rig/.beads/redirect -> ../../mayor/rig/.beads)
 		// This is the bug scenario from gt-csbjj
@@ -1111,6 +1189,21 @@ func TestParseAgentBeadID(t *testing.T) {
 		{"gt-gastown-polecat-capable", "gastown", "polecat", "capable", true},
 		// Names with hyphens
 		{"gt-gastown-polecat-my-agent", "gastown", "polecat", "my-agent", true},
+		// Worker name collides with role keyword
+		{"gt-gastown-polecat-witness", "gastown", "polecat", "witness", true},
+		{"gt-gastown-polecat-refinery", "gastown", "polecat", "refinery", true},
+		{"gt-gastown-crew-witness", "gastown", "crew", "witness", true},
+		{"gt-gastown-crew-refinery", "gastown", "crew", "refinery", true},
+		{"gt-gastown-polecat-crew", "gastown", "polecat", "crew", true},
+		{"gt-gastown-crew-polecat", "gastown", "crew", "polecat", true},
+		// Worker name collides with role keyword + hyphenated rig
+		{"gt-my-rig-polecat-witness", "my-rig", "polecat", "witness", true},
+		// Collapsed form: prefix == rig (e.g., rig "ff" with prefix "ff")
+		{"ff-witness", "ff", "witness", "", true},            // collapsed rig-level singleton
+		{"ff-refinery", "ff", "refinery", "", true},          // collapsed rig-level singleton
+		{"ff-polecat-nux", "ff", "polecat", "nux", true},    // collapsed named agent
+		{"ff-crew-dave", "ff", "crew", "dave", true},         // collapsed named agent
+		{"ff-polecat-war-boy", "ff", "polecat", "war-boy", true}, // collapsed named with hyphen
 		// Parseable but not valid agent roles (IsAgentSessionBead will reject)
 		{"gt-abc123", "", "abc123", "", true}, // Parses as town-level but not valid role
 		// Other prefixes (bd-, hq-)
@@ -1323,6 +1416,7 @@ func TestExpandRolePattern(t *testing.T) {
 		rig      string
 		name     string
 		role     string
+		prefix   string
 		want     string
 	}{
 		{
@@ -1331,18 +1425,20 @@ func TestExpandRolePattern(t *testing.T) {
 			want:     "gt-mayor",
 		},
 		{
-			pattern:  "gt-{rig}-{role}",
+			pattern:  "{prefix}-{role}",
 			townRoot: "/Users/stevey/gt",
 			rig:      "gastown",
 			role:     "witness",
-			want:     "gt-gastown-witness",
+			prefix:   "gt",
+			want:     "gt-witness",
 		},
 		{
-			pattern:  "gt-{rig}-{name}",
+			pattern:  "{prefix}-{name}",
 			townRoot: "/Users/stevey/gt",
 			rig:      "gastown",
 			name:     "toast",
-			want:     "gt-gastown-toast",
+			prefix:   "gt",
+			want:     "gt-toast",
 		},
 		{
 			pattern:  "{town}/{rig}/polecats/{name}",
@@ -1369,7 +1465,7 @@ func TestExpandRolePattern(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.pattern, func(t *testing.T) {
-			got := ExpandRolePattern(tt.pattern, tt.townRoot, tt.rig, tt.name, tt.role)
+			got := ExpandRolePattern(tt.pattern, tt.townRoot, tt.rig, tt.name, tt.role, tt.prefix)
 			if got != tt.want {
 				t.Errorf("ExpandRolePattern() = %q, want %q", got, tt.want)
 			}
@@ -1831,6 +1927,54 @@ func TestSetupRedirect(t *testing.T) {
 		}
 	})
 
+	t.Run("crew worktree with absolute rig redirect", func(t *testing.T) {
+		// Setup: rig/.beads/redirect contains an absolute path
+		townRoot := t.TempDir()
+		rigRoot := filepath.Join(townRoot, "testrig")
+		rigBeads := filepath.Join(rigRoot, ".beads")
+		crewPath := filepath.Join(rigRoot, "crew", "max")
+
+		// Create an absolute target beads directory (simulates a canonical .beads outside the town)
+		absTarget := filepath.Join(t.TempDir(), "canonical", ".beads")
+		if err := os.MkdirAll(absTarget, 0755); err != nil {
+			t.Fatalf("mkdir abs target: %v", err)
+		}
+
+		// Create rig structure with absolute redirect
+		if err := os.MkdirAll(rigBeads, 0755); err != nil {
+			t.Fatalf("mkdir rig beads: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(rigBeads, "redirect"), []byte(absTarget+"\n"), 0644); err != nil {
+			t.Fatalf("write rig redirect: %v", err)
+		}
+		if err := os.MkdirAll(crewPath, 0755); err != nil {
+			t.Fatalf("mkdir crew: %v", err)
+		}
+
+		// Run SetupRedirect
+		if err := SetupRedirect(townRoot, crewPath); err != nil {
+			t.Fatalf("SetupRedirect failed: %v", err)
+		}
+
+		// Verify redirect is the absolute path (not upPath + absolutePath)
+		redirectPath := filepath.Join(crewPath, ".beads", "redirect")
+		content, err := os.ReadFile(redirectPath)
+		if err != nil {
+			t.Fatalf("read redirect: %v", err)
+		}
+
+		want := absTarget + "\n"
+		if string(content) != want {
+			t.Errorf("redirect content = %q, want %q (absolute path should be passed through)", string(content), want)
+		}
+
+		// Verify redirect resolves correctly
+		resolved := ResolveBeadsDir(crewPath)
+		if resolved != absTarget {
+			t.Errorf("resolved = %q, want %q", resolved, absTarget)
+		}
+	})
+
 	t.Run("polecat worktree", func(t *testing.T) {
 		townRoot := t.TempDir()
 		rigRoot := filepath.Join(townRoot, "testrig")
@@ -1904,11 +2048,11 @@ func TestSetupRedirect(t *testing.T) {
 			t.Fatalf("mkdir crew beads: %v", err)
 		}
 		// Runtime files (should be removed)
-		if err := os.WriteFile(filepath.Join(crewBeads, "beads.db"), []byte("fake db"), 0644); err != nil {
-			t.Fatalf("write fake db: %v", err)
+		if err := os.WriteFile(filepath.Join(crewBeads, "daemon.lock"), []byte("1234"), 0644); err != nil {
+			t.Fatalf("write daemon.lock: %v", err)
 		}
-		if err := os.WriteFile(filepath.Join(crewBeads, "issues.jsonl"), []byte("{}"), 0644); err != nil {
-			t.Fatalf("write issues.jsonl: %v", err)
+		if err := os.WriteFile(filepath.Join(crewBeads, "metadata.json"), []byte("{}"), 0644); err != nil {
+			t.Fatalf("write metadata.json: %v", err)
 		}
 		// Tracked files (should be preserved)
 		if err := os.WriteFile(filepath.Join(crewBeads, "config.yaml"), []byte("prefix: test"), 0644); err != nil {
@@ -1923,11 +2067,11 @@ func TestSetupRedirect(t *testing.T) {
 		}
 
 		// Verify runtime files were cleaned up
-		if _, err := os.Stat(filepath.Join(crewBeads, "beads.db")); !os.IsNotExist(err) {
-			t.Error("beads.db should have been removed")
+		if _, err := os.Stat(filepath.Join(crewBeads, "daemon.lock")); !os.IsNotExist(err) {
+			t.Error("daemon.lock should have been removed")
 		}
-		if _, err := os.Stat(filepath.Join(crewBeads, "issues.jsonl")); !os.IsNotExist(err) {
-			t.Error("issues.jsonl should have been removed")
+		if _, err := os.Stat(filepath.Join(crewBeads, "metadata.json")); !os.IsNotExist(err) {
+			t.Error("metadata.json should have been removed")
 		}
 
 		// Verify tracked files were preserved
@@ -2008,7 +2152,7 @@ func TestSetupRedirect(t *testing.T) {
 		mayorRigBeads := filepath.Join(rigRoot, "mayor", "rig", ".beads")
 		crewPath := filepath.Join(rigRoot, "crew", "max")
 
-		// Create rig/.beads with metadata but NO database (no dolt/ or beads.db)
+		// Create rig/.beads with metadata but NO database (no dolt/)
 		if err := os.MkdirAll(rigBeads, 0755); err != nil {
 			t.Fatalf("mkdir rig beads: %v", err)
 		}
@@ -2139,238 +2283,12 @@ func TestSetupRedirect(t *testing.T) {
 	})
 }
 
-// TestAgentBeadTombstoneBug demonstrates the bd bug where `bd delete --hard --force`
-// creates tombstones instead of truly deleting records.
-//
-// This test documents the bug behavior:
-// 1. Create agent bead
-// 2. Delete with --hard --force (supposed to permanently delete)
-// 3. BUG: Tombstone is created instead
-// 4. BUG: bd create fails with UNIQUE constraint
-// 5. BUG: bd reopen fails with "issue not found" (tombstones are invisible)
-func TestAgentBeadTombstoneBug(t *testing.T) {
-	// Skip: bd CLI 0.47.2 has a bug where database writes don't commit
-	// ("sql: database is closed" during auto-flush). This blocks all tests
-	// that need to create issues. See internal issue for tracking.
-	t.Skip("bd CLI 0.47.2 bug: database writes don't commit")
 
-	tmpDir := t.TempDir()
 
-	// Create isolated beads instance and initialize database
-	bd := NewIsolated(tmpDir)
-	if err := bd.Init("test"); err != nil {
-		t.Fatalf("bd init: %v", err)
-	}
-
-	agentID := "test-testrig-polecat-tombstone"
-
-	// Step 1: Create agent bead
-	_, err := bd.CreateAgentBead(agentID, "Test agent", &AgentFields{
-		RoleType:   "polecat",
-		Rig:        "testrig",
-		AgentState: "spawning",
-	})
-	if err != nil {
-		t.Fatalf("CreateAgentBead: %v", err)
-	}
-
-	// Step 2: Delete with --hard --force (supposed to permanently delete)
-	err = bd.DeleteAgentBead(agentID)
-	if err != nil {
-		t.Fatalf("DeleteAgentBead: %v", err)
-	}
-
-	// Step 3: BUG - Tombstone exists (check via bd list --status=tombstone)
-	out, err := bd.run("list", "--status=tombstone", "--json")
-	if err != nil {
-		t.Fatalf("list tombstones: %v", err)
-	}
-
-	// Parse to check if our agent is in the tombstone list
-	var tombstones []Issue
-	if err := json.Unmarshal(out, &tombstones); err != nil {
-		t.Fatalf("parse tombstones: %v", err)
-	}
-
-	foundTombstone := false
-	for _, ts := range tombstones {
-		if ts.ID == agentID {
-			foundTombstone = true
-			break
-		}
-	}
-
-	if !foundTombstone {
-		// If bd ever fixes the --hard flag, this test will fail here
-		// That's a good thing - it means the bug is fixed!
-		t.Skip("bd --hard appears to be fixed (no tombstone created) - update this test")
-	}
-
-	// Step 4: BUG - bd create fails with UNIQUE constraint
-	_, err = bd.CreateAgentBead(agentID, "Test agent 2", &AgentFields{
-		RoleType:   "polecat",
-		Rig:        "testrig",
-		AgentState: "spawning",
-	})
-	if err == nil {
-		t.Fatal("expected UNIQUE constraint error, got nil")
-	}
-	if !strings.Contains(err.Error(), "UNIQUE constraint") {
-		t.Errorf("expected UNIQUE constraint error, got: %v", err)
-	}
-
-	// Step 5: BUG - bd reopen fails (tombstones are invisible)
-	_, err = bd.run("reopen", agentID, "--reason=test")
-	if err == nil {
-		t.Fatal("expected reopen to fail on tombstone, got nil")
-	}
-	if !strings.Contains(err.Error(), "no issue found") && !strings.Contains(err.Error(), "issue not found") {
-		t.Errorf("expected 'issue not found' error, got: %v", err)
-	}
-
-	t.Log("BUG CONFIRMED: bd delete --hard creates tombstones that block recreation")
-}
-
-// TestAgentBeadCloseReopenWorkaround demonstrates the workaround for the tombstone bug:
-// use Close instead of Delete, then Reopen works.
-func TestAgentBeadCloseReopenWorkaround(t *testing.T) {
-	t.Skip("bd CLI 0.47.2 bug: database writes don't commit")
-
-	tmpDir := t.TempDir()
-	bd := NewIsolated(tmpDir)
-	if err := bd.Init("test"); err != nil {
-		t.Fatalf("bd init: %v", err)
-	}
-
-	agentID := "test-testrig-polecat-closereopen"
-
-	// Step 1: Create agent bead
-	_, err := bd.CreateAgentBead(agentID, "Test agent", &AgentFields{
-		RoleType:   "polecat",
-		Rig:        "testrig",
-		AgentState: "spawning",
-		HookBead:   "test-task-1",
-	})
-	if err != nil {
-		t.Fatalf("CreateAgentBead: %v", err)
-	}
-
-	// Step 2: Close (not delete) - this is the workaround
-	err = bd.CloseAndClearAgentBead(agentID, "polecat removed")
-	if err != nil {
-		t.Fatalf("CloseAndClearAgentBead: %v", err)
-	}
-
-	// Step 3: Verify bead is closed (not tombstone)
-	issue, err := bd.Show(agentID)
-	if err != nil {
-		t.Fatalf("Show after close: %v", err)
-	}
-	if issue.Status != "closed" {
-		t.Errorf("status = %q, want 'closed'", issue.Status)
-	}
-
-	// Step 4: Reopen works on closed beads
-	_, err = bd.run("reopen", agentID, "--reason=re-spawning")
-	if err != nil {
-		t.Fatalf("reopen failed: %v", err)
-	}
-
-	// Step 5: Verify bead is open again
-	issue, err = bd.Show(agentID)
-	if err != nil {
-		t.Fatalf("Show after reopen: %v", err)
-	}
-	if issue.Status != "open" {
-		t.Errorf("status = %q, want 'open'", issue.Status)
-	}
-
-	t.Log("WORKAROUND CONFIRMED: Close + Reopen works for agent bead lifecycle")
-}
-
-// TestCreateOrReopenAgentBead_ClosedBead tests that CreateOrReopenAgentBead
-// successfully reopens a closed agent bead and updates its fields.
-func TestCreateOrReopenAgentBead_ClosedBead(t *testing.T) {
-	t.Skip("bd CLI 0.47.2 bug: database writes don't commit")
-
-	tmpDir := t.TempDir()
-	bd := NewIsolated(tmpDir)
-	if err := bd.Init("test"); err != nil {
-		t.Fatalf("bd init: %v", err)
-	}
-
-	agentID := "test-testrig-polecat-lifecycle"
-
-	// Simulate polecat lifecycle: spawn → nuke → respawn
-
-	// Spawn 1: Create agent bead with first task
-	issue1, err := bd.CreateOrReopenAgentBead(agentID, agentID, &AgentFields{
-		RoleType:   "polecat",
-		Rig:        "testrig",
-		AgentState: "spawning",
-		HookBead:   "test-task-1",
-	})
-	if err != nil {
-		t.Fatalf("Spawn 1 - CreateOrReopenAgentBead: %v", err)
-	}
-	if issue1.Status != "open" {
-		t.Errorf("Spawn 1: status = %q, want 'open'", issue1.Status)
-	}
-
-	// Nuke 1: Close agent bead (legacy path - CloseAndClearAgentBead)
-	err = bd.CloseAndClearAgentBead(agentID, "polecat nuked")
-	if err != nil {
-		t.Fatalf("Nuke 1 - CloseAndClearAgentBead: %v", err)
-	}
-
-	// Spawn 2: CreateOrReopenAgentBead should reopen and update
-	issue2, err := bd.CreateOrReopenAgentBead(agentID, agentID, &AgentFields{
-		RoleType:   "polecat",
-		Rig:        "testrig",
-		AgentState: "spawning",
-		HookBead:   "test-task-2", // Different task
-	})
-	if err != nil {
-		t.Fatalf("Spawn 2 - CreateOrReopenAgentBead: %v", err)
-	}
-	if issue2.Status != "open" {
-		t.Errorf("Spawn 2: status = %q, want 'open'", issue2.Status)
-	}
-
-	// Verify the hook was updated to the new task
-	fields := ParseAgentFields(issue2.Description)
-	if fields.HookBead != "test-task-2" {
-		t.Errorf("Spawn 2: hook_bead = %q, want 'test-task-2'", fields.HookBead)
-	}
-
-	// Nuke 2: Close again
-	err = bd.CloseAndClearAgentBead(agentID, "polecat nuked again")
-	if err != nil {
-		t.Fatalf("Nuke 2 - CloseAndClearAgentBead: %v", err)
-	}
-
-	// Spawn 3: Should still work
-	issue3, err := bd.CreateOrReopenAgentBead(agentID, agentID, &AgentFields{
-		RoleType:   "polecat",
-		Rig:        "testrig",
-		AgentState: "spawning",
-		HookBead:   "test-task-3",
-	})
-	if err != nil {
-		t.Fatalf("Spawn 3 - CreateOrReopenAgentBead: %v", err)
-	}
-
-	fields = ParseAgentFields(issue3.Description)
-	if fields.HookBead != "test-task-3" {
-		t.Errorf("Spawn 3: hook_bead = %q, want 'test-task-3'", fields.HookBead)
-	}
-
-	t.Log("LIFECYCLE TEST PASSED: spawn → nuke → respawn works with close/reopen")
-}
 
 // TestResetAgentBeadForReuse_NukeRespawnCycle tests the preferred nuke→respawn
-// lifecycle using ResetAgentBeadForReuse (gt-14b8o fix). Unlike CloseAndClearAgentBead,
-// this keeps the bead open with agent_state="nuked", avoiding the close/reopen cycle
+// lifecycle using ResetAgentBeadForReuse (gt-14b8o fix). This keeps the bead open
+// with agent_state="nuked", avoiding the close/reopen cycle
 // that fails on Dolt backends.
 func TestResetAgentBeadForReuse_NukeRespawnCycle(t *testing.T) {
 	t.Skip("bd CLI 0.47.2 bug: database writes don't commit")
@@ -2464,346 +2382,502 @@ func TestResetAgentBeadForReuse_NukeRespawnCycle(t *testing.T) {
 	t.Log("LIFECYCLE TEST PASSED: spawn → reset → respawn works without close/reopen")
 }
 
-// TestCloseAndClearAgentBead_FieldClearing tests that CloseAndClearAgentBead clears all mutable
-// fields to emulate delete --force --hard behavior. This ensures reopened agent
-// beads don't have stale state from previous lifecycle.
-func TestCloseAndClearAgentBead_FieldClearing(t *testing.T) {
-	t.Skip("bd CLI 0.47.2 bug: database writes don't commit")
 
-	tmpDir := t.TempDir()
-	bd := NewIsolated(tmpDir)
-	if err := bd.Init("test"); err != nil {
-		t.Fatalf("bd init: %v", err)
-	}
 
-	// Test cases for field clearing permutations
+
+
+
+// TestIsAgentBead verifies the IsAgentBead function correctly identifies agent
+// beads by checking both the gt:agent label (preferred) and the legacy type field.
+func TestIsAgentBead(t *testing.T) {
 	tests := []struct {
 		name   string
-		fields *AgentFields
-		reason string
+		issue  *Issue
+		want   bool
 	}{
 		{
-			name: "all_fields_populated",
-			fields: &AgentFields{
-				RoleType:          "polecat",
-				Rig:               "testrig",
-				AgentState:        "running",
-				HookBead:          "test-issue-123",
-				CleanupStatus:     "clean",
-				ActiveMR:          "test-mr-456",
-				NotificationLevel: "normal",
-			},
-			reason: "polecat completed work",
+			name: "nil issue",
+			issue: nil,
+			want: false,
 		},
 		{
-			name: "only_hook_bead",
-			fields: &AgentFields{
-				RoleType:   "polecat",
-				Rig:        "testrig",
-				AgentState: "spawning",
-				HookBead:   "test-issue-789",
+			name: "agent with legacy type",
+			issue: &Issue{
+				ID:   "gt-gastown-polecat-toast",
+				Type: "agent",
+				Labels: []string{},
 			},
-			reason: "polecat nuked",
+			want: true,
 		},
 		{
-			name: "only_active_mr",
-			fields: &AgentFields{
-				RoleType:   "polecat",
-				Rig:        "testrig",
-				AgentState: "running",
-				ActiveMR:   "test-mr-abc",
+			name: "agent with gt:agent label",
+			issue: &Issue{
+				ID:   "gt-gastown-polecat-toast",
+				Type: "task",
+				Labels: []string{"gt:agent"},
 			},
-			reason: "",
+			want: true,
 		},
 		{
-			name: "only_cleanup_status",
-			fields: &AgentFields{
-				RoleType:      "polecat",
-				Rig:           "testrig",
-				AgentState:    "idle",
-				CleanupStatus: "has_uncommitted",
+			name: "agent with both type and label",
+			issue: &Issue{
+				ID:   "gt-gastown-polecat-toast",
+				Type: "agent",
+				Labels: []string{"gt:agent", "other-label"},
 			},
-			reason: "cleanup required",
+			want: true,
 		},
 		{
-			name: "no_mutable_fields",
-			fields: &AgentFields{
-				RoleType:   "polecat",
-				Rig:        "testrig",
-				AgentState: "spawning",
+			name: "not an agent - task type without label",
+			issue: &Issue{
+				ID:   "gt-abc123",
+				Type: "task",
+				Labels: []string{},
 			},
-			reason: "fresh spawn closed",
+			want: false,
 		},
 		{
-			name: "polecat_with_all_field_types",
-			fields: &AgentFields{
-				RoleType:          "polecat",
-				Rig:               "testrig",
-				AgentState:        "processing",
-				HookBead:          "test-task-xyz",
-				ActiveMR:          "test-mr-processing",
-				CleanupStatus:     "has_uncommitted",
-				NotificationLevel: "verbose",
+			name: "not an agent - bug type with other labels",
+			issue: &Issue{
+				ID:   "gt-xyz456",
+				Type: "bug",
+				Labels: []string{"priority-high", "blocked"},
 			},
-			reason: "comprehensive cleanup",
+			want: false,
+		},
+		{
+			name: "agent with gt:agent label and other labels",
+			issue: &Issue{
+				ID:   "gt-gastown-witness",
+				Type: "task",
+				Labels: []string{"priority-high", "gt:agent", "status-running"},
+			},
+			want: true,
 		},
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			// Use tc.name for suffix to avoid hash-like patterns (e.g., single digits)
-			// that trigger bd's isLikelyHash() prefix extraction in v0.47.1+
-			agentID := fmt.Sprintf("test-testrig-%s-%s", tc.fields.RoleType, tc.name)
-
-			// Step 1: Create agent bead with specified fields
-			_, err := bd.CreateAgentBead(agentID, "Test agent", tc.fields)
-			if err != nil {
-				t.Fatalf("CreateAgentBead: %v", err)
-			}
-
-			// Verify fields were set
-			issue, err := bd.Show(agentID)
-			if err != nil {
-				t.Fatalf("Show before close: %v", err)
-			}
-			beforeFields := ParseAgentFields(issue.Description)
-			if tc.fields.HookBead != "" && beforeFields.HookBead != tc.fields.HookBead {
-				t.Errorf("before close: hook_bead = %q, want %q", beforeFields.HookBead, tc.fields.HookBead)
-			}
-
-			// Step 2: Close the agent bead
-			err = bd.CloseAndClearAgentBead(agentID, tc.reason)
-			if err != nil {
-				t.Fatalf("CloseAndClearAgentBead: %v", err)
-			}
-
-			// Step 3: Verify bead is closed
-			issue, err = bd.Show(agentID)
-			if err != nil {
-				t.Fatalf("Show after close: %v", err)
-			}
-			if issue.Status != "closed" {
-				t.Errorf("status = %q, want 'closed'", issue.Status)
-			}
-
-			// Step 4: Verify mutable fields were cleared
-			afterFields := ParseAgentFields(issue.Description)
-
-			// hook_bead should be cleared (empty or "null")
-			if afterFields.HookBead != "" {
-				t.Errorf("after close: hook_bead = %q, want empty (was %q)", afterFields.HookBead, tc.fields.HookBead)
-			}
-
-			// active_mr should be cleared
-			if afterFields.ActiveMR != "" {
-				t.Errorf("after close: active_mr = %q, want empty (was %q)", afterFields.ActiveMR, tc.fields.ActiveMR)
-			}
-
-			// cleanup_status should be cleared
-			if afterFields.CleanupStatus != "" {
-				t.Errorf("after close: cleanup_status = %q, want empty (was %q)", afterFields.CleanupStatus, tc.fields.CleanupStatus)
-			}
-
-			// agent_state should be "closed"
-			if afterFields.AgentState != "closed" {
-				t.Errorf("after close: agent_state = %q, want 'closed' (was %q)", afterFields.AgentState, tc.fields.AgentState)
-			}
-
-			// Immutable fields should be preserved
-			if afterFields.RoleType != tc.fields.RoleType {
-				t.Errorf("after close: role_type = %q, want %q (should be preserved)", afterFields.RoleType, tc.fields.RoleType)
-			}
-			if afterFields.Rig != tc.fields.Rig {
-				t.Errorf("after close: rig = %q, want %q (should be preserved)", afterFields.Rig, tc.fields.Rig)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := IsAgentBead(tt.issue)
+			if got != tt.want {
+				t.Errorf("IsAgentBead() = %v, want %v", got, tt.want)
 			}
 		})
 	}
 }
 
-// TestCloseAndClearAgentBead_NonExistent tests behavior when closing a non-existent agent bead.
-func TestCloseAndClearAgentBead_NonExistent(t *testing.T) {
-	t.Skip("bd CLI 0.47.2 bug: database writes don't commit")
-
-	tmpDir := t.TempDir()
-	bd := NewIsolated(tmpDir)
-	if err := bd.Init("test"); err != nil {
-		t.Fatalf("bd init: %v", err)
+// TestFilterBeadsEnv_NilInput verifies filterBeadsEnv does not panic on nil.
+func TestFilterBeadsEnv_NilInput(t *testing.T) {
+	got := filterBeadsEnv(nil)
+	if got == nil {
+		t.Fatal("filterBeadsEnv(nil) returned nil, want empty slice")
 	}
-
-	// Attempt to close non-existent bead
-	err := bd.CloseAndClearAgentBead("test-nonexistent-polecat-xyz", "should fail")
-
-	// Should return an error (bd close on non-existent issue fails)
-	if err == nil {
-		t.Error("CloseAndClearAgentBead on non-existent bead should return error")
+	if len(got) != 0 {
+		t.Errorf("filterBeadsEnv(nil) returned %d items, want 0", len(got))
 	}
 }
 
-// TestCloseAndClearAgentBead_AlreadyClosed tests behavior when closing an already-closed agent bead.
-func TestCloseAndClearAgentBead_AlreadyClosed(t *testing.T) {
-	t.Skip("bd CLI 0.47.2 bug: database writes don't commit")
-
-	tmpDir := t.TempDir()
-	bd := NewIsolated(tmpDir)
-	if err := bd.Init("test"); err != nil {
-		t.Fatalf("bd init: %v", err)
-	}
-
-	agentID := "test-testrig-polecat-doubleclosed"
-
-	// Create agent bead
-	_, err := bd.CreateAgentBead(agentID, "Test agent", &AgentFields{
-		RoleType:   "polecat",
-		Rig:        "testrig",
-		AgentState: "running",
-		HookBead:   "test-issue-1",
-	})
-	if err != nil {
-		t.Fatalf("CreateAgentBead: %v", err)
-	}
-
-	// First close - should succeed
-	err = bd.CloseAndClearAgentBead(agentID, "first close")
-	if err != nil {
-		t.Fatalf("First CloseAndClearAgentBead: %v", err)
-	}
-
-	// Second close - behavior depends on bd close semantics
-	// Document actual behavior: bd close on already-closed bead may error or be idempotent
-	err = bd.CloseAndClearAgentBead(agentID, "second close")
-
-	// Verify bead is still closed regardless of error
-	issue, showErr := bd.Show(agentID)
-	if showErr != nil {
-		t.Fatalf("Show after double close: %v", showErr)
-	}
-	if issue.Status != "closed" {
-		t.Errorf("status after double close = %q, want 'closed'", issue.Status)
-	}
-
-	// Log actual behavior for documentation
-	if err != nil {
-		t.Logf("BEHAVIOR: CloseAndClearAgentBead on already-closed bead returns error: %v", err)
-	} else {
-		t.Log("BEHAVIOR: CloseAndClearAgentBead on already-closed bead is idempotent (no error)")
+// TestFilterBeadsEnv_EmptyInput verifies filterBeadsEnv on empty slice.
+func TestFilterBeadsEnv_EmptyInput(t *testing.T) {
+	got := filterBeadsEnv([]string{})
+	if len(got) != 0 {
+		t.Errorf("filterBeadsEnv([]) returned %d items, want 0", len(got))
 	}
 }
 
-// TestCloseAndClearAgentBead_ReopenHasCleanState tests that reopening a closed agent bead
-// starts with clean state (no stale hook_bead, active_mr, etc.).
-func TestCloseAndClearAgentBead_ReopenHasCleanState(t *testing.T) {
-	t.Skip("bd CLI 0.47.2 bug: database writes don't commit")
-
-	tmpDir := t.TempDir()
-	bd := NewIsolated(tmpDir)
-	if err := bd.Init("test"); err != nil {
-		t.Fatalf("bd init: %v", err)
+// TestFilterBeadsEnv_PreservesDoltPortVars verifies that GT_DOLT_PORT and
+// BEADS_DOLT_PORT are preserved by filterBeadsEnv even though BEADS_* vars
+// are otherwise stripped. Tests need these to reach test Dolt servers.
+func TestFilterBeadsEnv_PreservesDoltPortVars(t *testing.T) {
+	environ := []string{
+		"BD_ACTOR=test-actor",
+		"BEADS_DIR=/tmp/beads",
+		"BEADS_DB=/tmp/beads.db",
+		"BEADS_DOLT_PORT=13306",
+		"GT_DOLT_PORT=13307",
+		"GT_ROOT=/tmp/gt",
+		"HOME=/home/test",
+		"PATH=/usr/bin",
 	}
-
-	agentID := "test-testrig-polecat-cleanreopen"
-
-	// Step 1: Create agent with all fields populated
-	_, err := bd.CreateAgentBead(agentID, "Test agent", &AgentFields{
-		RoleType:          "polecat",
-		Rig:               "testrig",
-		AgentState:        "running",
-		HookBead:          "test-old-issue",
-		CleanupStatus:     "clean",
-		ActiveMR:          "test-old-mr",
-		NotificationLevel: "normal",
-	})
-	if err != nil {
-		t.Fatalf("CreateAgentBead: %v", err)
+	got := filterBeadsEnv(environ)
+	want := []string{
+		"BEADS_DOLT_PORT=13306",
+		"GT_DOLT_PORT=13307",
+		"PATH=/usr/bin",
 	}
-
-	// Step 2: Close - should clear mutable fields
-	err = bd.CloseAndClearAgentBead(agentID, "completing old work")
-	if err != nil {
-		t.Fatalf("CloseAndClearAgentBead: %v", err)
+	if len(got) != len(want) {
+		t.Fatalf("filterBeadsEnv returned %d items, want %d\n  got:  %v\n  want: %v",
+			len(got), len(want), got, want)
 	}
-
-	// Step 3: Reopen with new fields
-	newIssue, err := bd.CreateOrReopenAgentBead(agentID, agentID, &AgentFields{
-		RoleType:   "polecat",
-		Rig:        "testrig",
-		AgentState: "spawning",
-		HookBead:   "test-new-issue",
-	})
-	if err != nil {
-		t.Fatalf("CreateOrReopenAgentBead: %v", err)
+	for i := range got {
+		if got[i] != want[i] {
+			t.Errorf("[%d] = %q, want %q", i, got[i], want[i])
+		}
 	}
-
-	// Step 4: Verify new state - should have new hook, no stale data
-	fields := ParseAgentFields(newIssue.Description)
-
-	if fields.HookBead != "test-new-issue" {
-		t.Errorf("hook_bead = %q, want 'test-new-issue'", fields.HookBead)
-	}
-
-	// The old active_mr should NOT be present (was cleared on close)
-	if fields.ActiveMR == "test-old-mr" {
-		t.Error("active_mr still has stale value 'test-old-mr' - CloseAndClearAgentBead didn't clear it")
-	}
-
-	// agent_state should be the new state
-	if fields.AgentState != "spawning" {
-		t.Errorf("agent_state = %q, want 'spawning'", fields.AgentState)
-	}
-
-	t.Log("CLEAN STATE CONFIRMED: Reopened agent bead has no stale mutable fields")
 }
 
-// TestCloseAndClearAgentBead_ReasonVariations tests close with different reason values.
-func TestCloseAndClearAgentBead_ReasonVariations(t *testing.T) {
-	t.Skip("bd CLI 0.47.2 bug: database writes don't commit")
-
-	tmpDir := t.TempDir()
-	bd := NewIsolated(tmpDir)
-	if err := bd.Init("test"); err != nil {
-		t.Fatalf("bd init: %v", err)
+// TestNewIsolatedWithPort verifies the constructor sets serverPort.
+func TestNewIsolatedWithPort(t *testing.T) {
+	b := NewIsolatedWithPort("/tmp/test", 13307)
+	if !b.isolated {
+		t.Error("expected isolated=true")
 	}
+	if b.serverPort != 13307 {
+		t.Errorf("serverPort = %d, want 13307", b.serverPort)
+	}
+}
 
+// ---------------------------------------------------------------------------
+// stripEnvPrefixes tests (refactored from runWithRouting inline logic)
+// ---------------------------------------------------------------------------
+
+// TestStripEnvPrefixes verifies the generic prefix stripping used by runWithRouting.
+func TestStripEnvPrefixes(t *testing.T) {
 	tests := []struct {
-		name   string
-		reason string
+		name     string
+		environ  []string
+		prefixes []string
+		want     []string
 	}{
-		{"empty_reason", ""},
-		{"simple_reason", "polecat nuked"},
-		{"reason_with_spaces", "polecat completed work successfully"},
-		{"reason_with_special_chars", "closed: issue #123 (resolved)"},
-		{"long_reason", "This is a very long reason that explains in detail why the agent bead was closed including multiple sentences and detailed context about the situation."},
+		{
+			name:     "strips single prefix",
+			environ:  []string{"BEADS_DIR=/tmp", "PATH=/usr/bin", "HOME=/home"},
+			prefixes: []string{"BEADS_DIR="},
+			want:     []string{"PATH=/usr/bin", "HOME=/home"},
+		},
+		{
+			name:     "strips multiple prefixes",
+			environ:  []string{"BEADS_DIR=/tmp", "BD_ACTOR=test-actor", "PATH=/usr/bin"},
+			prefixes: []string{"BEADS_DIR=", "BD_ACTOR="},
+			want:     []string{"PATH=/usr/bin"},
+		},
+		{
+			name:     "no matches",
+			environ:  []string{"PATH=/usr/bin", "HOME=/home"},
+			prefixes: []string{"BEADS_DIR=", "BD_ACTOR="},
+			want:     []string{"PATH=/usr/bin", "HOME=/home"},
+		},
+		{
+			name:     "empty prefixes",
+			environ:  []string{"PATH=/usr/bin"},
+			prefixes: []string{},
+			want:     []string{"PATH=/usr/bin"},
+		},
+		{
+			name:     "nil environ",
+			environ:  nil,
+			prefixes: []string{"BEADS_DIR="},
+			want:     []string{},
+		},
+		{
+			name:     "empty environ",
+			environ:  []string{},
+			prefixes: []string{"BEADS_DIR="},
+			want:     []string{},
+		},
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			// Use tc.name for suffix to avoid hash-like patterns (e.g., "reason0")
-			// that trigger bd's isLikelyHash() prefix extraction in v0.47.1+
-			agentID := fmt.Sprintf("test-testrig-polecat-%s", tc.name)
-
-			// Create agent bead
-			_, err := bd.CreateAgentBead(agentID, "Test agent", &AgentFields{
-				RoleType:   "polecat",
-				Rig:        "testrig",
-				AgentState: "running",
-			})
-			if err != nil {
-				t.Fatalf("CreateAgentBead: %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := stripEnvPrefixes(tt.environ, tt.prefixes...)
+			if len(got) != len(tt.want) {
+				t.Fatalf("stripEnvPrefixes() returned %d items, want %d\n  got:  %v\n  want: %v",
+					len(got), len(tt.want), got, tt.want)
 			}
-
-			// Close with specified reason
-			err = bd.CloseAndClearAgentBead(agentID, tc.reason)
-			if err != nil {
-				t.Fatalf("CloseAndClearAgentBead: %v", err)
-			}
-
-			// Verify closed
-			issue, err := bd.Show(agentID)
-			if err != nil {
-				t.Fatalf("Show: %v", err)
-			}
-			if issue.Status != "closed" {
-				t.Errorf("status = %q, want 'closed'", issue.Status)
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
 			}
 		})
 	}
+}
+
+// TestStripEnvPrefixes_PreservesOrder verifies output ordering is stable.
+func TestStripEnvPrefixes_PreservesOrder(t *testing.T) {
+	environ := []string{"A=1", "BEADS_DIR=/tmp", "B=2", "BD_ACTOR=x", "C=3"}
+	got := stripEnvPrefixes(environ, "BEADS_DIR=", "BD_ACTOR=")
+	want := []string{"A=1", "B=2", "C=3"}
+
+	if len(got) != len(want) {
+		t.Fatalf("len = %d, want %d", len(got), len(want))
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Errorf("[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Integration tests — verify env behavior with real os.Environ()
+// ---------------------------------------------------------------------------
+
+// TestFilterBeadsEnv_Integration verifies filterBeadsEnv strips all expected
+// vars from a real os.Environ() with multiple beads vars set.
+func TestFilterBeadsEnv_Integration(t *testing.T) {
+	t.Setenv("BD_ACTOR", "gastown/polecats/TestPolecat")
+	t.Setenv("BEADS_DIR", "/tmp/test-beads")
+	t.Setenv("GT_ROOT", "/tmp/test-gt-root")
+
+	env := filterBeadsEnv(os.Environ())
+
+	// BEADS_DOLT_PORT and GT_DOLT_PORT are explicitly preserved (test server access).
+	// Check that other BEADS_* vars are still stripped.
+	forbidden := []string{"BD_ACTOR=", "BEADS_DIR=", "BEADS_DB=", "GT_ROOT=", "HOME="}
+	for _, e := range env {
+		for _, prefix := range forbidden {
+			if strings.HasPrefix(e, prefix) {
+				t.Errorf("filterBeadsEnv did not strip %s (found: %s)", prefix, e)
+			}
+		}
+	}
+}
+
+// TestBdBranch_SystemScenario_FilterBeadsEnvIsolation verifies filterBeadsEnv
+// strips all beads-related vars from subprocess environment.
+func TestBdBranch_SystemScenario_FilterBeadsEnvIsolation(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping system test in short mode")
+	}
+
+	t.Setenv("BD_ACTOR", "gastown/polecats/FilterTest")
+	t.Setenv("BEADS_DIR", "/tmp/filter-test-beads")
+	t.Setenv("GT_ROOT", "/tmp/filter-test-gt")
+
+	cmd := exec.Command("env")
+	cmd.Env = filterBeadsEnv(os.Environ())
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("env command failed: %v", err)
+	}
+
+	output := string(out)
+	// Note: HOME= is stripped by filterBeadsEnv, but on macOS the kernel may
+	// re-inject HOME into subprocesses. Only check beads-specific vars here.
+	forbidden := []string{"BD_ACTOR=", "BEADS_DIR=", "GT_ROOT="}
+	for _, prefix := range forbidden {
+		if strings.Contains(output, prefix) {
+			t.Errorf("filterBeadsEnv subprocess still contains %s", prefix)
+		}
+	}
+}
+
+// TestBuildRunEnv verifies buildRunEnv() returns the correct environment
+// for each mode: default (passthrough) and isolated (strip all beads vars).
+func TestBuildRunEnv(t *testing.T) {
+	tests := []struct {
+		name     string
+		isolated bool
+		// envVars to inject via t.Setenv
+		envVars map[string]string
+		// mustContain: prefixes that MUST be present in the result
+		mustContain []string
+		// mustNotContain: prefixes that MUST NOT be present in the result
+		mustNotContain []string
+	}{
+		{
+			name:           "default preserves all vars",
+			envVars:        map[string]string{"PATH": "/usr/bin"},
+			mustContain:    []string{"PATH="},
+			mustNotContain: nil,
+		},
+		{
+			name:           "isolated strips all beads vars",
+			isolated:       true,
+			envVars:        map[string]string{"BD_ACTOR": "test-actor", "BEADS_DIR": "/tmp/beads"},
+			mustNotContain: []string{"BD_ACTOR=", "BEADS_DIR="},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for k, v := range tt.envVars {
+				t.Setenv(k, v)
+			}
+			b := &Beads{workDir: "/tmp", isolated: tt.isolated}
+			env := b.buildRunEnv()
+
+			for _, prefix := range tt.mustContain {
+				found := false
+				for _, e := range env {
+					if strings.HasPrefix(e, prefix) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("expected %s to be present", prefix)
+				}
+			}
+			for _, prefix := range tt.mustNotContain {
+				for _, e := range env {
+					if strings.HasPrefix(e, prefix) {
+						t.Errorf("expected %s to be absent, got %s", prefix, e)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestBuildRoutingEnv verifies buildRoutingEnv() returns the correct environment
+// for each mode: default (strip BEADS_DIR only) and isolated (strip all beads vars).
+func TestBuildRoutingEnv(t *testing.T) {
+	tests := []struct {
+		name           string
+		isolated       bool
+		envVars        map[string]string
+		mustContain    []string
+		mustNotContain []string
+	}{
+		{
+			name:           "default strips BEADS_DIR only",
+			envVars:        map[string]string{"BEADS_DIR": "/tmp/beads", "PATH": "/usr/bin"},
+			mustContain:    []string{"PATH="},
+			mustNotContain: []string{"BEADS_DIR="},
+		},
+		{
+			name:           "isolated strips all beads vars",
+			isolated:       true,
+			envVars:        map[string]string{"BD_ACTOR": "test-actor", "BEADS_DIR": "/tmp/beads"},
+			mustNotContain: []string{"BD_ACTOR=", "BEADS_DIR="},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for k, v := range tt.envVars {
+				t.Setenv(k, v)
+			}
+			b := &Beads{workDir: "/tmp", isolated: tt.isolated}
+			env := b.buildRoutingEnv()
+
+			for _, prefix := range tt.mustContain {
+				found := false
+				for _, e := range env {
+					if strings.HasPrefix(e, prefix) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("expected %s to be present", prefix)
+				}
+			}
+			for _, prefix := range tt.mustNotContain {
+				for _, e := range env {
+					if strings.HasPrefix(e, prefix) {
+						t.Errorf("expected %s to be absent, got %s", prefix, e)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestIsSubprocessCrash(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil error", nil, false},
+		{"normal error", fmt.Errorf("bd create: exit status 1"), false},
+		{"not found", fmt.Errorf("bd show: not found"), false},
+		{"signal segfault", fmt.Errorf("bd create: signal: segmentation fault"), true},
+		{"signal killed", fmt.Errorf("bd create: signal: killed"), true},
+		{"nil pointer in stderr", fmt.Errorf("bd create: nil pointer dereference"), true},
+		{"panic in stderr", fmt.Errorf("bd create: panic: runtime error"), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isSubprocessCrash(tt.err); got != tt.want {
+				t.Errorf("isSubprocessCrash(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCreateAgentBeadViaJSONL verifies the JSONL fallback creates valid entries (GH#1769).
+func TestCreateAgentBeadViaJSONL(t *testing.T) {
+	t.Run("creates valid JSONL entry", func(t *testing.T) {
+		beadsDir := filepath.Join(t.TempDir(), ".beads")
+		if err := os.MkdirAll(beadsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		issue, err := createAgentBeadViaJSONL(beadsDir, "gt-testrig-witness", "Witness for testrig", "Witness description\n\nrole_type: witness")
+		if err != nil {
+			t.Fatalf("createAgentBeadViaJSONL failed: %v", err)
+		}
+
+		if issue.ID != "gt-testrig-witness" {
+			t.Errorf("ID = %q, want %q", issue.ID, "gt-testrig-witness")
+		}
+		if issue.Status != "open" {
+			t.Errorf("Status = %q, want %q", issue.Status, "open")
+		}
+		if issue.Type != "agent" {
+			t.Errorf("Type = %q, want %q", issue.Type, "agent")
+		}
+		if len(issue.Labels) != 1 || issue.Labels[0] != "gt:agent" {
+			t.Errorf("Labels = %v, want [gt:agent]", issue.Labels)
+		}
+
+		// Verify JSONL file was created with valid content
+		jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
+		data, err := os.ReadFile(jsonlPath)
+		if err != nil {
+			t.Fatalf("reading issues.jsonl: %v", err)
+		}
+
+		var parsed Issue
+		if err := json.Unmarshal(data[:len(data)-1], &parsed); err != nil { // trim trailing newline
+			t.Fatalf("parsing JSONL entry: %v", err)
+		}
+		if parsed.ID != "gt-testrig-witness" {
+			t.Errorf("parsed ID = %q, want %q", parsed.ID, "gt-testrig-witness")
+		}
+		if parsed.Type != "agent" {
+			t.Errorf("parsed Type = %q, want %q", parsed.Type, "agent")
+		}
+	})
+
+	t.Run("appends to existing JSONL file", func(t *testing.T) {
+		beadsDir := filepath.Join(t.TempDir(), ".beads")
+		if err := os.MkdirAll(beadsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create first entry
+		_, err := createAgentBeadViaJSONL(beadsDir, "gt-testrig-witness", "Witness", "desc1")
+		if err != nil {
+			t.Fatalf("first create failed: %v", err)
+		}
+
+		// Create second entry
+		_, err = createAgentBeadViaJSONL(beadsDir, "gt-testrig-refinery", "Refinery", "desc2")
+		if err != nil {
+			t.Fatalf("second create failed: %v", err)
+		}
+
+		// Verify both entries are present
+		data, err := os.ReadFile(filepath.Join(beadsDir, "issues.jsonl"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+		if len(lines) != 2 {
+			t.Errorf("expected 2 JSONL lines, got %d", len(lines))
+		}
+	})
+
+	t.Run("fails gracefully on read-only directory", func(t *testing.T) {
+		// Use a non-existent path (can't write)
+		_, err := createAgentBeadViaJSONL("/nonexistent/.beads", "gt-test", "Test", "desc")
+		if err == nil {
+			t.Error("expected error for non-existent directory")
+		}
+	})
 }

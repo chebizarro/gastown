@@ -157,44 +157,18 @@ func (g *Git) wrapError(err error, stdout, stderr string, args []string) error {
 	}
 }
 
-// Clone clones a repository to the destination.
-func (g *Git) Clone(url, dest string) error {
-	// Ensure destination directory's parent exists
-	destParent := filepath.Dir(dest)
-	if err := os.MkdirAll(destParent, 0755); err != nil {
-		return fmt.Errorf("creating destination parent: %w", err)
-	}
-	// Run clone from a temporary directory to completely isolate from any
-	// git repo at the process cwd. Then move the result to the destination.
-	tmpDir, err := os.MkdirTemp("", "gt-clone-*")
-	if err != nil {
-		return fmt.Errorf("creating temp dir: %w", err)
-	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
-
-	tmpDest := filepath.Join(tmpDir, filepath.Base(dest))
-	cmd := exec.Command("git", "clone", url, tmpDest)
-	cmd.Dir = tmpDir
-	cmd.Env = append(os.Environ(), "GIT_CEILING_DIRECTORIES="+tmpDir)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return g.wrapError(err, stdout.String(), stderr.String(), []string{"clone", url})
-	}
-
-	// Move to final destination (handles cross-filesystem moves)
-	if err := moveDir(tmpDest, dest); err != nil {
-		return fmt.Errorf("moving clone to destination: %w", err)
-	}
-
-	// Configure hooks path for Gas Town clones
-	return configureHooksPath(dest)
+// cloneOptions configures a clone operation for cloneInternal.
+type cloneOptions struct {
+	bare         bool   // Pass --bare to git clone
+	reference    string // Pass --reference-if-able <path> to git clone
+	singleBranch bool   // Pass --single-branch to git clone (only fetch default branch)
+	depth        int    // Pass --depth N to git clone (shallow clone); 0 means full history
+	branch       string // Pass --branch <name> to git clone (checkout specific branch)
 }
 
-// CloneWithReference clones a repository using a local repo as an object reference.
-// This saves disk by sharing objects without changing remotes.
-func (g *Git) CloneWithReference(url, dest, reference string) error {
+// cloneInternal runs `git clone` in an isolated temp directory, moves the result
+// to dest, and applies post-clone configuration (hooks or refspec).
+func (g *Git) cloneInternal(url, dest string, opts cloneOptions) error {
 	// Ensure destination directory's parent exists
 	destParent := filepath.Dir(dest)
 	if err := os.MkdirAll(destParent, 0755); err != nil {
@@ -209,10 +183,31 @@ func (g *Git) CloneWithReference(url, dest, reference string) error {
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	tmpDest := filepath.Join(tmpDir, filepath.Base(dest))
-	args := []string{"clone", "--reference-if-able", reference, url, tmpDest}
-	if runtime.GOOS == "windows" {
-		args = append([]string{"-c", "core.symlinks=true"}, args...)
+
+	// Build clone args
+	var args []string
+	// Windows symlink fix for non-bare reference clones
+	if opts.reference != "" && !opts.bare && runtime.GOOS == "windows" {
+		args = append(args, "-c", "core.symlinks=true")
 	}
+	args = append(args, "clone")
+	if opts.bare {
+		args = append(args, "--bare")
+	}
+	if opts.singleBranch {
+		args = append(args, "--single-branch")
+	}
+	if opts.depth > 0 {
+		args = append(args, "--depth", fmt.Sprintf("%d", opts.depth))
+	}
+	if opts.branch != "" {
+		args = append(args, "--branch", opts.branch)
+	}
+	if opts.reference != "" {
+		args = append(args, "--reference-if-able", opts.reference)
+	}
+	args = append(args, url, tmpDest)
+
 	cmd := exec.Command("git", args...)
 	cmd.Dir = tmpDir
 	cmd.Env = append(os.Environ(), "GIT_CEILING_DIRECTORIES="+tmpDir)
@@ -228,44 +223,49 @@ func (g *Git) CloneWithReference(url, dest, reference string) error {
 		return fmt.Errorf("moving clone to destination: %w", err)
 	}
 
+	// Post-clone configuration
+	if opts.bare {
+		// Configure refspec so worktrees can fetch and see origin/* refs.
+		// For single-branch shallow clones, only set the config without
+		// fetching all branches (which would defeat the purpose of --single-branch).
+		return configureRefspec(dest, opts.singleBranch)
+	}
 	// Configure hooks path for Gas Town clones
-	return configureHooksPath(dest)
+	if err := configureHooksPath(dest); err != nil {
+		return err
+	}
+	// Initialize submodules if present
+	return InitSubmodules(dest)
+}
+
+// Clone clones a repository to the destination.
+// Uses --single-branch --depth 1 for efficiency on repos with many branches.
+func (g *Git) Clone(url, dest string) error {
+	return g.cloneInternal(url, dest, cloneOptions{singleBranch: true, depth: 1})
+}
+
+// CloneWithReference clones a repository using a local repo as an object reference.
+// This saves disk by sharing objects without changing remotes.
+// Uses --single-branch --depth 1 for efficiency on repos with many branches.
+func (g *Git) CloneWithReference(url, dest, reference string) error {
+	return g.cloneInternal(url, dest, cloneOptions{reference: reference, singleBranch: true, depth: 1})
+}
+
+// CloneBranch clones a specific branch with --single-branch --depth 1.
+// Use this when you know which branch you need (avoids fetching all branches).
+func (g *Git) CloneBranch(url, dest, branch string) error {
+	return g.cloneInternal(url, dest, cloneOptions{singleBranch: true, depth: 1, branch: branch})
+}
+
+// CloneBranchWithReference clones a specific branch using a local repo as reference.
+func (g *Git) CloneBranchWithReference(url, dest, branch, reference string) error {
+	return g.cloneInternal(url, dest, cloneOptions{singleBranch: true, depth: 1, branch: branch, reference: reference})
 }
 
 // CloneBare clones a repository as a bare repo (no working directory).
 // This is used for the shared repo architecture where all worktrees share a single git database.
 func (g *Git) CloneBare(url, dest string) error {
-	// Ensure destination directory's parent exists
-	destParent := filepath.Dir(dest)
-	if err := os.MkdirAll(destParent, 0755); err != nil {
-		return fmt.Errorf("creating destination parent: %w", err)
-	}
-	// Run clone from a temporary directory to completely isolate from any
-	// git repo at the process cwd. Then move the result to the destination.
-	tmpDir, err := os.MkdirTemp("", "gt-clone-*")
-	if err != nil {
-		return fmt.Errorf("creating temp dir: %w", err)
-	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
-
-	tmpDest := filepath.Join(tmpDir, filepath.Base(dest))
-	cmd := exec.Command("git", "clone", "--bare", url, tmpDest)
-	cmd.Dir = tmpDir
-	cmd.Env = append(os.Environ(), "GIT_CEILING_DIRECTORIES="+tmpDir)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return g.wrapError(err, stdout.String(), stderr.String(), []string{"clone", "--bare", url})
-	}
-
-	// Move to final destination (handles cross-filesystem moves)
-	if err := moveDir(tmpDest, dest); err != nil {
-		return fmt.Errorf("moving clone to destination: %w", err)
-	}
-
-	// Configure refspec so worktrees can fetch and see origin/* refs
-	return configureRefspec(dest)
+	return g.cloneInternal(url, dest, cloneOptions{bare: true, singleBranch: true, depth: 1})
 }
 
 // configureHooksPath sets core.hooksPath to use the repo's .githooks directory
@@ -297,7 +297,11 @@ func (g *Git) ConfigureHooksPath() error {
 // fetch and see origin/* refs. Without this, `git fetch` only updates FETCH_HEAD
 // and origin/main never appears in refs/remotes/origin/main.
 // See: https://github.com/anthropics/gastown/issues/286
-func configureRefspec(repoPath string) error {
+//
+// When singleBranch is true, fetches only the default branch's ref instead of all
+// branches. This prevents failures on repos with many branches where a full fetch
+// would error with "some local refs could not be updated".
+func configureRefspec(repoPath string, singleBranch bool) error {
 	gitDir := repoPath
 	if _, err := os.Stat(filepath.Join(repoPath, ".git")); err == nil {
 		gitDir = filepath.Join(repoPath, ".git")
@@ -311,6 +315,38 @@ func configureRefspec(repoPath string) error {
 		return fmt.Errorf("configuring refspec: %s", strings.TrimSpace(stderr.String()))
 	}
 
+	if singleBranch {
+		// For shallow single-branch clones, fetch only the HEAD branch to create
+		// the origin/<branch> ref that worktrees need. A full `git fetch origin`
+		// would try to fetch ALL remote branches (due to the refspec we just set),
+		// which fails on repos with many branches.
+		//
+		// Detect HEAD branch name, then fetch only that specific branch.
+		var headOut bytes.Buffer
+		headCmd := exec.Command("git", "--git-dir", gitDir, "symbolic-ref", "HEAD")
+		headCmd.Stdout = &headOut
+		headCmd.Stderr = &stderr
+		if err := headCmd.Run(); err != nil {
+			// Fallback: if HEAD is detached, try fetching all (shouldn't happen for clones)
+			fetchCmd := exec.Command("git", "--git-dir", gitDir, "fetch", "--depth", "1", "origin")
+			fetchCmd.Stderr = &stderr
+			if fetchErr := fetchCmd.Run(); fetchErr != nil {
+				return fmt.Errorf("fetching origin: %s", strings.TrimSpace(stderr.String()))
+			}
+			return nil
+		}
+		headRef := strings.TrimSpace(headOut.String())        // e.g. "refs/heads/main"
+		branch := strings.TrimPrefix(headRef, "refs/heads/")  // e.g. "main"
+		refspec := branch + ":refs/remotes/origin/" + branch   // e.g. "main:refs/remotes/origin/main"
+
+		fetchCmd := exec.Command("git", "--git-dir", gitDir, "fetch", "--depth", "1", "origin", refspec)
+		fetchCmd.Stderr = &stderr
+		if err := fetchCmd.Run(); err != nil {
+			return fmt.Errorf("fetching origin %s: %s", branch, strings.TrimSpace(stderr.String()))
+		}
+		return nil
+	}
+
 	fetchCmd := exec.Command("git", "--git-dir", gitDir, "fetch", "origin")
 	fetchCmd.Stderr = &stderr
 	if err := fetchCmd.Run(); err != nil {
@@ -321,38 +357,9 @@ func configureRefspec(repoPath string) error {
 }
 
 // CloneBareWithReference clones a bare repository using a local repo as an object reference.
+// Uses --single-branch --depth 1 for efficiency on repos with many branches.
 func (g *Git) CloneBareWithReference(url, dest, reference string) error {
-	// Ensure destination directory's parent exists
-	destParent := filepath.Dir(dest)
-	if err := os.MkdirAll(destParent, 0755); err != nil {
-		return fmt.Errorf("creating destination parent: %w", err)
-	}
-	// Run clone from a temporary directory to completely isolate from any
-	// git repo at the process cwd. Then move the result to the destination.
-	tmpDir, err := os.MkdirTemp("", "gt-clone-*")
-	if err != nil {
-		return fmt.Errorf("creating temp dir: %w", err)
-	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
-
-	tmpDest := filepath.Join(tmpDir, filepath.Base(dest))
-	cmd := exec.Command("git", "clone", "--bare", "--reference-if-able", reference, url, tmpDest)
-	cmd.Dir = tmpDir
-	cmd.Env = append(os.Environ(), "GIT_CEILING_DIRECTORIES="+tmpDir)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return g.wrapError(err, stdout.String(), stderr.String(), []string{"clone", "--bare", "--reference-if-able", url})
-	}
-
-	// Move to final destination (handles cross-filesystem moves)
-	if err := moveDir(tmpDest, dest); err != nil {
-		return fmt.Errorf("moving clone to destination: %w", err)
-	}
-
-	// Configure refspec so worktrees can fetch and see origin/* refs
-	return configureRefspec(dest)
+	return g.cloneInternal(url, dest, cloneOptions{bare: true, reference: reference, singleBranch: true, depth: 1})
 }
 
 // Checkout checks out the given ref.
@@ -380,10 +387,58 @@ func (g *Git) FetchBranch(remote, branch string) error {
 	return err
 }
 
+// FetchBranchShallow fetches a single branch with --depth 1 and creates the
+// remote tracking ref (e.g. origin/<branch>). Use this on shallow single-branch
+// clones to add a branch that wasn't included in the initial clone.
+func (g *Git) FetchBranchShallow(remote, branch string) error {
+	refspec := branch + ":refs/remotes/" + remote + "/" + branch
+	_, err := g.run("fetch", "--depth", "1", remote, refspec)
+	return err
+}
+
 // Pull pulls from the remote branch.
 func (g *Git) Pull(remote, branch string) error {
 	_, err := g.run("pull", remote, branch)
 	return err
+}
+
+// ConfigurePushURL sets the push URL for a remote while keeping the fetch URL.
+// This is useful for read-only upstream repos where you want to push to a fork.
+// Example: ConfigurePushURL("origin", "https://github.com/user/fork.git")
+func (g *Git) ConfigurePushURL(remote, pushURL string) error {
+	_, err := g.run("remote", "set-url", remote, "--push", pushURL)
+	return err
+}
+
+// ClearPushURL removes a custom push URL for a remote, reverting to the fetch URL.
+// If no custom push URL is set, this is a no-op.
+// Uses --unset-all to handle multi-valued pushurl entries; with --unset-all,
+// exit code 5 unambiguously means "key not found" (safe to ignore).
+func (g *Git) ClearPushURL(remote string) error {
+	_, err := g.run("config", "--unset-all", fmt.Sprintf("remote.%s.pushurl", remote))
+	if err != nil {
+		// git config --unset-all returns exit code 5 if the key doesn't exist — that's fine.
+		var ge *GitError
+		if errors.As(err, &ge) {
+			var exitErr *exec.ExitError
+			if errors.As(ge.Err, &exitErr) && exitErr.ExitCode() == 5 {
+				return nil
+			}
+		}
+		return err
+	}
+	return nil
+}
+
+// GetPushURL returns the effective push URL for a remote.
+// Note: git returns the fetch URL when no custom push URL is configured, so this
+// never returns empty for a valid remote. Compare with RemoteURL to detect custom push URLs.
+func (g *Git) GetPushURL(remote string) (string, error) {
+	out, err := g.run("remote", "get-url", "--push", remote)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
 }
 
 // Push pushes to the remote branch.
@@ -605,6 +660,32 @@ func (g *Git) DeleteRemoteBranch(remote, branch string) error {
 	return err
 }
 
+// ListRemoteRefs returns remote ref names matching a prefix using ls-remote.
+// The prefix filters refs (e.g., "refs/heads/polecat/" for all polecat branches).
+// Returns full ref names like "refs/heads/polecat/furiosa-abc123".
+func (g *Git) ListRemoteRefs(remote, prefix string) ([]string, error) {
+	out, err := g.run("ls-remote", "--refs", remote, prefix+"*")
+	if err != nil {
+		return nil, err
+	}
+	if out == "" {
+		return nil, nil
+	}
+	var refs []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// ls-remote output format: <sha>\t<refname>
+		parts := strings.Fields(line)
+		if len(parts) >= 2 {
+			refs = append(refs, parts[1])
+		}
+	}
+	return refs, nil
+}
+
 // Rebase rebases the current branch onto the given ref.
 func (g *Git) Rebase(onto string) error {
 	_, err := g.run("rebase", onto)
@@ -760,6 +841,20 @@ func (g *Git) RefExists(ref string) (bool, error) {
 	return true, nil
 }
 
+// IsEmpty returns true if the repository has no refs (an empty/unborn repo).
+// This is the case for newly-created repos with no commits.
+func (g *Git) IsEmpty() (bool, error) {
+	out, err := g.run("show-ref")
+	if err != nil {
+		// git show-ref exits 1 when there are no refs — that means empty
+		if strings.Contains(err.Error(), "exit status 1") {
+			return true, nil
+		}
+		return false, err
+	}
+	return strings.TrimSpace(out) == "", nil
+}
+
 // RemoteBranchExists checks if a branch exists on the remote.
 func (g *Git) RemoteBranchExists(remote, branch string) (bool, error) {
 	out, err := g.run("ls-remote", "--heads", remote, branch)
@@ -813,8 +908,17 @@ func (g *Git) ListBranches(pattern string) ([]string, error) {
 
 // ResetBranch force-updates a branch to point to a ref.
 // This is useful for resetting stale polecat branches to main.
+// NOTE: This uses `git branch -f` which fails on the currently checked-out branch.
+// Use ResetHard instead when the target branch is checked out.
 func (g *Git) ResetBranch(name, ref string) error {
 	_, err := g.run("branch", "-f", name, ref)
+	return err
+}
+
+// ResetHard resets the current working tree and index to the given ref.
+// Unlike ResetBranch, this works on the currently checked-out branch.
+func (g *Git) ResetHard(ref string) error {
+	_, err := g.run("reset", "--hard", ref)
 	return err
 }
 
@@ -838,35 +942,63 @@ func (g *Git) IsAncestor(ancestor, descendant string) (bool, error) {
 
 // WorktreeAdd creates a new worktree at the given path with a new branch.
 // The new branch is created from the current HEAD.
+// Skips LFS smudge filter during checkout (see WorktreeAddFromRef).
 func (g *Git) WorktreeAdd(path, branch string) error {
-	_, err := g.run("worktree", "add", "-b", branch, path)
-	return err
+	if _, err := g.runWithEnv(
+		[]string{"worktree", "add", "-b", branch, path},
+		[]string{"GIT_LFS_SKIP_SMUDGE=1"},
+	); err != nil {
+		return err
+	}
+	return InitSubmodules(path)
 }
 
 // WorktreeAddFromRef creates a new worktree at the given path with a new branch
 // starting from the specified ref (e.g., "origin/main").
+// Skips LFS smudge filter during checkout to avoid downloading large LFS objects
+// over NFS (~72s for 473MB). LFS files appear as pointer files initially;
+// callers can run "git lfs pull" later when LFS content is actually needed.
 func (g *Git) WorktreeAddFromRef(path, branch, startPoint string) error {
-	_, err := g.run("worktree", "add", "-b", branch, path, startPoint)
-	return err
+	if _, err := g.runWithEnv(
+		[]string{"worktree", "add", "-b", branch, path, startPoint},
+		[]string{"GIT_LFS_SKIP_SMUDGE=1"},
+	); err != nil {
+		return err
+	}
+	return InitSubmodules(path)
 }
 
 // WorktreeAddDetached creates a new worktree at the given path with a detached HEAD.
+// Skips LFS smudge filter during checkout (see WorktreeAddFromRef).
 func (g *Git) WorktreeAddDetached(path, ref string) error {
-	_, err := g.run("worktree", "add", "--detach", path, ref)
-	return err
+	if _, err := g.runWithEnv(
+		[]string{"worktree", "add", "--detach", path, ref},
+		[]string{"GIT_LFS_SKIP_SMUDGE=1"},
+	); err != nil {
+		return err
+	}
+	return InitSubmodules(path)
 }
 
 // WorktreeAddExisting creates a new worktree at the given path for an existing branch.
+// Skips LFS smudge filter during checkout (see WorktreeAddFromRef).
 func (g *Git) WorktreeAddExisting(path, branch string) error {
-	_, err := g.run("worktree", "add", path, branch)
-	return err
+	if _, err := g.runWithEnv(
+		[]string{"worktree", "add", path, branch},
+		[]string{"GIT_LFS_SKIP_SMUDGE=1"},
+	); err != nil {
+		return err
+	}
+	return InitSubmodules(path)
 }
 
 // WorktreeAddExistingForce creates a new worktree even if the branch is already checked out elsewhere.
 // This is useful for cross-rig worktrees where multiple clones need to be on main.
 func (g *Git) WorktreeAddExistingForce(path, branch string) error {
-	_, err := g.run("worktree", "add", "--force", path, branch)
-	return err
+	if _, err := g.run("worktree", "add", "--force", path, branch); err != nil {
+		return err
+	}
+	return InitSubmodules(path)
 }
 
 // IsSparseCheckoutConfigured checks if sparse checkout is enabled for a given repo/worktree.
@@ -954,9 +1086,10 @@ func (g *Git) WorktreeList() ([]Worktree, error) {
 // This uses the committer date of the first commit on the branch.
 // Returns date in YYYY-MM-DD format.
 func (g *Git) BranchCreatedDate(branch string) (string, error) {
-	// Get the date of the first commit on the branch that's not on main
-	// Use merge-base to find where the branch diverged from main
-	mergeBase, err := g.run("merge-base", "main", branch)
+	// Get the date of the first commit on the branch that's not on the default branch
+	// Use merge-base to find where the branch diverged
+	defaultBranch := g.RemoteDefaultBranch()
+	mergeBase, err := g.run("merge-base", defaultBranch, branch)
 	if err != nil {
 		// If merge-base fails, fall back to the branch tip's date
 		out, err := g.run("log", "-1", "--format=%cs", branch)
@@ -1023,7 +1156,12 @@ func (g *Git) CountCommitsBehind(ref string) (int, error) {
 	return count, nil
 }
 
-// StashCount returns the number of stashes in the repository.
+// StashCount returns the number of stashes belonging to the current branch.
+// Git stashes are stored in the main repo (.git/refs/stash) and shared across
+// all worktrees. Counting all stashes is incorrect for worktree-based polecats:
+// a fresh polecat worktree would inherit stash count from siblings, blocking
+// Remove(force=true) on work it never created. Filter by current branch name
+// to only count stashes that actually belong to this worktree.
 func (g *Git) StashCount() (int, error) {
 	out, err := g.run("stash", "list")
 	if err != nil {
@@ -1034,13 +1172,32 @@ func (g *Git) StashCount() (int, error) {
 		return 0, nil
 	}
 
-	// Count lines in the stash list
+	// Get current branch to filter stashes.
+	// If we can't determine the branch (detached HEAD, error), count all
+	// stashes as a safe fallback — better to over-count than silently lose work.
+	branch, branchErr := g.CurrentBranch()
+	filterByBranch := branchErr == nil && branch != "" && branch != "HEAD"
+
+	// Stash reflog lines have the format:
+	//   stash@{N}: WIP on <branch>: <hash> <message>
+	//   stash@{N}: On <branch>: <message>
+	// We anchor the match to ": WIP on <branch>:" or ": On <branch>:" to avoid
+	// false positives from commit messages that happen to contain "on <branch>:".
+	wipPrefix := ": WIP on " + branch + ":"
+	onPrefix := ": On " + branch + ":"
+
 	lines := strings.Split(out, "\n")
 	count := 0
 	for _, line := range lines {
-		if line != "" {
-			count++
+		if line == "" {
+			continue
 		}
+		if filterByBranch {
+			if !strings.Contains(line, wipPrefix) && !strings.Contains(line, onPrefix) {
+				continue
+			}
+		}
+		count++
 	}
 	return count, nil
 }
@@ -1174,13 +1331,15 @@ func (g *Git) CheckUncommittedWork() (*UncommittedWorkStatus, error) {
 func (g *Git) BranchPushedToRemote(localBranch, remote string) (bool, int, error) {
 	remoteBranch := remote + "/" + localBranch
 
-	// First check if the remote branch exists
-	exists, err := g.RemoteBranchExists(remote, localBranch)
+	// Check if the remote branch exists via ls-remote and save the output.
+	// The output contains the SHA which we reuse in the fallback path below,
+	// avoiding a redundant second ls-remote call.
+	lsOut, err := g.run("ls-remote", "--heads", remote, localBranch)
 	if err != nil {
 		return false, 0, fmt.Errorf("checking remote branch: %w", err)
 	}
 
-	if !exists {
+	if lsOut == "" {
 		// Remote branch doesn't exist - count commits since origin/main (or HEAD if that fails)
 		count, err := g.run("rev-list", "--count", "origin/main..HEAD")
 		if err != nil {
@@ -1209,7 +1368,7 @@ func (g *Git) BranchPushedToRemote(localBranch, remote string) (bool, int, error
 	remoteRef := "refs/remotes/" + remoteBranch
 	if _, err := g.run("rev-parse", "--verify", remoteRef); err != nil {
 		// Remote ref doesn't exist locally - update it from FETCH_HEAD if fetch succeeded.
-		// Best-effort: if this fails, the code below falls back to ls-remote.
+		// Best-effort: if this fails, the code below falls back to the saved ls-remote SHA.
 		if fetchErr == nil {
 			_, _ = g.run("update-ref", remoteRef, "FETCH_HEAD")
 		}
@@ -1219,22 +1378,13 @@ func (g *Git) BranchPushedToRemote(localBranch, remote string) (bool, int, error
 	count, err := g.run("rev-list", "--count", remoteBranch+"..HEAD")
 	if err != nil {
 		// Fallback: If we can't use the tracking ref (possibly missing remote.origin.fetch),
-		// get the remote commit SHA directly via ls-remote and compare.
+		// use the SHA from the ls-remote call above instead of hitting the network again.
 		// See: gt-0eh3r (gt done fails in worktree with missing remote.origin.fetch config)
-		remoteSHA, lsErr := g.run("ls-remote", remote, "refs/heads/"+localBranch)
-		if lsErr != nil {
-			return false, 0, fmt.Errorf("counting unpushed commits: %w (fallback also failed: %v)", err, lsErr)
-		}
-		// Parse SHA from ls-remote output (format: "<sha>\trefs/heads/<branch>")
-		remoteSHA = strings.TrimSpace(remoteSHA)
-		if remoteSHA == "" {
-			return false, 0, fmt.Errorf("counting unpushed commits: %w (remote branch not found)", err)
-		}
-		parts := strings.Fields(remoteSHA)
+		parts := strings.Fields(strings.TrimSpace(lsOut))
 		if len(parts) == 0 {
 			return false, 0, fmt.Errorf("counting unpushed commits: %w (invalid ls-remote output)", err)
 		}
-		remoteSHA = parts[0]
+		remoteSHA := parts[0]
 
 		// Count commits from remote SHA to HEAD
 		count, err = g.run("rev-list", "--count", remoteSHA+"..HEAD")
@@ -1335,4 +1485,202 @@ func (g *Git) PruneStaleBranches(pattern string, dryRun bool) ([]PrunedBranch, e
 	}
 
 	return pruned, nil
+}
+
+// SubmoduleChange represents a changed submodule pointer between two refs.
+type SubmoduleChange struct {
+	Path   string // Submodule path relative to repo root
+	OldSHA string // Previous commit SHA (or empty for new submodule)
+	NewSHA string // New commit SHA (or empty for removed submodule)
+	URL    string // Submodule remote URL from .gitmodules
+}
+
+// InitSubmodules initializes and updates submodules if .gitmodules exists.
+// This is a no-op for repos without submodules.
+func InitSubmodules(repoPath string) error {
+	gitmodules := filepath.Join(repoPath, ".gitmodules")
+	if _, err := os.Stat(gitmodules); os.IsNotExist(err) {
+		return nil
+	}
+	cmd := exec.Command("git", "-C", repoPath, "submodule", "update", "--init", "--recursive")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("initializing submodules: %s", strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+// SubmoduleChanges detects submodule pointer changes between two refs.
+// Returns nil if no submodules changed or if the repo has no submodules.
+func (g *Git) SubmoduleChanges(base, head string) ([]SubmoduleChange, error) {
+	// git diff --raw shows mode 160000 for gitlink (submodule) entries
+	out, err := g.run("diff", "--raw", base, head)
+	if err != nil {
+		return nil, fmt.Errorf("diffing for submodule changes: %w", err)
+	}
+	if out == "" {
+		return nil, nil
+	}
+
+	var changes []SubmoduleChange
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Format: :oldmode newmode oldsha newsha status\tpath
+		// Submodule entries have mode 160000
+		if !strings.Contains(line, "160000") {
+			continue
+		}
+		// Parse the raw diff line
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		path := strings.TrimSpace(parts[1])
+		fields := strings.Fields(parts[0])
+		if len(fields) < 5 {
+			continue
+		}
+		oldSHA := fields[2]
+		newSHA := fields[3]
+		// Null SHAs (all zeros) indicate added/removed submodules
+		if strings.Repeat("0", len(oldSHA)) == oldSHA {
+			oldSHA = ""
+		}
+		if strings.Repeat("0", len(newSHA)) == newSHA {
+			newSHA = ""
+		}
+
+		change := SubmoduleChange{
+			Path:   path,
+			OldSHA: oldSHA,
+			NewSHA: newSHA,
+		}
+
+		// Try to get the submodule URL from .gitmodules on the head ref
+		url, urlErr := g.submoduleURL(head, path)
+		if urlErr == nil {
+			change.URL = url
+		}
+
+		changes = append(changes, change)
+	}
+	return changes, nil
+}
+
+// submoduleURL reads the URL for a submodule from .gitmodules at a given ref.
+// Uses git config -f to parse the file correctly regardless of field ordering.
+func (g *Git) submoduleURL(ref, submodulePath string) (string, error) {
+	// Write .gitmodules from the ref to a temp file so we can use git config -f
+	content, err := g.run("show", ref+":.gitmodules")
+	if err != nil {
+		return "", err
+	}
+	tmpFile, err := os.CreateTemp("", "gitmodules-*")
+	if err != nil {
+		return "", fmt.Errorf("creating temp file for .gitmodules: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	if _, err := tmpFile.WriteString(content); err != nil {
+		tmpFile.Close()
+		return "", fmt.Errorf("writing temp .gitmodules: %w", err)
+	}
+	tmpFile.Close()
+
+	// List all submodule.<name>.path entries to find the section matching our path
+	cmd := exec.Command("git", "config", "-f", tmpFile.Name(), "--get-regexp", `^submodule\..*\.path$`)
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("reading submodule paths from .gitmodules: %w", err)
+	}
+
+	var sectionName string
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Format: submodule.<name>.path <value>
+		parts := strings.SplitN(line, " ", 2)
+		if len(parts) == 2 && strings.TrimSpace(parts[1]) == submodulePath {
+			key := parts[0]
+			key = strings.TrimPrefix(key, "submodule.")
+			key = strings.TrimSuffix(key, ".path")
+			sectionName = key
+			break
+		}
+	}
+	if sectionName == "" {
+		return "", fmt.Errorf("submodule URL not found for path %s", submodulePath)
+	}
+
+	// Get the URL for this section
+	urlCmd := exec.Command("git", "config", "-f", tmpFile.Name(), "--get", "submodule."+sectionName+".url")
+	var urlOut bytes.Buffer
+	urlCmd.Stdout = &urlOut
+	if err := urlCmd.Run(); err != nil {
+		return "", fmt.Errorf("reading URL for submodule %s: %w", sectionName, err)
+	}
+	url := strings.TrimSpace(urlOut.String())
+	if url == "" {
+		return "", fmt.Errorf("submodule URL not found for path %s", submodulePath)
+	}
+	return url, nil
+}
+
+// PushSubmoduleCommit pushes a specific commit SHA from a submodule to its remote.
+// The submodulePath is relative to the repo working directory.
+// The commit must exist in the submodule's object store (shared via .repo.git/modules/).
+func (g *Git) PushSubmoduleCommit(submodulePath, sha, remote string) error {
+	absPath := filepath.Join(g.workDir, submodulePath)
+	// Detect the remote's default branch (don't assume main)
+	defaultBranch, err := submoduleDefaultBranch(absPath, remote)
+	if err != nil {
+		return fmt.Errorf("detecting default branch for submodule %s: %w", submodulePath, err)
+	}
+	cmd := exec.Command("git", "-C", absPath, "push", remote, sha+":refs/heads/"+defaultBranch)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("pushing submodule %s commit %s: %s", submodulePath, sha[:8], strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+// submoduleDefaultBranch detects the default branch of a submodule's remote.
+// Tries local refs first to avoid network round-trips, falling back to remote queries.
+func submoduleDefaultBranch(submodulePath, remote string) (string, error) {
+	// Try local symbolic-ref first (no network, fastest)
+	symCmd := exec.Command("git", "-C", submodulePath, "symbolic-ref", "refs/remotes/"+remote+"/HEAD")
+	if symOut, err := symCmd.Output(); err == nil {
+		ref := strings.TrimSpace(string(symOut))
+		// refs/remotes/origin/HEAD -> refs/remotes/origin/main -> main
+		if parts := strings.Split(ref, "/"); len(parts) > 0 {
+			branch := parts[len(parts)-1]
+			if branch != "" {
+				return branch, nil
+			}
+		}
+	}
+
+	// Try local tracking refs (no network)
+	for _, candidate := range []string{"main", "master"} {
+		check := exec.Command("git", "-C", submodulePath, "rev-parse", "--verify", "--quiet", "refs/remotes/"+remote+"/"+candidate)
+		if check.Run() == nil {
+			return candidate, nil
+		}
+	}
+
+	// Fallback: network query via ls-remote
+	for _, candidate := range []string{"main", "master"} {
+		check := exec.Command("git", "-C", submodulePath, "ls-remote", "--exit-code", remote, "refs/heads/"+candidate)
+		if check.Run() == nil {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("could not determine default branch for remote %s", remote)
 }

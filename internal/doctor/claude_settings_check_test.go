@@ -880,7 +880,7 @@ func TestClaudeSettingsCheck_FixPreservesTrackedCleanFiles(t *testing.T) {
 // TestClaudeSettingsCheck_FixMovesCLAUDEmdToMayor were removed because
 // CLAUDE.md at town root is now intentionally created by gt install.
 // It serves as an identity anchor for Mayor/Deacon who run from the town root.
-// See install.go createTownRootCLAUDEmd() for details.
+// See install.go createTownRootAgentMDs() for details.
 
 func TestClaudeSettingsCheck_GitIgnoredFilesNotFlagged(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -1257,8 +1257,8 @@ func TestClaudeSettingsCheck_MissingFileOnlyMessage(t *testing.T) {
 	}
 
 	// Fix hint should mention restart for missing files
-	if !strings.Contains(result.FixHint, "gt up --restart") {
-		t.Errorf("expected fix hint to mention 'gt up --restart', got %q", result.FixHint)
+	if !strings.Contains(result.FixHint, "gt up --restore") {
+		t.Errorf("expected fix hint to mention 'gt up --restore', got %q", result.FixHint)
 	}
 }
 

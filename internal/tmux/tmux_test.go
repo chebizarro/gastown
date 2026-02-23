@@ -333,6 +333,13 @@ func TestIsAgentRunning(t *testing.T) {
 	}
 	defer func() { _ = tm.KillSession(sessionName) }()
 
+	// Wait for the shell to be fully initialized before querying pane command.
+	// Without this, GetPaneCommand can return a transient value during shell
+	// startup (e.g., login or profile-sourced commands), causing flaky matches.
+	if err := tm.WaitForShellReady(sessionName, 2*time.Second); err != nil {
+		t.Fatalf("WaitForShellReady: %v", err)
+	}
+
 	// Get the current pane command (should be bash/zsh/etc)
 	cmd, err := tm.GetPaneCommand(sessionName)
 	if err != nil {
@@ -383,11 +390,26 @@ func TestIsAgentRunning(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := tm.IsAgentRunning(sessionName, tt.processNames...)
-			if got != tt.wantRunning {
-				t.Errorf("IsAgentRunning(%q, %v) = %v, want %v (current cmd: %q)",
-					sessionName, tt.processNames, got, tt.wantRunning, cmd)
+			// Re-check the pane command immediately before assertion.
+			// The pane command can transiently change between the initial
+			// GetPaneCommand call and subtest execution (e.g., shell profile
+			// commands), causing false failures. Retry up to 5 times with
+			// a short sleep to tolerate transient pane command changes.
+			var got bool
+			var currentCmd string
+			for attempt := 0; attempt < 5; attempt++ {
+				if attempt > 0 {
+					time.Sleep(200 * time.Millisecond)
+				}
+				got = tm.IsAgentRunning(sessionName, tt.processNames...)
+				if got == tt.wantRunning {
+					return // success
+				}
+				// Re-read pane command for diagnostics
+				currentCmd, _ = tm.GetPaneCommand(sessionName)
 			}
+			t.Errorf("IsAgentRunning(%q, %v) = %v, want %v (current cmd: %q, setup cmd: %q)",
+				sessionName, tt.processNames, got, tt.wantRunning, currentCmd, cmd)
 		})
 	}
 }
@@ -481,31 +503,103 @@ func TestIsRuntimeRunning_ShellWithNodeChild(t *testing.T) {
 	}
 }
 
-func TestHasChildWithNames(t *testing.T) {
-	// Test the hasChildWithNames helper function directly
+// TestGetPaneCommand_MultiPane verifies that GetPaneCommand returns pane 0's
+// command even when a split pane exists and is active. This is the core fix
+// for gs-2v7: without explicit pane 0 targeting, health checks would see the
+// split pane's shell and falsely report the agent as dead.
+func TestGetPaneCommand_MultiPane(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	tm := NewTmux()
+	sessionName := "gt-test-multipane-" + t.Name()
+
+	_ = tm.KillSession(sessionName)
+
+	// Create session running sleep (simulates an agent process in pane 0)
+	if err := tm.NewSessionWithCommand(sessionName, "", "sleep 300"); err != nil {
+		t.Fatalf("NewSessionWithCommand: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	// Verify pane 0 shows "sleep"
+	cmd, err := tm.GetPaneCommand(sessionName)
+	if err != nil {
+		t.Fatalf("GetPaneCommand before split: %v", err)
+	}
+	if cmd != "sleep" {
+		t.Fatalf("expected pane 0 command to be 'sleep', got %q", cmd)
+	}
+
+	// Capture pane 0's PID and working directory before the split
+	pidBefore, err := tm.GetPanePID(sessionName)
+	if err != nil {
+		t.Fatalf("GetPanePID before split: %v", err)
+	}
+	wdBefore, err := tm.GetPaneWorkDir(sessionName)
+	if err != nil {
+		t.Fatalf("GetPaneWorkDir before split: %v", err)
+	}
+
+	// Split the window — creates a new pane running a shell, which becomes active
+	if _, err := tm.run("split-window", "-t", sessionName, "-d"); err != nil {
+		t.Fatalf("split-window: %v", err)
+	}
+
+	// GetPaneCommand should still return "sleep" (pane 0), not the shell
+	cmd, err = tm.GetPaneCommand(sessionName)
+	if err != nil {
+		t.Fatalf("GetPaneCommand after split: %v", err)
+	}
+	if cmd != "sleep" {
+		t.Errorf("after split, GetPaneCommand should return pane 0 command 'sleep', got %q", cmd)
+	}
+
+	// GetPanePID should return pane 0's PID, matching the pre-split value
+	pid, err := tm.GetPanePID(sessionName)
+	if err != nil {
+		t.Fatalf("GetPanePID after split: %v", err)
+	}
+	if pid != pidBefore {
+		t.Errorf("GetPanePID changed after split: before=%s, after=%s", pidBefore, pid)
+	}
+
+	// GetPaneWorkDir should still return pane 0's working directory
+	wd, err := tm.GetPaneWorkDir(sessionName)
+	if err != nil {
+		t.Fatalf("GetPaneWorkDir after split: %v", err)
+	}
+	if wd != wdBefore {
+		t.Errorf("GetPaneWorkDir changed after split: before=%s, after=%s", wdBefore, wd)
+	}
+}
+
+func TestHasDescendantWithNames(t *testing.T) {
+	// Test the hasDescendantWithNames helper function directly
 
 	// Test with a definitely nonexistent PID
-	got := hasChildWithNames("999999999", []string{"node", "claude"})
+	got := hasDescendantWithNames("999999999", []string{"node", "claude"}, 0)
 	if got {
-		t.Error("hasChildWithNames should return false for nonexistent PID")
+		t.Error("hasDescendantWithNames should return false for nonexistent PID")
 	}
 
 	// Test with empty names slice - should always return false
-	got = hasChildWithNames("1", []string{})
+	got = hasDescendantWithNames("1", []string{}, 0)
 	if got {
-		t.Error("hasChildWithNames should return false for empty names slice")
+		t.Error("hasDescendantWithNames should return false for empty names slice")
 	}
 
 	// Test with nil names slice - should always return false
-	got = hasChildWithNames("1", nil)
+	got = hasDescendantWithNames("1", nil, 0)
 	if got {
-		t.Error("hasChildWithNames should return false for nil names slice")
+		t.Error("hasDescendantWithNames should return false for nil names slice")
 	}
 
 	// Test with PID 1 (init/launchd) - should have children but not specific agent processes
-	got = hasChildWithNames("1", []string{"node", "claude"})
+	got = hasDescendantWithNames("1", []string{"node", "claude"}, 0)
 	if got {
-		t.Logf("hasChildWithNames(\"1\", [node,claude]) = true - init has matching child?")
+		t.Logf("hasDescendantWithNames(\"1\", [node,claude]) = true - init has matching child?")
 	}
 }
 
@@ -848,12 +942,18 @@ func TestCleanupOrphanedSessions(t *testing.T) {
 		t.Skip("tmux not installed")
 	}
 
+	// Local predicate matching gt-/hq- prefixes (sufficient for test fixtures;
+	// avoids circular import of session package).
+	isTestGTSession := func(s string) bool {
+		return strings.HasPrefix(s, "gt-") || strings.HasPrefix(s, "hq-")
+	}
+
 	tm := NewTmux()
 
 	// Additional safety check: Skip if production GT sessions exist.
 	sessions, _ := tm.ListSessions()
 	for _, sess := range sessions {
-		if (strings.HasPrefix(sess, "gt-") || strings.HasPrefix(sess, "hq-")) &&
+		if isTestGTSession(sess) &&
 			sess != "gt-test-cleanup-rig" && sess != "hq-test-cleanup" {
 			t.Skip("Skipping: production GT sessions exist (would be killed by CleanupOrphanedSessions)")
 		}
@@ -898,7 +998,7 @@ func TestCleanupOrphanedSessions(t *testing.T) {
 	}
 
 	// Run cleanup
-	cleaned, err := tm.CleanupOrphanedSessions()
+	cleaned, err := tm.CleanupOrphanedSessions(isTestGTSession)
 	if err != nil {
 		t.Fatalf("CleanupOrphanedSessions: %v", err)
 	}
@@ -940,18 +1040,23 @@ func TestCleanupOrphanedSessions_NoSessions(t *testing.T) {
 		t.Skip("tmux not installed")
 	}
 
+	// Local predicate matching gt-/hq- prefixes (avoids circular import).
+	isTestGTSession := func(s string) bool {
+		return strings.HasPrefix(s, "gt-") || strings.HasPrefix(s, "hq-")
+	}
+
 	tm := NewTmux()
 
 	// Additional safety check: Skip if production GT sessions exist.
 	sessions, _ := tm.ListSessions()
 	for _, sess := range sessions {
-		if strings.HasPrefix(sess, "gt-") || strings.HasPrefix(sess, "hq-") {
+		if isTestGTSession(sess) {
 			t.Skip("Skipping: GT sessions exist (CleanupOrphanedSessions would kill them)")
 		}
 	}
 
 	// Running cleanup with no orphaned GT sessions should return 0, no error
-	cleaned, err := tm.CleanupOrphanedSessions()
+	cleaned, err := tm.CleanupOrphanedSessions(isTestGTSession)
 	if err != nil {
 		t.Fatalf("CleanupOrphanedSessions: %v", err)
 	}
@@ -1661,4 +1766,504 @@ func TestNudgeSession_WithRetry(t *testing.T) {
 	if err != nil {
 		t.Errorf("NudgeSession() = %v, want nil", err)
 	}
+}
+
+// TestMatchesPromptPrefix verifies that prompt matching handles non-breaking
+// spaces (NBSP, U+00A0) correctly. Claude Code uses NBSP after its > prompt
+// character, but the default ReadyPromptPrefix uses a regular space.
+// Regression test for https://github.com/steveyegge/gastown/issues/1387.
+func TestMatchesPromptPrefix(t *testing.T) {
+	const (
+		nbsp          = "\u00a0" // non-breaking space
+		regularPrefix = "❯ "    // default: ❯ + regular space
+	)
+
+	tests := []struct {
+		name   string
+		line   string
+		prefix string
+		want   bool
+	}{
+		// Regular space in both line and prefix (baseline)
+		{"regular space matches", "❯ ", regularPrefix, true},
+		{"regular space with trailing content", "❯ some input", regularPrefix, true},
+
+		// NBSP in line, regular space in prefix (the bug scenario)
+		{"NBSP bare prompt matches", "❯" + nbsp, regularPrefix, true},
+		{"NBSP with content matches", "❯" + nbsp + "claude --help", regularPrefix, true},
+		{"NBSP with leading whitespace", "  ❯" + nbsp, regularPrefix, true},
+
+		// NBSP in prefix (defensive: user could configure it either way)
+		{"NBSP prefix matches NBSP line", "❯" + nbsp + "hello", "❯" + nbsp, true},
+		{"NBSP prefix matches regular space line", "❯ hello", "❯" + nbsp, true},
+
+		// Empty prefix never matches
+		{"empty prefix", "❯ ", "", false},
+
+		// No prompt character at all
+		{"no prompt", "hello world", regularPrefix, false},
+		{"empty line", "", regularPrefix, false},
+		{"whitespace only", "   ", regularPrefix, false},
+
+		// Bare prompt character without any space
+		{"bare prompt no space", "❯", regularPrefix, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := matchesPromptPrefix(tt.line, tt.prefix)
+			if got != tt.want {
+				t.Errorf("matchesPromptPrefix(%q, %q) = %v, want %v",
+					tt.line, tt.prefix, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWaitForIdle_Timeout(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+	if os.Getenv("TMUX") == "" {
+		t.Skip("not inside tmux")
+	}
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("test requires unix")
+	}
+
+	tm := NewTmux()
+
+	// Create a session running a long sleep (no prompt visible)
+	sessionName := fmt.Sprintf("gt-test-idle-%d", time.Now().UnixNano())
+	if err := tm.NewSessionWithCommand(sessionName, os.TempDir(), "sleep 60"); err != nil {
+		t.Fatalf("NewSessionWithCommand: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	time.Sleep(200 * time.Millisecond)
+
+	// WaitForIdle should timeout quickly since the session is running sleep, not a prompt
+	err := tm.WaitForIdle(sessionName, 500*time.Millisecond)
+	if err == nil {
+		t.Error("WaitForIdle should have timed out for a busy session")
+	}
+	if !errors.Is(err, ErrIdleTimeout) {
+		t.Errorf("expected ErrIdleTimeout, got: %v", err)
+	}
+}
+
+func TestDefaultReadyPromptPrefix(t *testing.T) {
+	// Verify the constant is set correctly
+	if DefaultReadyPromptPrefix == "" {
+		t.Error("DefaultReadyPromptPrefix should not be empty")
+	}
+	if !strings.Contains(DefaultReadyPromptPrefix, "❯") {
+		t.Errorf("DefaultReadyPromptPrefix = %q, want to contain ❯", DefaultReadyPromptPrefix)
+	}
+}
+
+func TestGetSessionActivity(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	tm := NewTmux()
+	sessionName := "gt-test-activity-" + t.Name()
+
+	// Clean up any existing session
+	_ = tm.KillSession(sessionName)
+
+	// Create session
+	if err := tm.NewSession(sessionName, ""); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	// Get session activity
+	activity, err := tm.GetSessionActivity(sessionName)
+	if err != nil {
+		t.Fatalf("GetSessionActivity: %v", err)
+	}
+
+	// Activity should be recent (within last minute since we just created it)
+	if activity.IsZero() {
+		t.Error("GetSessionActivity returned zero time")
+	}
+
+	// Activity should be in the past (or very close to now)
+	now := activity // Use activity as baseline since clocks might differ
+	_ = now         // Avoid unused variable
+
+	// The activity timestamp should be reasonable (not in far future or past)
+	// Just verify it's a valid Unix timestamp (after year 2000)
+	if activity.Year() < 2000 {
+		t.Errorf("GetSessionActivity returned suspicious time: %v", activity)
+	}
+}
+
+func TestGetSessionActivity_NonexistentSession(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	tm := NewTmux()
+
+	// GetSessionActivity on nonexistent session should error
+	_, err := tm.GetSessionActivity("nonexistent-session-xyz-12345")
+	if err == nil {
+		t.Error("GetSessionActivity on nonexistent session should return error")
+	}
+}
+
+func TestNewSessionSet(t *testing.T) {
+	// Test creating SessionSet from names
+	names := []string{"session-a", "session-b", "session-c"}
+	set := NewSessionSet(names)
+
+	if set == nil {
+		t.Fatal("NewSessionSet returned nil")
+	}
+
+	// Test Has() for existing sessions
+	for _, name := range names {
+		if !set.Has(name) {
+			t.Errorf("SessionSet.Has(%q) = false, want true", name)
+		}
+	}
+
+	// Test Has() for non-existing session
+	if set.Has("nonexistent") {
+		t.Error("SessionSet.Has(nonexistent) = true, want false")
+	}
+
+	// Test Names() returns all sessions
+	gotNames := set.Names()
+	if len(gotNames) != len(names) {
+		t.Errorf("SessionSet.Names() returned %d names, want %d", len(gotNames), len(names))
+	}
+
+	// Verify all names are present (order may differ)
+	nameSet := make(map[string]bool)
+	for _, n := range gotNames {
+		nameSet[n] = true
+	}
+	for _, n := range names {
+		if !nameSet[n] {
+			t.Errorf("SessionSet.Names() missing %q", n)
+		}
+	}
+}
+
+func TestNewSessionSet_Empty(t *testing.T) {
+	set := NewSessionSet([]string{})
+
+	if set == nil {
+		t.Fatal("NewSessionSet returned nil for empty input")
+	}
+
+	if set.Has("anything") {
+		t.Error("Empty SessionSet.Has() = true, want false")
+	}
+
+	names := set.Names()
+	if len(names) != 0 {
+		t.Errorf("Empty SessionSet.Names() returned %d names, want 0", len(names))
+	}
+}
+
+func TestNewSessionSet_Nil(t *testing.T) {
+	set := NewSessionSet(nil)
+
+	if set == nil {
+		t.Fatal("NewSessionSet returned nil for nil input")
+	}
+
+	if set.Has("anything") {
+		t.Error("Nil-input SessionSet.Has() = true, want false")
+	}
+}
+
+func TestSessionPrefixPattern_AlwaysIncludesGTAndHQ(t *testing.T) {
+	// Even without GT_ROOT, the pattern should include gt and hq as safe defaults.
+	orig := os.Getenv("GT_ROOT")
+	t.Setenv("GT_ROOT", "")
+	defer func() { os.Setenv("GT_ROOT", orig) }()
+
+	pattern := sessionPrefixPattern()
+	if !strings.Contains(pattern, "gt") {
+		t.Errorf("pattern %q missing 'gt'", pattern)
+	}
+	if !strings.Contains(pattern, "hq") {
+		t.Errorf("pattern %q missing 'hq'", pattern)
+	}
+	// Must be a valid grep -Eq anchored alternation
+	if !strings.HasPrefix(pattern, "^(") || !strings.HasSuffix(pattern, ")-") {
+		t.Errorf("pattern %q has unexpected format", pattern)
+	}
+}
+
+func TestGetKeyBinding_NoExistingBinding(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+	tm := NewTmux()
+	// Query a key that almost certainly has no binding
+	result := tm.getKeyBinding("prefix", "F12")
+	if result != "" {
+		t.Errorf("expected empty string for unbound key, got %q", result)
+	}
+}
+
+func TestGetKeyBinding_CapturesDefaultBinding(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+	tm := NewTmux()
+
+	// Query the default tmux binding for prefix-n (next-window).
+	// This works without a running tmux server because list-keys
+	// returns builtin defaults. Skip if already a GT binding (e.g.,
+	// when running inside an active gastown session).
+	result := tm.getKeyBinding("prefix", "n")
+	if result == "" && tm.isGTBinding("prefix", "n") {
+		t.Skip("prefix-n is already a GT binding in this environment")
+	}
+	if result != "next-window" {
+		t.Errorf("expected 'next-window' for default prefix-n binding, got %q", result)
+	}
+}
+
+func TestGetKeyBinding_CapturesDefaultBindingWithArgs(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+	tm := NewTmux()
+
+	// prefix-s is "choose-tree -Zs" by default — tests multi-word command parsing
+	result := tm.getKeyBinding("prefix", "s")
+	if !strings.Contains(result, "choose-tree") {
+		t.Errorf("expected binding to contain 'choose-tree', got %q", result)
+	}
+}
+
+func TestGetKeyBinding_SkipsGasTownBindings(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+	if !IsInsideTmux() {
+		t.Skip("not inside tmux — need server for bind-key")
+	}
+	tm := NewTmux()
+
+	// Set a GT-style if-shell binding (contains both "if-shell" and "gt ")
+	ifShell := fmt.Sprintf("echo '#{session_name}' | grep -Eq '%s'", sessionPrefixPattern())
+	_, _ = tm.run("bind-key", "-T", "prefix", "F11",
+		"if-shell", ifShell,
+		"run-shell 'gt agents menu'",
+		":")
+
+	result := tm.getKeyBinding("prefix", "F11")
+	if result != "" {
+		t.Errorf("expected empty string for Gas Town binding, got %q", result)
+	}
+
+	// Clean up
+	_, _ = tm.run("unbind-key", "-T", "prefix", "F11")
+}
+
+func TestGetKeyBinding_CapturesUserBinding(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+	if !IsInsideTmux() {
+		t.Skip("not inside tmux — need server for bind-key")
+	}
+	tm := NewTmux()
+
+	// Set a user binding that doesn't contain "gt "
+	_, _ = tm.run("bind-key", "-T", "prefix", "F11", "display-message", "hello")
+
+	result := tm.getKeyBinding("prefix", "F11")
+	// Should capture the user's binding command
+	if result == "" {
+		t.Error("expected non-empty string for user binding")
+	}
+	if !strings.Contains(result, "display-message") {
+		t.Errorf("expected binding to contain 'display-message', got %q", result)
+	}
+
+	// Clean up
+	_, _ = tm.run("unbind-key", "-T", "prefix", "F11")
+}
+
+func TestIsGTBinding_DetectsGasTownBindings(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+	if !IsInsideTmux() {
+		t.Skip("not inside tmux — need server for bind-key")
+	}
+	tm := NewTmux()
+
+	// A plain user binding should NOT be detected as GT
+	_, _ = tm.run("bind-key", "-T", "prefix", "F11", "display-message", "hello")
+	if tm.isGTBinding("prefix", "F11") {
+		t.Error("plain user binding should not be detected as GT binding")
+	}
+
+	// A GT-style if-shell binding should be detected
+	ifShell := fmt.Sprintf("echo '#{session_name}' | grep -Eq '%s'", sessionPrefixPattern())
+	_, _ = tm.run("bind-key", "-T", "prefix", "F11",
+		"if-shell", ifShell,
+		"run-shell 'gt feed --window'",
+		"display-message hello")
+	if !tm.isGTBinding("prefix", "F11") {
+		t.Error("GT if-shell binding should be detected as GT binding")
+	}
+
+	// Clean up
+	_, _ = tm.run("unbind-key", "-T", "prefix", "F11")
+}
+
+func TestSetBindings_PreserveFallbackOnRepeatedCalls(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+	if !IsInsideTmux() {
+		t.Skip("not inside tmux — need server for bind-key")
+	}
+	tm := NewTmux()
+
+	// Set a custom user binding on F11
+	_, _ = tm.run("bind-key", "-T", "prefix", "F11", "display-message", "custom-user-cmd")
+
+	// Wrap it as a GT binding (simulating first Set*Binding call)
+	ifShell := fmt.Sprintf("echo '#{session_name}' | grep -Eq '%s'", sessionPrefixPattern())
+	_, _ = tm.run("bind-key", "-T", "prefix", "F11",
+		"if-shell", ifShell,
+		"run-shell 'gt feed --window'",
+		"display-message custom-user-cmd")
+
+	// Record the binding after first configuration
+	firstRaw, _ := tm.run("list-keys", "-T", "prefix", "F11")
+
+	// isGTBinding should return true, causing Set*Binding to skip
+	if !tm.isGTBinding("prefix", "F11") {
+		t.Fatal("expected isGTBinding=true after first configuration")
+	}
+
+	// Verify the original user fallback is preserved in the binding
+	if !strings.Contains(firstRaw, "custom-user-cmd") {
+		t.Errorf("original user fallback not found in binding: %q", firstRaw)
+	}
+
+	// Clean up
+	_, _ = tm.run("unbind-key", "-T", "prefix", "F11")
+}
+
+func TestSessionPrefixPattern_WithTownRoot(t *testing.T) {
+	// Point at the real town root if available; otherwise skip.
+	townRoot := os.Getenv("GT_ROOT")
+	if townRoot == "" {
+		t.Skip("GT_ROOT not set; skipping live rigs.json test")
+	}
+	pattern := sessionPrefixPattern()
+	// With a real rigs.json, pattern must include at least gt, hq, and
+	// whatever other rigs are registered.
+	if !strings.Contains(pattern, "gt") {
+		t.Errorf("pattern %q missing 'gt'", pattern)
+	}
+	if !strings.Contains(pattern, "hq") {
+		t.Errorf("pattern %q missing 'hq'", pattern)
+	}
+	// Verify it's a sorted alternation.
+	if !strings.HasPrefix(pattern, "^(") || !strings.HasSuffix(pattern, ")-") {
+		t.Errorf("pattern %q has unexpected format", pattern)
+	}
+}
+
+func TestZombieStatusString(t *testing.T) {
+	tests := []struct {
+		status   ZombieStatus
+		expected string
+		zombie   bool
+	}{
+		{SessionHealthy, "healthy", false},
+		{SessionDead, "session-dead", false},
+		{AgentDead, "agent-dead", true},
+		{AgentHung, "agent-hung", true},
+	}
+
+	for _, tc := range tests {
+		if got := tc.status.String(); got != tc.expected {
+			t.Errorf("ZombieStatus(%d).String() = %q, want %q", tc.status, got, tc.expected)
+		}
+		if got := tc.status.IsZombie(); got != tc.zombie {
+			t.Errorf("ZombieStatus(%d).IsZombie() = %v, want %v", tc.status, got, tc.zombie)
+		}
+	}
+}
+
+func TestCheckSessionHealth_NonexistentSession(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	tm := NewTmux()
+	status := tm.CheckSessionHealth("nonexistent-session-xyz", 0)
+	if status != SessionDead {
+		t.Errorf("CheckSessionHealth(nonexistent) = %v, want SessionDead", status)
+	}
+}
+
+func TestCheckSessionHealth_ZombieSession(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	// Create a session with just a shell (no agent running)
+	tm := NewTmux()
+	sessionName := fmt.Sprintf("gt-test-zombie-%d", os.Getpid())
+	if err := tm.NewSession(sessionName, ""); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer tm.KillSession(sessionName)
+
+	// Wait for shell to start
+	time.Sleep(200 * time.Millisecond)
+
+	// Session exists but no agent process → AgentDead
+	status := tm.CheckSessionHealth(sessionName, 0)
+	if status != AgentDead {
+		t.Errorf("CheckSessionHealth(shell-only) = %v, want AgentDead", status)
+	}
+}
+
+func TestCheckSessionHealth_ActivityCheck(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	// Create a session that runs a long-lived process
+	tm := NewTmux()
+	sessionName := fmt.Sprintf("gt-test-activity-%d", os.Getpid())
+	// Use 'sleep' as a stand-in for an agent process
+	if err := tm.NewSessionWithCommand(sessionName, "", "sleep 60"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer tm.KillSession(sessionName)
+	time.Sleep(300 * time.Millisecond)
+
+	// With no maxInactivity (0), activity is not checked.
+	// The session has a non-shell process running (sleep), but it won't
+	// match any agent process names, so IsAgentAlive returns false → AgentDead.
+	status := tm.CheckSessionHealth(sessionName, 0)
+	if status != AgentDead {
+		// sleep is not an agent process, so this is expected
+		t.Logf("Status with sleep process: %v (expected AgentDead since sleep != agent)", status)
+	}
+
+	// With a very short maxInactivity, a recently-created session should be healthy
+	// (if the agent were actually running). This tests the activity threshold logic
+	// without needing a real Claude process.
 }

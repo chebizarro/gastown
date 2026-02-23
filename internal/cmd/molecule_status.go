@@ -4,12 +4,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -44,6 +47,8 @@ func buildAgentBeadID(identity string, role Role, townRoot string) string {
 			return beads.MayorBeadIDTown()
 		case identity == "deacon":
 			return beads.DeaconBeadIDTown()
+		case identity == "deacon-boot":
+			return beads.DogBeadIDTown("boot")
 		case len(parts) == 2 && parts[1] == "witness":
 			return beads.WitnessBeadIDWithPrefix(getPrefix(parts[0]), parts[0])
 		case len(parts) == 2 && parts[1] == "refinery":
@@ -91,6 +96,9 @@ func buildAgentBeadID(identity string, role Role, townRoot string) string {
 			return beads.CrewBeadIDWithPrefix(getPrefix(parts[0]), parts[0], parts[2])
 		}
 		return ""
+	case RoleBoot:
+		// Boot is a deacon dog — uses town-level dog bead ID
+		return beads.DogBeadIDTown("boot")
 	default:
 		return ""
 	}
@@ -228,7 +236,7 @@ func runMoleculeProgress(cmd *cobra.Command, args []string) error {
 				deps = step.Dependencies
 			}
 			for _, dep := range deps {
-				if dep.DependencyType != "blocks" {
+				if !isBlockingDepType(dep.DependencyType) {
 					continue // Skip parent-child and other non-blocking relationships
 				}
 				hasBlockingDeps = true
@@ -245,6 +253,9 @@ func runMoleculeProgress(cmd *cobra.Command, args []string) error {
 			}
 		}
 	}
+
+	// Sort ready steps by sequence number so step 1 comes before step 2, etc.
+	sortStepIDsBySequence(progress.ReadySteps)
 
 	// Calculate completion percentage
 	if progress.TotalSteps > 0 {
@@ -372,7 +383,7 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {
 
 		// Try to fetch the agent bead
 		agentBead, err := agentB.Show(agentBeadID)
-		if err == nil && agentBead != nil && agentBead.Type == "agent" {
+		if err == nil && beads.IsAgentBead(agentBead) {
 			status.AgentBeadID = agentBeadID
 
 			// Read hook_bead from the agent bead's database field (not description!)
@@ -603,7 +614,7 @@ func getMoleculeProgressInfo(b *beads.Beads, moleculeRootID string) (*MoleculePr
 				deps = step.Dependencies
 			}
 			for _, dep := range deps {
-				if dep.DependencyType != "blocks" {
+				if !isBlockingDepType(dep.DependencyType) {
 					continue // Skip parent-child and other non-blocking relationships
 				}
 				hasBlockingDeps = true
@@ -620,6 +631,9 @@ func getMoleculeProgressInfo(b *beads.Beads, moleculeRootID string) (*MoleculePr
 			}
 		}
 	}
+
+	// Sort ready steps by sequence number so step 1 comes before step 2, etc.
+	sortStepIDsBySequence(progress.ReadySteps)
 
 	// Calculate completion percentage
 	if progress.TotalSteps > 0 {
@@ -745,12 +759,141 @@ func outputMoleculeStatus(status MoleculeStatusInfo) error {
 		}
 	}
 
+	// Git divergence warning and recent trail (gt-7w6cq)
+	showGitDivergenceWarning()
+	showRecentTrailSummary()
+
 	// Next action hint
 	if status.NextAction != "" {
 		fmt.Printf("\n%s %s\n", style.Bold.Render("Next:"), status.NextAction)
 	}
 
 	return nil
+}
+
+// showGitDivergenceWarning fetches from origin and checks if the current branch
+// has diverged from its remote tracking branch, showing a warning if so.
+func showGitDivergenceWarning() {
+	g := git.NewGit(".")
+	if !g.IsRepo() {
+		return
+	}
+
+	branch, err := g.CurrentBranch()
+	if err != nil || branch == "" {
+		return
+	}
+
+	// Fetch quietly to get fresh remote refs. Non-fatal if it fails
+	// (e.g., offline, no remote).
+	_ = g.Fetch("origin")
+
+	remote := "origin/" + branch
+	ahead, aErr := g.CommitsAhead(remote, "HEAD")
+	behind, bErr := g.CountCommitsBehind(remote)
+
+	// Also check divergence from origin/main as a fallback — polecats
+	// work on feature branches that may not have a remote tracking branch,
+	// but we still want to warn if they're behind main.
+	if aErr != nil || bErr != nil {
+		// No tracking branch for current branch; check against origin/main
+		ahead, aErr = g.CommitsAhead("origin/main", "HEAD")
+		behind, bErr = g.CountCommitsBehind("origin/main")
+		if aErr != nil || bErr != nil {
+			return // Can't determine divergence at all — skip silently
+		}
+		remote = "origin/main"
+	}
+
+	if ahead == 0 && behind == 0 {
+		return // In sync
+	}
+
+	fmt.Println()
+	if ahead > 0 && behind > 0 {
+		fmt.Printf("%s Branch diverged: %d ahead, %d behind %s\n",
+			style.Warning.Render("⚠"), ahead, behind, remote)
+		fmt.Printf("  Run 'git pull --rebase' before starting work\n")
+	} else if behind > 0 {
+		fmt.Printf("%s Branch is %d commits behind %s\n",
+			style.Warning.Render("⚠"), behind, remote)
+		fmt.Printf("  Run 'git pull' to update\n")
+	} else {
+		fmt.Printf("%s Branch is %d commits ahead of %s (unpushed work)\n",
+			style.Dim.Render("ℹ"), ahead, remote)
+	}
+}
+
+// showRecentTrailSummary shows a compact summary of recent agent activity.
+// Leverages git log and beads to show what happened since last activity.
+func showRecentTrailSummary() {
+	g := git.NewGit(".")
+	if !g.IsRepo() {
+		return
+	}
+
+	// Get recent commits (last 24h) — summarize by author
+	since := time.Now().Add(-24 * time.Hour).Format(time.RFC3339)
+	gitArgs := []string{
+		"log",
+		"--format=%an",
+		"--since=" + since,
+		"-n50",
+		"--all",
+	}
+	gitCmd := exec.Command("git", gitArgs...)
+	output, err := gitCmd.Output()
+	if err != nil {
+		return
+	}
+
+	// Count commits per author
+	authorCounts := make(map[string]int)
+	totalCommits := 0
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		authorCounts[line]++
+		totalCommits++
+	}
+
+	if totalCommits == 0 {
+		return
+	}
+
+	// Build compact author summary (e.g., "3 commits by darcy, 2 by nux")
+	type authorCount struct {
+		name  string
+		count int
+	}
+	var authors []authorCount
+	for name, count := range authorCounts {
+		authors = append(authors, authorCount{name, count})
+	}
+	// Sort by count descending
+	for i := 0; i < len(authors); i++ {
+		for j := i + 1; j < len(authors); j++ {
+			if authors[j].count > authors[i].count {
+				authors[i], authors[j] = authors[j], authors[i]
+			}
+		}
+	}
+
+	var parts []string
+	for i, a := range authors {
+		if i >= 3 {
+			remaining := len(authors) - 3
+			parts = append(parts, fmt.Sprintf("+%d others", remaining))
+			break
+		}
+		parts = append(parts, fmt.Sprintf("%d by %s", a.count, a.name))
+	}
+
+	fmt.Printf("\n%s Recent (24h): %d commits (%s)\n",
+		style.Dim.Render("📍"), totalCommits, strings.Join(parts, ", "))
 }
 
 func runMoleculeCurrent(cmd *cobra.Command, args []string) error {
@@ -893,11 +1036,10 @@ func runMoleculeCurrent(cmd *cobra.Command, args []string) error {
 
 		// Check dependencies using Dependencies field (from bd show),
 		// not DependsOn (which is empty from bd list).
-		// Only "blocks" type dependencies block progress - ignore "parent-child".
 		allDepsClosed := true
 		hasBlockingDeps := false
 		for _, dep := range step.Dependencies {
-			if dep.DependencyType != "blocks" {
+			if !isBlockingDepType(dep.DependencyType) {
 				continue // Skip parent-child and other non-blocking relationships
 			}
 			hasBlockingDeps = true
@@ -910,6 +1052,9 @@ func runMoleculeCurrent(cmd *cobra.Command, args []string) error {
 			readySteps = append(readySteps, step)
 		}
 	}
+
+	// Sort ready steps by sequence number so step 1 comes before step 2, etc.
+	sortStepsBySequence(readySteps)
 
 	// Determine current step and status
 	if info.StepsComplete == info.StepsTotal && info.StepsTotal > 0 {
@@ -985,7 +1130,7 @@ func outputMoleculeCurrent(info MoleculeCurrentInfo) error {
 func isTownLevelRole(agentID string) bool {
 	return agentID == "mayor" || agentID == "mayor/" ||
 		agentID == "deacon" || agentID == "deacon/" ||
-		agentID == "boot" || agentID == "deacon/boot"
+		agentID == "deacon/boot" || agentID == "deacon-boot"
 }
 
 // extractMailSender extracts the sender from mail bead labels.
@@ -1025,7 +1170,6 @@ func scanAllRigsForHookedBeads(townRoot, target string) []*beads.Issue {
 		}
 
 		b := beads.New(rigBeadsDir)
-
 		// First check for hooked beads
 		hookedBeads, err := b.List(beads.ListOptions{
 			Status:   beads.StatusHooked,

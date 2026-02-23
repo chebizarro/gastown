@@ -38,6 +38,12 @@ const (
 	// branch needs rebasing due to conflicts with the target branch.
 	// Subject format: "REWORK_REQUEST <polecat-name>"
 	TypeReworkRequest MessageType = "REWORK_REQUEST"
+
+	// TypeConvoyNeedsFeeding is sent from Refinery to Deacon after a
+	// convoy-eligible merge completes. This triggers immediate convoy
+	// feeding instead of waiting for the next deacon patrol cycle.
+	// Subject format: "CONVOY_NEEDS_FEEDING <convoy-id>"
+	TypeConvoyNeedsFeeding MessageType = "CONVOY_NEEDS_FEEDING"
 )
 
 // ParseMessageType extracts the protocol message type from a mail subject.
@@ -51,6 +57,7 @@ func ParseMessageType(subject string) MessageType {
 		TypeMerged,
 		TypeMergeFailed,
 		TypeReworkRequest,
+		TypeConvoyNeedsFeeding,
 	}
 
 	for _, prefix := range prefixes {
@@ -164,6 +171,60 @@ type ReworkRequestPayload struct {
 
 	// Instructions provides specific rebase instructions.
 	Instructions string `json:"instructions,omitempty"`
+}
+
+// PolecatDonePayload contains the data from a POLECAT_DONE notification.
+// This is not a formal protocol message (it's a mail convention), but the
+// payload is structured for programmatic parsing by witness handlers.
+type PolecatDonePayload struct {
+	// Polecat is the worker name.
+	Polecat string `json:"polecat"`
+
+	// ExitType is the exit status (COMPLETED, ESCALATED, DEFERRED, PHASE_COMPLETE).
+	ExitType string `json:"exit_type"`
+
+	// Issue is the beads issue ID the polecat worked on.
+	Issue string `json:"issue,omitempty"`
+
+	// Branch is the polecat's work branch.
+	Branch string `json:"branch"`
+
+	// MR is the merge-request bead ID (empty for owned+direct convoys).
+	MR string `json:"mr,omitempty"`
+
+	// ConvoyID is the tracking convoy ID (if any).
+	ConvoyID string `json:"convoy_id,omitempty"`
+
+	// ConvoyOwned indicates the convoy has caller-managed lifecycle.
+	ConvoyOwned bool `json:"convoy_owned,omitempty"`
+
+	// MergeStrategy is the convoy's merge strategy (direct, mr, local).
+	MergeStrategy string `json:"merge_strategy,omitempty"`
+
+	// Errors contains any non-fatal errors encountered during gt done.
+	Errors string `json:"errors,omitempty"`
+}
+
+// SkipMergeFlow returns true if this polecat's work should bypass the
+// standard witness/refinery merge pipeline (owned convoy + direct merge).
+func (p *PolecatDonePayload) SkipMergeFlow() bool {
+	return p.ConvoyOwned && p.MergeStrategy == "direct"
+}
+
+// ConvoyNeedsFeedingPayload contains the data for a CONVOY_NEEDS_FEEDING message.
+// Sent by Refinery to Deacon after a convoy-eligible merge completes.
+type ConvoyNeedsFeedingPayload struct {
+	// ConvoyID is the convoy that may have newly-ready issues.
+	ConvoyID string `json:"convoy_id"`
+
+	// SourceIssue is the issue that was just merged and closed.
+	SourceIssue string `json:"source_issue"`
+
+	// Rig is the rig where the merge happened.
+	Rig string `json:"rig"`
+
+	// MergedAt is when the merge completed.
+	MergedAt time.Time `json:"merged_at"`
 }
 
 // IsProtocolMessage returns true if the subject matches a known protocol type.

@@ -19,12 +19,14 @@ import (
 )
 
 // outputPrimeContext outputs the role-specific context using templates or fallback.
-func outputPrimeContext(ctx RoleContext) error {
+// Returns the rendered template content (empty string when using fallback path).
+func outputPrimeContext(ctx RoleContext) (string, error) {
 	// Try to use templates first
 	tmpl, err := templates.New()
 	if err != nil {
 		// Fall back to hardcoded output if templates fail
-		return outputPrimeContextFallback(ctx)
+		outputPrimeContextFallback(ctx)
+		return "", nil
 	}
 
 	// Map role to template name
@@ -46,7 +48,8 @@ func outputPrimeContext(ctx RoleContext) error {
 		roleName = "boot"
 	default:
 		// Unknown role - use fallback
-		return outputPrimeContextFallback(ctx)
+		outputPrimeContextFallback(ctx)
+		return "", nil
 	}
 
 	// Build template data
@@ -77,14 +80,14 @@ func outputPrimeContext(ctx RoleContext) error {
 	// Render and output
 	output, err := tmpl.RenderRole(roleName, data)
 	if err != nil {
-		return fmt.Errorf("rendering template: %w", err)
+		return "", fmt.Errorf("rendering template: %w", err)
 	}
 
 	fmt.Print(output)
-	return nil
+	return output, nil
 }
 
-func outputPrimeContextFallback(ctx RoleContext) error {
+func outputPrimeContextFallback(ctx RoleContext) {
 	switch ctx.Role {
 	case RoleMayor:
 		outputMayorContext(ctx)
@@ -101,7 +104,6 @@ func outputPrimeContextFallback(ctx RoleContext) error {
 	default:
 		outputUnknownContext(ctx)
 	}
-	return nil
 }
 
 func outputMayorContext(ctx RoleContext) {
@@ -250,7 +252,8 @@ func outputUnknownContext(ctx RoleContext) {
 	fmt.Println("- `<rig>/polecats/<name>/` - Polecat role")
 	fmt.Println("- `<rig>/witness/rig/` - Witness role")
 	fmt.Println("- `<rig>/refinery/rig/` - Refinery role")
-	fmt.Println("- Town root or `mayor/` - Mayor role")
+	fmt.Println("- `mayor/` or `<rig>/mayor/` - Mayor role")
+	fmt.Println("- Town root is neutral (set GT_ROLE or cd into a role directory)")
 	fmt.Println()
 	fmt.Printf("Town root: %s\n", style.Dim.Render(ctx.TownRoot))
 }
@@ -289,7 +292,7 @@ func outputCommandQuickReference(ctx RoleContext) {
 		fmt.Println("|------------|----------------|----------------|")
 		fmt.Printf("| Signal work complete | `%s done` | ~~bd close <root-issue>~~ (Refinery closes it) |\n", c)
 		fmt.Printf("| Message another agent | `%s nudge <target> \"msg\"` | ~~tmux send-keys~~ (unreliable) |\n", c)
-		fmt.Println("| Check workflow steps | `bd ready` | ~~gt mol status~~ (less useful) |")
+		fmt.Println("| Check workflow steps | `bd mol current` | ~~bd ready~~ (excludes molecule steps) |")
 		fmt.Println("| Create issues | `bd create \"title\"` | ~~gt issue create~~ (not a command) |")
 		fmt.Printf("| Escalate blocker | `%s escalate \"desc\" -s HIGH` | ~~waiting for human~~ (never wait) |\n", c)
 

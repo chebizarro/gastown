@@ -58,6 +58,7 @@ type PolecatDonePayload struct {
 	MRID        string
 	Branch      string
 	Gate        string // Gate ID when Exit is PHASE_COMPLETE
+	MRFailed    bool   // True when MR bead creation was attempted but failed
 }
 
 // HelpPayload contains parsed data from a HELP message.
@@ -162,6 +163,8 @@ func ParsePolecatDone(subject, body string) (*PolecatDonePayload, error) {
 			payload.Gate = strings.TrimSpace(strings.TrimPrefix(line, "Gate:"))
 		} else if strings.HasPrefix(line, "Branch:") {
 			payload.Branch = strings.TrimSpace(strings.TrimPrefix(line, "Branch:"))
+		} else if strings.HasPrefix(line, "MRFailed:") {
+			payload.MRFailed = strings.TrimSpace(strings.TrimPrefix(line, "MRFailed:")) == "true"
 		}
 	}
 
@@ -312,18 +315,31 @@ func ParseMergeReady(subject, body string) (*MergeReadyPayload, error) {
 }
 
 // ParseSwarmStart extracts payload from a SWARM_START message.
-// Body format is JSON: {"swarm_id": "batch-123", "beads": ["bd-a", "bd-b"]}
+// Subject format: SWARM_START
+// Body format:
+//
+//	SwarmID: <swarm-id>
+//	Beads: <bead-a>, <bead-b>, ...
+//	Total: <count>
 func ParseSwarmStart(body string) (*SwarmStartPayload, error) {
 	payload := &SwarmStartPayload{
 		StartedAt: time.Now(),
 	}
 
-	// Parse the JSON-like body (simplified parsing for key-value extraction)
-	// Full JSON parsing would require encoding/json import
 	for _, line := range strings.Split(body, "\n") {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "SwarmID:") || strings.HasPrefix(line, "swarm_id:") {
-			payload.SwarmID = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(line, "SwarmID:"), "swarm_id:"))
+		if strings.HasPrefix(line, "SwarmID:") {
+			payload.SwarmID = strings.TrimSpace(strings.TrimPrefix(line, "SwarmID:"))
+		} else if strings.HasPrefix(line, "Beads:") {
+			raw := strings.TrimSpace(strings.TrimPrefix(line, "Beads:"))
+			if raw != "" {
+				for _, b := range strings.Split(raw, ",") {
+					b = strings.TrimSpace(b)
+					if b != "" {
+						payload.BeadIDs = append(payload.BeadIDs, b)
+					}
+				}
+			}
 		} else if strings.HasPrefix(line, "Total:") {
 			_, _ = fmt.Sscanf(line, "Total: %d", &payload.Total)
 		}

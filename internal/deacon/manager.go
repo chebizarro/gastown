@@ -103,8 +103,14 @@ func (m *Manager) Start(agentOverride string) error {
 		Recipient: "deacon",
 		Sender:    "daemon",
 		Topic:     "patrol",
-	}, "I am Deacon running in PERSISTENT PATROL MODE. My patrol loop: 1. Run gt deacon heartbeat. 2. Check gt hook - if exists, execute it. 3. If no hook, create and execute: gt wisp create mol-deacon-patrol --hook --execute. 4. After patrol completes, use await-signal to wait for next cycle. 5. Return to step 1. I NEVER exit voluntarily.")
-	startupCmd, err := config.BuildAgentStartupCommandWithAgentOverride("deacon", "", m.townRoot, "", initialPrompt, agentOverride)
+	}, "I am Deacon. Start patrol: run gt deacon heartbeat, then check gt hook. If no hook, create mol-deacon-patrol wisp and execute it.")
+	startupCmd, err := config.BuildStartupCommandFromConfig(config.AgentEnvConfig{
+		Role:        "deacon",
+		TownRoot:    m.townRoot,
+		Prompt:      initialPrompt,
+		Topic:       "patrol",
+		SessionName: sessionID,
+	}, "", initialPrompt, agentOverride)
 	if err != nil {
 		return fmt.Errorf("building startup command: %w", err)
 	}
@@ -125,7 +131,9 @@ func (m *Manager) Start(agentOverride string) error {
 	envVars := config.AgentEnv(config.AgentEnvConfig{
 		Role:     "deacon",
 		TownRoot: m.townRoot,
+		Agent:    agentOverride,
 	})
+	envVars = session.MergeRuntimeLivenessEnv(envVars, runtimeConfig)
 	for k, v := range envVars {
 		_ = t.SetEnvironment(sessionID, k, v)
 	}

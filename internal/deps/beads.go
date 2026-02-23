@@ -2,16 +2,16 @@
 package deps
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"regexp"
-	"strconv"
-	"strings"
+	"time"
 )
 
 // MinBeadsVersion is the minimum compatible beads version for this Gas Town release.
 // Update this when Gas Town requires new beads features.
-const MinBeadsVersion = "0.43.0"
+const MinBeadsVersion = "0.55.4"
 
 // BeadsInstallPath is the go install path for beads.
 const BeadsInstallPath = "github.com/steveyegge/beads/cmd/bd@latest"
@@ -36,8 +36,12 @@ func CheckBeads() (BeadsStatus, string) {
 	}
 	_ = path // bd found
 
-	// Get version
-	cmd := exec.Command("bd", "version")
+	// Get version (with timeout to prevent hanging on broken bd installs).
+	// 10s is generous but necessary: under heavy CI load (parallel test
+	// packages), even a trivial shell script can take >3s to start.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "bd", "version")
 	output, err := cmd.Output()
 	if err != nil {
 		return BeadsUnknown, ""
@@ -49,7 +53,7 @@ func CheckBeads() (BeadsStatus, string) {
 	}
 
 	// Compare versions
-	if compareVersions(version, MinBeadsVersion) < 0 {
+	if CompareVersions(version, MinBeadsVersion) < 0 {
 		return BeadsTooOld, version
 	}
 
@@ -109,7 +113,7 @@ func installBeads() error {
 
 // parseBeadsVersion extracts version from "bd version X.Y.Z ..." output.
 func parseBeadsVersion(output string) string {
-	// Match patterns like "bd version 0.43.0" or "bd version 0.43.0 (dev: ...)"
+	// Match patterns like "bd version 0.52.0" or "bd version 0.52.0 (dev: ...)"
 	re := regexp.MustCompile(`bd version (\d+\.\d+\.\d+)`)
 	matches := re.FindStringSubmatch(output)
 	if len(matches) >= 2 {
@@ -118,29 +122,3 @@ func parseBeadsVersion(output string) string {
 	return ""
 }
 
-// compareVersions compares two semver strings.
-// Returns -1 if a < b, 0 if a == b, 1 if a > b.
-func compareVersions(a, b string) int {
-	aParts := parseVersion(a)
-	bParts := parseVersion(b)
-
-	for i := 0; i < 3; i++ {
-		if aParts[i] < bParts[i] {
-			return -1
-		}
-		if aParts[i] > bParts[i] {
-			return 1
-		}
-	}
-	return 0
-}
-
-// parseVersion parses "X.Y.Z" into [3]int.
-func parseVersion(v string) [3]int {
-	var parts [3]int
-	split := strings.Split(v, ".")
-	for i := 0; i < 3 && i < len(split); i++ {
-		parts[i], _ = strconv.Atoi(split[i])
-	}
-	return parts
-}

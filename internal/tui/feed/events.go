@@ -241,7 +241,7 @@ func NewGtEventsSource(townRoot string) (*GtEventsSource, error) {
 
 	source := &GtEventsSource{
 		file:   file,
-		events: make(chan Event, 100),
+		events: make(chan Event, 200),
 		cancel: cancel,
 	}
 
@@ -250,13 +250,18 @@ func NewGtEventsSource(townRoot string) (*GtEventsSource, error) {
 	return source, nil
 }
 
-// tail follows the file and sends events
+// tail loads recent history then follows the file for new events.
 func (s *GtEventsSource) tail(ctx context.Context) {
 	defer close(s.events)
 
-	// Seek to end for live tailing
+	// Load recent events (last 200 lines) for initial display
+	s.loadRecentEvents()
+
+	// Seek to true EOF so the tail scanner starts cleanly,
+	// regardless of the preload scanner's internal read-ahead buffer.
 	_, _ = s.file.Seek(0, 2)
 
+	// Now tail for new events
 	scanner := bufio.NewScanner(s.file)
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
@@ -274,6 +279,50 @@ func (s *GtEventsSource) tail(ctx context.Context) {
 					default:
 					}
 				}
+			}
+		}
+	}
+}
+
+// loadRecentEvents reads the last N lines of the file and emits them as events.
+// Uses a ring buffer so memory is O(maxLines) regardless of file size.
+func (s *GtEventsSource) loadRecentEvents() {
+	const maxLines = 200
+
+	if _, err := s.file.Seek(0, 0); err != nil {
+		return
+	}
+
+	// Ring buffer: only keep the last maxLines lines in memory
+	ring := make([]string, maxLines)
+	idx := 0
+	count := 0
+
+	scanner := bufio.NewScanner(s.file)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	for scanner.Scan() {
+		ring[idx%maxLines] = scanner.Text()
+		idx++
+		count++
+	}
+	if scanner.Err() != nil {
+		// Scanner failed (e.g. token too long) — seek to EOF so tail starts clean
+		_, _ = s.file.Seek(0, 2)
+		return
+	}
+
+	// Emit lines in order (oldest first)
+	n := count
+	if n > maxLines {
+		n = maxLines
+	}
+	start := idx - n
+	for i := start; i < idx; i++ {
+		line := ring[i%maxLines]
+		if event := parseGtEventLine(line); event != nil {
+			select {
+			case s.events <- *event:
+			default:
 			}
 		}
 	}
@@ -515,6 +564,11 @@ type CombinedSource struct {
 	cancel  context.CancelFunc
 }
 
+// fanInTimeout is the maximum time a fan-in goroutine will wait for an event
+// before checking if it should exit. This prevents goroutine leaks when a source
+// channel blocks forever and the context is never canceled.
+const fanInTimeout = 30 * time.Second
+
 // NewCombinedSource creates a source that merges multiple event sources
 func NewCombinedSource(sources ...EventSource) *CombinedSource {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -525,7 +579,11 @@ func NewCombinedSource(sources ...EventSource) *CombinedSource {
 		cancel:  cancel,
 	}
 
-	// Fan-in from all sources
+	// Fan-in from all sources with timeout to prevent goroutine leaks.
+	// Each goroutine will exit if:
+	// 1. Context is canceled (Close() called)
+	// 2. Source channel is closed
+	// 3. No event received for fanInTimeout (prevents indefinite blocking)
 	for _, src := range sources {
 		go func(s EventSource) {
 			for {
@@ -538,8 +596,18 @@ func NewCombinedSource(sources ...EventSource) *CombinedSource {
 					}
 					select {
 					case combined.events <- event:
+					case <-ctx.Done():
+						return
 					default:
 						// Drop if full
+					}
+				case <-time.After(fanInTimeout):
+					// Timeout - check if we should exit
+					select {
+					case <-ctx.Done():
+						return
+					default:
+						// Context still active, continue waiting
 					}
 				}
 			}

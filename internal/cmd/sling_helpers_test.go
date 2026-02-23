@@ -6,11 +6,25 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/session"
 )
 
+func setupSlingTestRegistry(t *testing.T) {
+	t.Helper()
+	reg := session.NewPrefixRegistry()
+	reg.Register("gt", "gastown")
+	reg.Register("bd", "beads")
+	reg.Register("mp", "my-project")
+	old := session.DefaultRegistry()
+	session.SetDefaultRegistry(reg)
+	t.Cleanup(func() { session.SetDefaultRegistry(old) })
+}
+
 // TestNudgeRefinerySessionName verifies that nudgeRefinery constructs the
-// correct tmux session name (gt-<rigName>-refinery) and passes the message.
+// correct tmux session name ({prefix}-refinery) and passes the message.
 func TestNudgeRefinerySessionName(t *testing.T) {
+	setupSlingTestRegistry(t)
 	logPath := filepath.Join(t.TempDir(), "nudge.log")
 	t.Setenv("GT_TEST_NUDGE_LOG", logPath)
 
@@ -23,14 +37,14 @@ func TestNudgeRefinerySessionName(t *testing.T) {
 		{
 			name:        "simple rig name",
 			rigName:     "gastown",
-			message:     "MR submitted: gt-abc branch=polecat/Nux/gt-abc",
-			wantSession: "gt-gastown-refinery",
+			message:     "MERGE_READY received - check inbox for pending work",
+			wantSession: "gt-refinery",
 		},
 		{
 			name:        "hyphenated rig name",
 			rigName:     "my-project",
-			message:     "MR submitted: mp-xyz branch=polecat/Toast/mp-xyz",
-			wantSession: "gt-my-project-refinery",
+			message:     "MERGE_READY received - check inbox for pending work",
+			wantSession: "mp-refinery",
 		},
 	}
 
@@ -97,6 +111,33 @@ func TestNudgeRefineryNoOpWithoutLog(t *testing.T) {
 
 	// Should not panic even though no tmux session exists
 	nudgeRefinery("nonexistent-rig", "test message")
+}
+
+func TestIsDeferredBead(t *testing.T) {
+	tests := []struct {
+		name string
+		info *beadInfo
+		want bool
+	}{
+		{"open bead is not deferred", &beadInfo{Status: "open", Description: "some task"}, false},
+		{"in_progress bead is not deferred", &beadInfo{Status: "in_progress", Description: "working on it"}, false},
+		{"deferred status", &beadInfo{Status: "deferred", Description: "some task"}, true},
+		{"description says deferred to post-launch", &beadInfo{Status: "open", Description: "deferred to post-launch"}, true},
+		{"description says deferred to post launch", &beadInfo{Status: "open", Description: "deferred to post launch"}, true},
+		{"description says status: deferred", &beadInfo{Status: "open", Description: "status: deferred\nsome other notes"}, true},
+		{"case insensitive description", &beadInfo{Status: "open", Description: "Deferred to Post-Launch"}, true},
+		{"deferred keyword not in deferral phrase", &beadInfo{Status: "open", Description: "the user deferred this action"}, false},
+		{"empty description", &beadInfo{Status: "open", Description: ""}, false},
+		{"hooked bead not deferred", &beadInfo{Status: "hooked", Description: "some work"}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isDeferredBead(tt.info); got != tt.want {
+				t.Errorf("isDeferredBead(%+v) = %v, want %v", tt.info, got, tt.want)
+			}
+		})
+	}
 }
 
 func TestIsSlingConfigError(t *testing.T) {

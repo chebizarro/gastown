@@ -10,6 +10,16 @@ import (
 	"time"
 )
 
+const (
+	// HeartbeatStaleThreshold is the age at which a heartbeat is considered stale,
+	// meaning the Deacon may be doing a long operation.
+	HeartbeatStaleThreshold = 5 * time.Minute
+
+	// HeartbeatVeryStaleThreshold is the age at which a heartbeat is considered
+	// very stale, meaning the Deacon should be poked or restarted.
+	HeartbeatVeryStaleThreshold = 15 * time.Minute
+)
+
 // Heartbeat represents the Deacon's heartbeat file contents.
 // Written by the Deacon on each wake cycle.
 // Read by the Go daemon to decide whether to poke.
@@ -88,7 +98,7 @@ func (hb *Heartbeat) Age() time.Duration {
 // IsFresh returns true if the heartbeat is less than 5 minutes old.
 // A fresh heartbeat means the Deacon is actively working or recently finished.
 func (hb *Heartbeat) IsFresh() bool {
-	return hb != nil && hb.Age() < 5*time.Minute
+	return hb != nil && hb.Age() < HeartbeatStaleThreshold
 }
 
 // IsStale returns true if the heartbeat is 5-15 minutes old.
@@ -98,21 +108,13 @@ func (hb *Heartbeat) IsStale() bool {
 		return false
 	}
 	age := hb.Age()
-	return age >= 5*time.Minute && age < 15*time.Minute
+	return age >= HeartbeatStaleThreshold && age < HeartbeatVeryStaleThreshold
 }
 
 // IsVeryStale returns true if the heartbeat is more than 15 minutes old.
 // A very stale heartbeat means the Deacon should be poked.
 func (hb *Heartbeat) IsVeryStale() bool {
-	return hb == nil || hb.Age() >= 15*time.Minute
-}
-
-// ShouldPoke returns true if the daemon should poke the Deacon.
-// The Deacon should be poked if:
-// - No heartbeat exists
-// - Heartbeat is very stale (>5 minutes)
-func (hb *Heartbeat) ShouldPoke() bool {
-	return hb.IsVeryStale()
+	return hb == nil || hb.Age() >= HeartbeatVeryStaleThreshold
 }
 
 // Touch writes a minimal heartbeat with just the timestamp.

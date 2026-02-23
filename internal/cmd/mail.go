@@ -16,6 +16,7 @@ var (
 	mailType          string
 	mailReplyTo       string
 	mailNotify        bool
+	mailNoNotify      bool // Suppress auto-nudge notification to recipient
 	mailSendSelf      bool
 	mailCC            []string // CC recipients
 	mailInboxJSON     bool
@@ -175,9 +176,10 @@ Examples:
   gt mail read hq-abc123    # Read by message ID
   gt mail read 3            # Read the 3rd message in inbox
 
+Use 'gt mail inbox' to list messages and their IDs.
 Use 'gt mail mark-read' to mark messages as read.`,
 	Aliases: []string{"show"},
-	Args:    cobra.ExactArgs(1),
+	Args:    cobra.MaximumNArgs(1),
 	RunE:    runMailRead,
 }
 
@@ -459,7 +461,9 @@ func init() {
 	mailSendCmd.Flags().BoolVar(&mailUrgent, "urgent", false, "Set priority=0 (urgent)")
 	mailSendCmd.Flags().StringVar(&mailType, "type", "notification", "Message type (task, scavenge, notification, reply)")
 	mailSendCmd.Flags().StringVar(&mailReplyTo, "reply-to", "", "Message ID this is replying to")
-	mailSendCmd.Flags().BoolVarP(&mailNotify, "notify", "n", false, "Send tmux notification to recipient")
+	mailSendCmd.Flags().BoolVarP(&mailNotify, "notify", "n", false, "Bump priority to high (notification is automatic; use --no-notify to suppress)")
+	mailSendCmd.Flags().BoolVar(&mailNoNotify, "no-notify", false, "Suppress auto-nudge notification to recipient")
+	mailSendCmd.MarkFlagsMutuallyExclusive("notify", "no-notify")
 	mailSendCmd.Flags().BoolVar(&mailPinned, "pinned", false, "Pin message (for handoff context that persists)")
 	mailSendCmd.Flags().BoolVar(&mailWisp, "wisp", true, "Send as wisp (ephemeral, default)")
 	mailSendCmd.Flags().BoolVar(&mailPermanent, "permanent", false, "Send as permanent (not ephemeral, synced to remote)")

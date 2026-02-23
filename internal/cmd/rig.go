@@ -2,12 +2,12 @@
 package cmd
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -21,11 +21,13 @@ import (
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/refinery"
 	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/wisp"
 	"github.com/steveyegge/gastown/internal/witness"
 	"github.com/steveyegge/gastown/internal/workspace"
+	"golang.org/x/term"
 )
 
 var rigCmd = &cobra.Command{
@@ -80,14 +82,40 @@ Example:
 var rigListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List all rigs in the workspace",
-	RunE:  runRigList,
+	Long: `List all rigs registered in the Gas Town workspace.
+
+For each rig, displays:
+  - Rig name and operational state (OPERATIONAL, PARKED, DOCKED)
+  - Witness status (running/stopped)
+  - Refinery status (running/stopped)
+  - Number of polecats and crew members
+
+Examples:
+  gt rig list          # List all rigs with status
+  gt rig list --json   # Output as JSON for scripting`,
+	RunE: runRigList,
 }
 
 var rigRemoveCmd = &cobra.Command{
 	Use:   "remove <name>",
 	Short: "Remove a rig from the registry (does not delete files)",
-	Args:  cobra.ExactArgs(1),
-	RunE:  runRigRemove,
+	Long: `Remove a rig from the Gas Town registry.
+
+This only removes the rig entry from mayor/rigs.json and cleans up
+the beads route. The rig's files on disk are NOT deleted.
+
+If the rig has running tmux sessions (witness, refinery, polecats, crew),
+you must shut them down first with 'gt rig shutdown' or use --force to
+kill them automatically.
+
+To fully remove a rig, delete the directory manually after unregistering.
+
+Examples:
+  gt rig remove myproject                    # Unregister (fails if sessions running)
+  gt rig remove myproject --force            # Kill sessions then unregister
+  gt rig remove myproject && rm -rf myproject # Unregister and delete files`,
+	Args: cobra.ExactArgs(1),
+	RunE: runRigRemove,
 }
 
 var rigResetCmd = &cobra.Command{
@@ -175,7 +203,7 @@ Before shutdown, checks all polecats for uncommitted work:
 - Stashes
 - Unpushed commits
 
-Use --force to skip graceful shutdown and kill immediately.
+Use --force to force immediate shutdown (prompts if uncommitted work).
 Use --nuclear to bypass ALL safety checks (will lose work!).
 
 Examples:
@@ -224,7 +252,7 @@ Before shutdown, checks all polecats for uncommitted work:
 - Stashes
 - Unpushed commits
 
-Use --force to skip graceful shutdown and kill immediately.
+Use --force to force immediate shutdown (prompts if uncommitted work).
 Use --nuclear to bypass ALL safety checks (will lose work!).
 
 Examples:
@@ -249,7 +277,7 @@ Before shutdown, checks all polecats for uncommitted work:
 - Stashes
 - Unpushed commits
 
-Use --force to skip graceful shutdown and kill immediately.
+Use --force to force immediate shutdown (prompts if uncommitted work).
 Use --nuclear to bypass ALL safety checks (will lose work!).
 
 Examples:
@@ -266,6 +294,7 @@ var (
 	rigAddPrefix       string
 	rigAddLocalRepo    string
 	rigAddBranch       string
+	rigAddPushURL      string
 	rigAddAdopt        bool
 	rigAddAdoptURL     string
 	rigAddAdoptForce   bool
@@ -282,6 +311,25 @@ var (
 	rigStopNuclear     bool
 	rigRestartForce    bool
 	rigRestartNuclear  bool
+	rigListJSON        bool
+	rigRemoveForce     bool
+)
+
+var (
+	// Test seams for checkUncommittedWork.
+	listPolecatsForWorkCheck = func(r *rig.Rig) ([]*polecat.Polecat, error) {
+		polecatGit := git.NewGit(r.Path)
+		polecatMgr := polecat.NewManager(r, polecatGit, nil) // nil tmux: just listing
+		return polecatMgr.List()
+	}
+	checkPolecatWorkStatus = func(clonePath string) (*git.UncommittedWorkStatus, error) {
+		pGit := git.NewGit(clonePath)
+		return pGit.CheckUncommittedWork()
+	}
+	isStdinTerminal = func() bool {
+		return term.IsTerminal(int(os.Stdin.Fd()))
+	}
+	promptYesNoUnsafeProceed = promptYesNo
 )
 
 func init() {
@@ -298,9 +346,14 @@ func init() {
 	rigCmd.AddCommand(rigStatusCmd)
 	rigCmd.AddCommand(rigStopCmd)
 
+	rigListCmd.Flags().BoolVar(&rigListJSON, "json", false, "Output as JSON")
+
+	rigRemoveCmd.Flags().BoolVarP(&rigRemoveForce, "force", "f", false, "Kill running tmux sessions before removing (may lose uncommitted work)")
+
 	rigAddCmd.Flags().StringVar(&rigAddPrefix, "prefix", "", "Beads issue prefix (default: derived from name)")
 	rigAddCmd.Flags().StringVar(&rigAddLocalRepo, "local-repo", "", "Local repo path to share git objects (optional)")
 	rigAddCmd.Flags().StringVar(&rigAddBranch, "branch", "", "Default branch name (default: auto-detected from remote)")
+	rigAddCmd.Flags().StringVar(&rigAddPushURL, "push-url", "", "Push URL for read-only upstreams (push to fork)")
 	rigAddCmd.Flags().BoolVar(&rigAddAdopt, "adopt", false, "Adopt an existing directory instead of creating new")
 	rigAddCmd.Flags().StringVar(&rigAddAdoptURL, "url", "", "Git remote URL for --adopt (default: auto-detected from origin)")
 	rigAddCmd.Flags().BoolVar(&rigAddAdoptForce, "force", false, "With --adopt, register even if git remote cannot be detected")
@@ -311,17 +364,104 @@ func init() {
 	rigResetCmd.Flags().BoolVar(&rigResetDryRun, "dry-run", false, "Show what would be reset without making changes")
 	rigResetCmd.Flags().StringVar(&rigResetRole, "role", "", "Role to reset (default: auto-detect from cwd)")
 
-	rigShutdownCmd.Flags().BoolVarP(&rigShutdownForce, "force", "f", false, "Force immediate shutdown")
+	rigShutdownCmd.Flags().BoolVarP(&rigShutdownForce, "force", "f", false, "Force immediate shutdown (prompts if uncommitted work)")
 	rigShutdownCmd.Flags().BoolVar(&rigShutdownNuclear, "nuclear", false, "DANGER: Bypass ALL safety checks (loses uncommitted work!)")
 
-	rigRebootCmd.Flags().BoolVarP(&rigRebootForce, "force", "f", false, "Force immediate shutdown during reboot")
+	rigRebootCmd.Flags().BoolVarP(&rigRebootForce, "force", "f", false, "Force immediate shutdown during reboot (prompts if uncommitted work)")
 	rigRebootCmd.Flags().BoolVar(&rigRebootNuclear, "nuclear", false, "DANGER: Bypass ALL safety checks during reboot (loses uncommitted work!)")
 
-	rigStopCmd.Flags().BoolVarP(&rigStopForce, "force", "f", false, "Force immediate shutdown")
+	rigStopCmd.Flags().BoolVarP(&rigStopForce, "force", "f", false, "Force immediate shutdown (prompts if uncommitted work)")
 	rigStopCmd.Flags().BoolVar(&rigStopNuclear, "nuclear", false, "DANGER: Bypass ALL safety checks (loses uncommitted work!)")
 
-	rigRestartCmd.Flags().BoolVarP(&rigRestartForce, "force", "f", false, "Force immediate shutdown during restart")
+	rigRestartCmd.Flags().BoolVarP(&rigRestartForce, "force", "f", false, "Force immediate shutdown during restart (prompts if uncommitted work)")
 	rigRestartCmd.Flags().BoolVar(&rigRestartNuclear, "nuclear", false, "DANGER: Bypass ALL safety checks (loses uncommitted work!)")
+}
+
+func confirmUnsafeProceed(force bool) bool {
+	// If --force and interactive TTY, prompt.
+	if force && isStdinTerminal() {
+		fmt.Println()
+		return promptYesNoUnsafeProceed("Proceed anyway?")
+	}
+
+	// Otherwise block with hint.
+	if force {
+		fmt.Printf("\n%s requires an interactive terminal. Use %s to skip all checks (DANGER: will lose work!)\n",
+			style.Bold.Render("--force"), style.Bold.Render("--nuclear"))
+	} else {
+		fmt.Printf("\nUse %s to proceed with confirmation, or %s to skip all checks (DANGER: will lose work!)\n",
+			style.Bold.Render("--force"), style.Bold.Render("--nuclear"))
+	}
+	return false
+}
+
+// checkUncommittedWork checks polecats in a rig for uncommitted work.
+// operation is the verb shown in the warning (e.g. "stop", "shutdown", "restart").
+// Returns true if the caller should proceed, false if it should abort.
+// When force is true and stdin is a TTY, prompts the user to confirm.
+// When force is true but stdin is NOT a TTY, blocks (same as no --force).
+// All user-facing messages are printed internally.
+func checkUncommittedWork(r *rig.Rig, rigName, operation string, force bool) (proceed bool) {
+	polecats, err := listPolecatsForWorkCheck(r)
+	if err != nil {
+		fmt.Printf("%s Could not check polecats for uncommitted work: %v\n",
+			style.Warning.Render("⚠"), err)
+		return confirmUnsafeProceed(force)
+	}
+	if len(polecats) == 0 {
+		return true
+	}
+
+	var problemPolecats []struct {
+		name   string
+		status *git.UncommittedWorkStatus
+	}
+	var checkErrors []struct {
+		name string
+		err  error
+	}
+	for _, p := range polecats {
+		status, err := checkPolecatWorkStatus(p.ClonePath)
+		if err != nil {
+			checkErrors = append(checkErrors, struct {
+				name string
+				err  error
+			}{p.Name, err})
+			continue
+		}
+		if status == nil {
+			checkErrors = append(checkErrors, struct {
+				name string
+				err  error
+			}{p.Name, fmt.Errorf("no status returned")})
+			continue
+		}
+		if !status.Clean() {
+			problemPolecats = append(problemPolecats, struct {
+				name   string
+				status *git.UncommittedWorkStatus
+			}{p.Name, status})
+		}
+	}
+	if len(problemPolecats) == 0 && len(checkErrors) == 0 {
+		return true
+	}
+
+	if len(problemPolecats) > 0 {
+		fmt.Printf("\n%s Cannot %s %s - polecats have uncommitted work:\n",
+			style.Warning.Render("⚠"), operation, rigName)
+		for _, pp := range problemPolecats {
+			fmt.Printf("  %s: %s\n", style.Bold.Render(pp.name), pp.status.String())
+		}
+	}
+	if len(checkErrors) > 0 {
+		fmt.Printf("\n%s Could not verify uncommitted work for:\n", style.Warning.Render("⚠"))
+		for _, checkErr := range checkErrors {
+			fmt.Printf("  %s: %v\n", style.Bold.Render(checkErr.name), checkErr.err)
+		}
+	}
+
+	return confirmUnsafeProceed(force)
 }
 
 func runRigAdd(cmd *cobra.Command, args []string) error {
@@ -374,12 +514,19 @@ func runRigAdd(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  Local repo: %s\n", rigAddLocalRepo)
 	}
 
+	// Validate push URL if provided
+	rigAddPushURL = strings.TrimSpace(rigAddPushURL)
+	if rigAddPushURL != "" && !isGitRemoteURL(rigAddPushURL) {
+		return fmt.Errorf("invalid push URL %q: expected a remote URL (https://, git@, ssh://, git://)", rigAddPushURL)
+	}
+
 	startTime := time.Now()
 
 	// Add the rig
 	newRig, err := mgr.AddRig(rig.AddRigOptions{
 		Name:          name,
 		GitURL:        gitURL,
+		PushURL:       rigAddPushURL,
 		BeadsPrefix:   rigAddPrefix,
 		LocalRepo:     rigAddLocalRepo,
 		DefaultBranch: rigAddBranch,
@@ -399,30 +546,15 @@ func runRigAdd(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  %s Could not update daemon.json patrols: %v\n", style.Warning.Render("!"), err)
 	}
 
-	// Add route to town-level routes.jsonl for prefix-based routing.
-	// Route points to the canonical beads location:
-	// - If source repo has .beads/ tracked in git, route to mayor/rig
-	// - Otherwise route to rig root (where initBeads creates the database)
-	// The conditional routing is necessary because initBeads creates the database at
-	// "<rig>/.beads", while repos with tracked beads have their database at mayor/rig/.beads.
+	// Route registration is now handled inside AddRig (before agent bead creation)
+	// to avoid "no route found" warnings (#1424). Determine beadsWorkDir for rig identity bead.
 	var beadsWorkDir string
 	if newRig.Config.Prefix != "" {
-		routePath := name
 		mayorRigBeads := filepath.Join(townRoot, name, "mayor", "rig", ".beads")
 		if _, err := os.Stat(mayorRigBeads); err == nil {
-			// Source repo has .beads/ tracked - route to mayor/rig
-			routePath = name + "/mayor/rig"
 			beadsWorkDir = filepath.Join(townRoot, name, "mayor", "rig")
 		} else {
 			beadsWorkDir = filepath.Join(townRoot, name)
-		}
-		route := beads.Route{
-			Prefix: newRig.Config.Prefix + "-",
-			Path:   routePath,
-		}
-		if err := beads.AppendRoute(townRoot, route); err != nil {
-			// Non-fatal: routing will still work, just not from town root
-			fmt.Printf("  %s Could not update routes.jsonl: %v\n", style.Warning.Render("!"), err)
 		}
 	}
 
@@ -467,13 +599,56 @@ func runRigAdd(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  ├── refinery/rig/     (worktree: %s, sees polecat branches)\n", defaultBranch)
 	fmt.Printf("  ├── crew/             (empty - add crew with 'gt crew add')\n")
 	fmt.Printf("  ├── witness/\n")
-	fmt.Printf("  └── polecats/\n")
+	fmt.Printf("  └── polecats/         (.claude/ scaffolded for polecat sessions)\n")
 
 	fmt.Printf("\nNext steps:\n")
 	fmt.Printf("  gt crew add <name> --rig %s   # Create your personal workspace\n", name)
 	fmt.Printf("  cd %s/crew/<name>              # Start working\n", filepath.Join(townRoot, name))
 
 	return nil
+}
+
+// GetRigLED returns the LED indicator for a rig based on session and operational state.
+// Used by both rig list and statusline for consistent indicators:
+//   - 🟢 = both witness and refinery running (fully active)
+//   - 🟡 = one session running (partially active)
+//   - ⚫ = nothing running (stopped)
+//   - 🅿️ = parked (intentionally paused)
+//   - 🛑 = docked (global shutdown)
+func GetRigLED(hasWitness, hasRefinery bool, opState string) string {
+	if hasWitness && hasRefinery {
+		return "🟢"
+	}
+	if hasWitness || hasRefinery {
+		return "🟡"
+	}
+	switch opState {
+	case "PARKED":
+		return "🅿️"
+	case "DOCKED":
+		return "🛑"
+	default:
+		return "⚫"
+	}
+}
+
+// rigStatePriority returns a sort priority for a rig's state.
+// Lower values sort first: active > partial > stopped > parked > docked.
+func rigStatePriority(hasWitness, hasRefinery bool, opState string) int {
+	if hasWitness && hasRefinery {
+		return 0
+	}
+	if hasWitness || hasRefinery {
+		return 1
+	}
+	switch opState {
+	case "PARKED":
+		return 3
+	case "DOCKED":
+		return 4
+	default:
+		return 2
+	}
 }
 
 func runRigList(cmd *cobra.Command, args []string) error {
@@ -500,33 +675,98 @@ func runRigList(cmd *cobra.Command, args []string) error {
 	// Create rig manager to get details
 	g := git.NewGit(townRoot)
 	mgr := rig.NewManager(townRoot, rigsConfig, g)
+	t := tmux.NewTmux()
 
-	fmt.Printf("Rigs in %s:\n\n", townRoot)
+	type rigInfo struct {
+		Name     string `json:"name"`
+		Status   string `json:"status"`
+		Witness  string `json:"witness"`
+		Refinery string `json:"refinery"`
+		Polecats int    `json:"polecats"`
+		Crew     int    `json:"crew"`
+		// sorting fields (not exported to JSON)
+		sortPrio int
+	}
+
+	var rigs []rigInfo
 
 	for name := range rigsConfig.Rigs {
 		r, err := mgr.GetRig(name)
 		if err != nil {
-			fmt.Printf("  %s %s\n", style.Warning.Render("!"), name)
+			rigs = append(rigs, rigInfo{Name: name, Status: "error", sortPrio: 99})
 			continue
 		}
 
-		summary := r.Summary()
-		fmt.Printf("  %s\n", style.Bold.Render(name))
-		fmt.Printf("    Polecats: %d  Crew: %d\n", summary.PolecatCount, summary.CrewCount)
+		opState, _ := getRigOperationalState(townRoot, name)
 
-		agents := []string{}
-		if summary.HasRefinery {
-			agents = append(agents, "refinery")
+		witnessSession := session.WitnessSessionName(session.PrefixFor(name))
+		refinerySession := session.RefinerySessionName(session.PrefixFor(name))
+		witnessRunning, _ := t.HasSession(witnessSession)
+		refineryRunning, _ := t.HasSession(refinerySession)
+
+		witnessStatus := "stopped"
+		if witnessRunning {
+			witnessStatus = "running"
 		}
-		if summary.HasWitness {
-			agents = append(agents, "witness")
+		refineryStatus := "stopped"
+		if refineryRunning {
+			refineryStatus = "running"
 		}
-		if r.HasMayor {
-			agents = append(agents, "mayor")
+
+		summary := r.Summary()
+		rigs = append(rigs, rigInfo{
+			Name:     name,
+			Status:   strings.ToLower(opState),
+			Witness:  witnessStatus,
+			Refinery: refineryStatus,
+			Polecats: summary.PolecatCount,
+			Crew:     summary.CrewCount,
+			sortPrio: rigStatePriority(witnessRunning, refineryRunning, opState),
+		})
+	}
+
+	// Sort by state priority (active first), then alphabetically
+	sort.Slice(rigs, func(i, j int) bool {
+		if rigs[i].sortPrio != rigs[j].sortPrio {
+			return rigs[i].sortPrio < rigs[j].sortPrio
 		}
-		if len(agents) > 0 {
-			fmt.Printf("    Agents: %v\n", agents)
+		return rigs[i].Name < rigs[j].Name
+	})
+
+	if rigListJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(rigs)
+	}
+
+	fmt.Printf("Rigs in %s:\n\n", townRoot)
+	for _, ri := range rigs {
+		if ri.Status == "error" {
+			fmt.Printf("  %s %s\n", style.Warning.Render("!"), ri.Name)
+			continue
 		}
+
+		led := GetRigLED(ri.Witness == "running", ri.Refinery == "running", strings.ToUpper(ri.Status))
+		// 🅿️ needs extra space for alignment
+		space := " "
+		if led == "🅿️" {
+			space = "  "
+		}
+
+		fmt.Printf("%s%s%s\n", led, space, style.Bold.Render(ri.Name))
+
+		witnessIcon := style.Dim.Render("○")
+		if ri.Witness == "running" {
+			witnessIcon = style.Success.Render("●")
+		}
+		refineryIcon := style.Dim.Render("○")
+		if ri.Refinery == "running" {
+			refineryIcon = style.Success.Render("●")
+		}
+
+		fmt.Printf("   Witness: %s %s  Refinery: %s %s\n",
+			witnessIcon, ri.Witness, refineryIcon, ri.Refinery)
+		fmt.Printf("   Polecats: %d  Crew: %d\n", ri.Polecats, ri.Crew)
 		fmt.Println()
 	}
 
@@ -559,6 +799,46 @@ func runRigRemove(cmd *cobra.Command, args []string) error {
 	g := git.NewGit(townRoot)
 	mgr := rig.NewManager(townRoot, rigsConfig, g)
 
+	// Check for running tmux sessions before removing
+	t := tmux.NewTmux()
+	sessions, sessErr := findRigSessions(t, name)
+	if sessErr != nil {
+		if !rigRemoveForce {
+			return fmt.Errorf("could not verify session state for rig %s: %w (use --force to skip check)", name, sessErr)
+		}
+		fmt.Printf("  %s Could not check tmux sessions: %v (proceeding due to --force)\n", style.Warning.Render("!"), sessErr)
+	}
+	if len(sessions) > 0 {
+		if !rigRemoveForce {
+			fmt.Printf("%s Rig %s has %d running tmux session(s):\n",
+				style.Warning.Render("⚠"), name, len(sessions))
+			for _, s := range sessions {
+				fmt.Printf("  - %s\n", s)
+			}
+			fmt.Printf("\nShut them down first:\n")
+			fmt.Printf("  %s\n", style.Dim.Render(fmt.Sprintf("gt rig shutdown %s", name)))
+			fmt.Printf("Or force removal:\n")
+			fmt.Printf("  %s\n", style.Dim.Render(fmt.Sprintf("gt rig remove %s --force", name)))
+			return fmt.Errorf("refusing to remove rig with running sessions")
+		}
+
+		// --force: kill all rig sessions (WARNING: may lose uncommitted work)
+		fmt.Printf("Killing %d tmux session(s) for rig %s...\n", len(sessions), name)
+		var killErrors []string
+		for _, s := range sessions {
+			if err := t.KillSessionWithProcesses(s); err != nil {
+				fmt.Printf("  %s Failed to kill session %s: %v\n", style.Warning.Render("!"), s, err)
+				killErrors = append(killErrors, s)
+			} else {
+				fmt.Printf("  Killed %s\n", s)
+			}
+		}
+		if len(killErrors) > 0 {
+			return fmt.Errorf("aborting remove: failed to kill %d session(s) (%s); rig left registered to avoid orphaned sessions",
+				len(killErrors), strings.Join(killErrors, ", "))
+		}
+	}
+
 	if err := mgr.RemoveRig(name); err != nil {
 		return fmt.Errorf("removing rig: %w", err)
 	}
@@ -566,6 +846,12 @@ func runRigRemove(cmd *cobra.Command, args []string) error {
 	// Save updated config
 	if err := config.SaveRigsConfig(rigsPath, rigsConfig); err != nil {
 		return fmt.Errorf("saving rigs config: %w", err)
+	}
+
+	// Remove rig from daemon.json patrol config (witness + refinery rigs arrays)
+	if err := config.RemoveRigFromDaemonPatrols(townRoot, name); err != nil {
+		// Non-fatal: daemon will stop spawning for this rig anyway since it's unregistered
+		fmt.Printf("  %s Could not update daemon.json patrols: %v\n", style.Warning.Render("!"), err)
 	}
 
 	// Remove route from routes.jsonl (issue #899)
@@ -613,10 +899,17 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid git URL %q: expected a remote URL (https://, git@, ssh://, git://)", rigAddAdoptURL)
 	}
 
+	// Validate --push-url if provided
+	rigAddPushURL = strings.TrimSpace(rigAddPushURL)
+	if rigAddPushURL != "" && !isGitRemoteURL(rigAddPushURL) {
+		return fmt.Errorf("invalid push URL %q: expected a remote URL (https://, git@, ssh://, git://)", rigAddPushURL)
+	}
+
 	// Register the existing rig
 	result, err := mgr.RegisterRig(rig.RegisterRigOptions{
 		Name:        name,
 		GitURL:      rigAddAdoptURL,
+		PushURL:     rigAddPushURL,
 		BeadsPrefix: rigAddPrefix,
 		Force:       rigAddAdoptForce,
 	})
@@ -656,14 +949,16 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 		filepath.Join(rigPath, ".beads"),
 		filepath.Join(rigPath, "mayor", "rig", ".beads"),
 	}
+	foundBeadsCandidate := false
 	for _, beadsDir := range beadsDirCandidates {
 		if _, err := os.Stat(beadsDir); err != nil {
 			continue
 		}
+		foundBeadsCandidate = true
 
-		// Detect prefix: try dolt backend first, fall back to issues.jsonl.
-		// With dolt, metadata.json and the database survive clone, so we can
-		// query the prefix directly via "bd config get issue_prefix".
+		// Detect prefix from Dolt metadata: try "bd config get issue_prefix" first,
+		// then extract from metadata.json dolt_database name as fallback.
+		// metadata.json survives clone (dolt/ is gitignored since bd v0.50+).
 		prefixDetected := false
 		metadataPath := filepath.Join(beadsDir, "metadata.json")
 		if metaBytes, readErr := os.ReadFile(metadataPath); readErr == nil {
@@ -686,57 +981,71 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 						prefixDetected = true
 					}
 				}
-			}
-		}
-
-		// Fall back to issues.jsonl for non-dolt backends or if dolt detection failed
-		if !prefixDetected {
-			jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-			if f, readErr := os.Open(jsonlPath); readErr == nil {
-				scanner := bufio.NewScanner(f)
-				if scanner.Scan() {
-					var issue struct {
-						ID string `json:"id"`
+				// Fallback: extract prefix from dolt_database name in metadata.json.
+				// Format: "beads_<prefix>" (e.g. "beads_my-project" → "my-project").
+				// This survives clone because metadata.json is tracked by git.
+				if !prefixDetected {
+					var fullMeta struct {
+						DoltDatabase string `json:"dolt_database"`
 					}
-					if json.Unmarshal(scanner.Bytes(), &issue) == nil && issue.ID != "" {
-						// Extract prefix: everything before the last "-" segment
-						if lastDash := strings.LastIndex(issue.ID, "-"); lastDash > 0 {
-							detected := issue.ID[:lastDash]
-							if detected != "" && rigAddPrefix != "" {
-								if strings.TrimSuffix(rigAddPrefix, "-") != detected {
-									f.Close()
-									return fmt.Errorf("prefix mismatch: source repo uses '%s' but --prefix '%s' was provided", detected, rigAddPrefix)
-								}
+					if json.Unmarshal(metaBytes, &fullMeta) == nil && strings.HasPrefix(fullMeta.DoltDatabase, "beads_") {
+						detected := strings.TrimPrefix(fullMeta.DoltDatabase, "beads_")
+						if detected != "" {
+							if rigAddPrefix != "" && strings.TrimSuffix(rigAddPrefix, "-") != detected {
+								return fmt.Errorf("prefix mismatch: source repo uses '%s' but --prefix '%s' was provided", detected, rigAddPrefix)
 							}
-							if detected != "" && result.BeadsPrefix == "" {
+							if result.BeadsPrefix == "" {
 								result.BeadsPrefix = detected
 							}
+							prefixDetected = true
 						}
 					}
 				}
-				f.Close()
 			}
 		}
 
-		// Init database if metadata.json is missing (DB files are gitignored)
+		// Re-init database if metadata.json is missing or dolt/ directory is missing.
+		// Since bd v0.50+, dolt/ is gitignored and won't exist after clone.
+		// Use mgr.InitBeads() for consistency with the non-adopt path — it handles
+		// BEADS_DIR env isolation, prefix validation, custom types config, tracked-beads
+		// redirect, and fallback config creation.
 		metadataPath = filepath.Join(beadsDir, "metadata.json")
+		needsInit := false
 		if _, err := os.Stat(metadataPath); os.IsNotExist(err) {
+			needsInit = true
+		} else if metaBytes, readErr := os.ReadFile(metadataPath); readErr == nil {
+			var meta struct {
+				Backend string `json:"backend"`
+			}
+			if json.Unmarshal(metaBytes, &meta) == nil && meta.Backend == "dolt" {
+				doltDir := filepath.Join(beadsDir, "dolt")
+				if _, statErr := os.Stat(doltDir); os.IsNotExist(statErr) {
+					needsInit = true
+				}
+			}
+		}
+		if needsInit {
 			prefix := result.BeadsPrefix
 			if prefix == "" {
 				break
 			}
-			workDir := filepath.Dir(beadsDir) // directory containing .beads/
-			// IMPORTANT: Use --backend dolt --server to prevent SQLite creation.
-			// Gas Town rigs use Dolt server mode via the shared town Dolt sql-server.
-			initCmd := exec.Command("bd", "init", "--prefix", prefix, "--backend", "dolt", "--server")
-			initCmd.Dir = workDir
-			if output, initErr := initCmd.CombinedOutput(); initErr != nil {
-				fmt.Printf("  %s Could not init bd database: %v (%s)\n", style.Warning.Render("!"), initErr, strings.TrimSpace(string(output)))
+			if err := mgr.InitBeads(rigPath, prefix, name); err != nil {
+				fmt.Printf("  %s Could not init bd database: %v\n", style.Warning.Render("!"), err)
 			} else {
 				fmt.Printf("  %s Initialized beads database (Dolt)\n", style.Success.Render("✓"))
 			}
 		}
 		break
+	}
+
+	// If no existing .beads/ candidate was found, initialize a fresh database
+	// to match the behavior of the normal (non-adopt) gt rig add path.
+	if !foundBeadsCandidate && result.BeadsPrefix != "" {
+		if err := mgr.InitBeads(rigPath, result.BeadsPrefix, name); err != nil {
+			fmt.Printf("  %s Could not init beads database: %v\n", style.Warning.Render("!"), err)
+		} else {
+			fmt.Printf("  %s Initialized beads database\n", style.Success.Render("✓"))
+		}
 	}
 
 	// Print results
@@ -930,15 +1239,15 @@ func assigneeToSessionName(assignee string) (sessionName string, isPersistent bo
 	switch len(parts) {
 	case 2:
 		// rig/polecatName -> gt-rig-polecatName
-		return fmt.Sprintf("gt-%s-%s", parts[0], parts[1]), false
+		return session.PolecatSessionName(session.PrefixFor(parts[0]), parts[1]), false
 	case 3:
 		// rig/crew/name -> gt-rig-crew-name
 		if parts[1] == "crew" {
-			return fmt.Sprintf("gt-%s-crew-%s", parts[0], parts[2]), true
+			return session.CrewSessionName(session.PrefixFor(parts[0]), parts[2]), true
 		}
 		// rig/polecats/name -> gt-rig-name
 		if parts[1] == "polecats" {
-			return fmt.Sprintf("gt-%s-%s", parts[0], parts[2]), false
+			return session.PolecatSessionName(session.PrefixFor(parts[0]), parts[2]), false
 		}
 		// Other 3-part formats not recognized
 		return "", false
@@ -985,7 +1294,7 @@ func runRigBoot(cmd *cobra.Command, args []string) error {
 
 	// 1. Start the witness
 	// Check actual tmux session, not state file (may be stale)
-	witnessSession := fmt.Sprintf("gt-%s-witness", rigName)
+	witnessSession := session.WitnessSessionName(session.PrefixFor(rigName))
 	witnessRunning, _ := t.HasSession(witnessSession)
 	if witnessRunning {
 		skipped = append(skipped, "witness (already running)")
@@ -1005,7 +1314,7 @@ func runRigBoot(cmd *cobra.Command, args []string) error {
 
 	// 2. Start the refinery
 	// Check actual tmux session, not state file (may be stale)
-	refinerySession := fmt.Sprintf("gt-%s-refinery", rigName)
+	refinerySession := session.RefinerySessionName(session.PrefixFor(rigName))
 	refineryRunning, _ := t.HasSession(refinerySession)
 	if refineryRunning {
 		skipped = append(skipped, "refinery (already running)")
@@ -1074,7 +1383,7 @@ func runRigStart(cmd *cobra.Command, args []string) error {
 		hasError := false
 
 		// 1. Start the witness
-		witnessSession := fmt.Sprintf("gt-%s-witness", rigName)
+		witnessSession := session.WitnessSessionName(session.PrefixFor(rigName))
 		witnessRunning, _ := t.HasSession(witnessSession)
 		if witnessRunning {
 			skipped = append(skipped, "witness")
@@ -1094,7 +1403,7 @@ func runRigStart(cmd *cobra.Command, args []string) error {
 		}
 
 		// 2. Start the refinery
-		refinerySession := fmt.Sprintf("gt-%s-refinery", rigName)
+		refinerySession := session.RefinerySessionName(session.PrefixFor(rigName))
 		refineryRunning, _ := t.HasSession(refinerySession)
 		if refineryRunning {
 			skipped = append(skipped, "refinery")
@@ -1161,36 +1470,8 @@ func runRigShutdown(cmd *cobra.Command, args []string) error {
 	}
 
 	// Check all polecats for uncommitted work (unless nuclear)
-	if !rigShutdownNuclear {
-		polecatGit := git.NewGit(r.Path)
-		polecatMgr := polecat.NewManager(r, polecatGit, nil) // nil tmux: just listing
-		polecats, err := polecatMgr.List()
-		if err == nil && len(polecats) > 0 {
-			var problemPolecats []struct {
-				name   string
-				status *git.UncommittedWorkStatus
-			}
-
-			for _, p := range polecats {
-				pGit := git.NewGit(p.ClonePath)
-				status, err := pGit.CheckUncommittedWork()
-				if err == nil && !status.Clean() {
-					problemPolecats = append(problemPolecats, struct {
-						name   string
-						status *git.UncommittedWorkStatus
-					}{p.Name, status})
-				}
-			}
-
-			if len(problemPolecats) > 0 {
-				fmt.Printf("\n%s Cannot shutdown - polecats have uncommitted work:\n\n", style.Warning.Render("⚠"))
-				for _, pp := range problemPolecats {
-					fmt.Printf("  %s: %s\n", style.Bold.Render(pp.name), pp.status.String())
-				}
-				fmt.Printf("\nUse %s to force shutdown (DANGER: will lose work!)\n", style.Bold.Render("--nuclear"))
-				return fmt.Errorf("refusing to shutdown with uncommitted work")
-			}
-		}
+	if !rigShutdownNuclear && !checkUncommittedWork(r, rigName, "shutdown", rigShutdownForce) {
+		return fmt.Errorf("refusing to shutdown with uncommitted work")
 	}
 
 	fmt.Printf("Shutting down rig %s...\n", style.Bold.Render(rigName))
@@ -1345,7 +1626,7 @@ func runRigStatus(cmd *cobra.Command, args []string) error {
 	} else {
 		fmt.Printf(" (%d)\n", len(polecats))
 		for _, p := range polecats {
-			sessionName := fmt.Sprintf("gt-%s-%s", rigName, p.Name)
+			sessionName := session.PolecatSessionName(session.PrefixFor(rigName), p.Name)
 			hasSession, _ := t.HasSession(sessionName)
 
 			sessionIcon := style.Dim.Render("○")
@@ -1360,7 +1641,7 @@ func runRigStatus(cmd *cobra.Command, args []string) error {
 			displayState := p.State
 			if hasSession && displayState == polecat.StateDone {
 				displayState = polecat.StateWorking
-			} else if !hasSession && displayState.IsActive() {
+			} else if !hasSession && displayState == polecat.StateWorking {
 				displayState = polecat.StateDone
 			}
 
@@ -1439,36 +1720,9 @@ func runRigStop(cmd *cobra.Command, args []string) error {
 		}
 
 		// Check all polecats for uncommitted work (unless nuclear)
-		if !rigStopNuclear {
-			polecatGit := git.NewGit(r.Path)
-			polecatMgr := polecat.NewManager(r, polecatGit, nil) // nil tmux: just listing
-			polecats, err := polecatMgr.List()
-			if err == nil && len(polecats) > 0 {
-				var problemPolecats []struct {
-					name   string
-					status *git.UncommittedWorkStatus
-				}
-
-				for _, p := range polecats {
-					pGit := git.NewGit(p.ClonePath)
-					status, err := pGit.CheckUncommittedWork()
-					if err == nil && !status.Clean() {
-						problemPolecats = append(problemPolecats, struct {
-							name   string
-							status *git.UncommittedWorkStatus
-						}{p.Name, status})
-					}
-				}
-
-				if len(problemPolecats) > 0 {
-					fmt.Printf("\n%s Cannot stop %s - polecats have uncommitted work:\n", style.Warning.Render("⚠"), rigName)
-					for _, pp := range problemPolecats {
-						fmt.Printf("  %s: %s\n", style.Bold.Render(pp.name), pp.status.String())
-					}
-					failed = append(failed, rigName)
-					continue
-				}
-			}
+		if !rigStopNuclear && !checkUncommittedWork(r, rigName, "stop", rigStopForce) {
+			failed = append(failed, rigName)
+			continue
 		}
 
 		fmt.Printf("Stopping rig %s...\n", style.Bold.Render(rigName))
@@ -1524,11 +1778,9 @@ func runRigStop(cmd *cobra.Command, args []string) error {
 		}
 		if len(failed) > 0 {
 			fmt.Printf("%s Failed: %s\n", style.Warning.Render("⚠"), strings.Join(failed, ", "))
-			fmt.Printf("\nUse %s to force shutdown (DANGER: will lose work!)\n", style.Bold.Render("--nuclear"))
 			return fmt.Errorf("some rigs failed to stop")
 		}
 	} else if len(failed) > 0 {
-		fmt.Printf("\nUse %s to force shutdown (DANGER: will lose work!)\n", style.Bold.Render("--nuclear"))
 		return fmt.Errorf("rig failed to stop")
 	}
 
@@ -1566,40 +1818,13 @@ func runRigRestart(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		fmt.Printf("Restarting rig %s...\n", style.Bold.Render(rigName))
-
 		// Check all polecats for uncommitted work (unless nuclear)
-		if !rigRestartNuclear {
-			polecatGit := git.NewGit(r.Path)
-			polecatMgr := polecat.NewManager(r, polecatGit, nil) // nil tmux: just listing
-			polecats, err := polecatMgr.List()
-			if err == nil && len(polecats) > 0 {
-				var problemPolecats []struct {
-					name   string
-					status *git.UncommittedWorkStatus
-				}
-
-				for _, p := range polecats {
-					pGit := git.NewGit(p.ClonePath)
-					status, err := pGit.CheckUncommittedWork()
-					if err == nil && !status.Clean() {
-						problemPolecats = append(problemPolecats, struct {
-							name   string
-							status *git.UncommittedWorkStatus
-						}{p.Name, status})
-					}
-				}
-
-				if len(problemPolecats) > 0 {
-					fmt.Printf("\n%s Cannot restart %s - polecats have uncommitted work:\n", style.Warning.Render("⚠"), rigName)
-					for _, pp := range problemPolecats {
-						fmt.Printf("  %s: %s\n", style.Bold.Render(pp.name), pp.status.String())
-					}
-					failed = append(failed, rigName)
-					continue
-				}
-			}
+		if !rigRestartNuclear && !checkUncommittedWork(r, rigName, "restart", rigRestartForce) {
+			failed = append(failed, rigName)
+			continue
 		}
+
+		fmt.Printf("Restarting rig %s...\n", style.Bold.Render(rigName))
 
 		var stopErrors []string
 		var startErrors []string
@@ -1651,7 +1876,7 @@ func runRigRestart(cmd *cobra.Command, args []string) error {
 		var skipped []string
 
 		// 1. Start the witness
-		witnessSession := fmt.Sprintf("gt-%s-witness", rigName)
+		witnessSession := session.WitnessSessionName(session.PrefixFor(rigName))
 		witnessRunning, _ := t.HasSession(witnessSession)
 		if witnessRunning {
 			skipped = append(skipped, "witness")
@@ -1670,7 +1895,7 @@ func runRigRestart(cmd *cobra.Command, args []string) error {
 		}
 
 		// 2. Start the refinery
-		refinerySession := fmt.Sprintf("gt-%s-refinery", rigName)
+		refinerySession := session.RefinerySessionName(session.PrefixFor(rigName))
 		refineryRunning, _ := t.HasSession(refinerySession)
 		if refineryRunning {
 			skipped = append(skipped, "refinery")
@@ -1712,11 +1937,9 @@ func runRigRestart(cmd *cobra.Command, args []string) error {
 		}
 		if len(failed) > 0 {
 			fmt.Printf("%s Failed: %s\n", style.Warning.Render("⚠"), strings.Join(failed, ", "))
-			fmt.Printf("\nUse %s to force shutdown (DANGER: will lose work!)\n", style.Bold.Render("--nuclear"))
 			return fmt.Errorf("some rigs failed to restart")
 		}
 	} else if len(failed) > 0 {
-		fmt.Printf("\nUse %s to force shutdown (DANGER: will lose work!)\n", style.Bold.Render("--nuclear"))
 		return fmt.Errorf("rig failed to restart")
 	}
 
@@ -1791,6 +2014,24 @@ func syncRigHooks(townRoot, rigName string) error {
 		fmt.Printf("  Synced hooks for %d target(s)\n", synced)
 	}
 	return nil
+}
+
+// findRigSessions returns all tmux sessions belonging to the given rig.
+// All rig sessions share the "<rigPrefix>-" prefix, so this catches witness,
+// refinery, polecat, and crew sessions in one pass.
+func findRigSessions(t *tmux.Tmux, rigName string) ([]string, error) {
+	prefix := session.PrefixFor(rigName) + "-"
+	all, err := t.ListSessions()
+	if err != nil {
+		return nil, fmt.Errorf("listing tmux sessions: %w", err)
+	}
+	var matches []string
+	for _, name := range all {
+		if strings.HasPrefix(name, prefix) {
+			matches = append(matches, name)
+		}
+	}
+	return matches, nil
 }
 
 // isGitRemoteURL returns true if s looks like a remote git URL

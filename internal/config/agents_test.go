@@ -17,7 +17,7 @@ func isClaudeCmd(cmd string) bool {
 func TestBuiltinPresets(t *testing.T) {
 	t.Parallel()
 	// Ensure all built-in presets are accessible
-	presets := []AgentPreset{AgentClaude, AgentGemini, AgentCodex, AgentCursor, AgentAuggie, AgentAmp}
+	presets := []AgentPreset{AgentClaude, AgentGemini, AgentCodex, AgentCursor, AgentAuggie, AgentAmp, AgentOpenCode, AgentCopilot, AgentPi}
 
 	for _, preset := range presets {
 		info := GetAgentPreset(preset)
@@ -52,6 +52,8 @@ func TestGetAgentPresetByName(t *testing.T) {
 		{"amp", AgentAmp, false},
 		{"aider", "", true},               // Not built-in, can be added via config
 		{"opencode", AgentOpenCode, false}, // Built-in multi-model CLI agent
+		{"copilot", AgentCopilot, false},   // Built-in GitHub Copilot CLI agent
+		{"pi", AgentPi, false},             // Pi Coding Agent
 		{"unknown", "", true},
 	}
 
@@ -83,6 +85,7 @@ func TestRuntimeConfigFromPreset(t *testing.T) {
 		{AgentCursor, "cursor-agent"},
 		{AgentAuggie, "auggie"},
 		{AgentAmp, "amp"},
+		{AgentCopilot, "copilot"},
 	}
 
 	for _, tt := range tests {
@@ -131,6 +134,8 @@ func TestIsKnownPreset(t *testing.T) {
 		{"amp", true},
 		{"aider", false},    // Not built-in, can be added via config
 		{"opencode", true},  // Built-in multi-model CLI agent
+		{"copilot", true},   // Built-in GitHub Copilot CLI agent
+		{"pi", true},        // Pi Coding Agent
 		{"unknown", false},
 		{"chatgpt", false},
 	}
@@ -198,16 +203,215 @@ func TestLoadAgentRegistry(t *testing.T) {
 	ResetRegistryForTesting()
 }
 
-func TestAgentPresetYOLOFlags(t *testing.T) {
+func TestGetProcessNamesRespectsRegistryOverride(t *testing.T) {
+	// Regression test: settings/agents.json overrides must be visible to
+	// GetProcessNames so that liveness checks (IsAgentAlive, daemon heartbeat,
+	// cleanup) respect user-configured process names.
+	// Real-world case: NixOS wraps claude as ".claude-unwrapped".
+	ResetRegistryForTesting()
+	t.Cleanup(ResetRegistryForTesting)
+
+	// Before loading any registry, GetProcessNames returns the builtin default.
+	builtinNames := GetProcessNames("claude")
+	if len(builtinNames) != 2 || builtinNames[0] != "node" || builtinNames[1] != "claude" {
+		t.Fatalf("builtin GetProcessNames(claude) = %v, want [node claude]", builtinNames)
+	}
+
+	// Write a settings/agents.json that adds ".claude-unwrapped" to process_names.
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "agents.json")
+
+	customRegistry := AgentRegistry{
+		Version: CurrentAgentRegistryVersion,
+		Agents: map[string]*AgentPresetInfo{
+			"claude": {
+				Name:         "claude",
+				Command:      "claude",
+				Args:         []string{"--dangerously-skip-permissions"},
+				ProcessNames: []string{"node", "claude", ".claude-unwrapped"},
+			},
+		},
+	}
+
+	data, err := json.Marshal(customRegistry)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := os.WriteFile(configPath, data, 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// After loading the registry, GetProcessNames must return the override.
+	if err := LoadAgentRegistry(configPath); err != nil {
+		t.Fatalf("LoadAgentRegistry: %v", err)
+	}
+
+	got := GetProcessNames("claude")
+	want := []string{"node", "claude", ".claude-unwrapped"}
+	if len(got) != len(want) {
+		t.Fatalf("GetProcessNames(claude) after LoadAgentRegistry = %v, want %v", got, want)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Errorf("GetProcessNames(claude)[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestResolveProcessNames(t *testing.T) {
 	t.Parallel()
-	// Verify YOLO flags are set correctly for each E2E tested agent
+	ResetRegistryForTesting()
+	t.Cleanup(ResetRegistryForTesting)
+
+	tests := []struct {
+		name      string
+		agentName string
+		command   string
+		want      []string
+	}{
+		{
+			name:      "built-in preset with matching command",
+			agentName: "claude",
+			command:   "claude",
+			want:      []string{"node", "claude"},
+		},
+		{
+			name:      "built-in preset with matching command (opencode)",
+			agentName: "opencode",
+			command:   "opencode",
+			want:      []string{"opencode", "node", "bun"},
+		},
+		{
+			name:      "custom agent shadowing built-in with different command",
+			agentName: "codex",
+			command:   "opencode",
+			want:      []string{"opencode", "node", "bun"},
+		},
+		{
+			name:      "custom agent shadowing built-in with same command",
+			agentName: "codex",
+			command:   "codex",
+			want:      []string{"codex"},
+		},
+		{
+			name:      "unknown agent with known command",
+			agentName: "my-custom-agent",
+			command:   "claude",
+			want:      []string{"node", "claude"},
+		},
+		{
+			name:      "unknown agent with unknown command",
+			agentName: "my-custom-agent",
+			command:   "my-binary",
+			want:      []string{"my-binary"},
+		},
+		{
+			name:      "empty agent name with command",
+			agentName: "",
+			command:   "opencode",
+			want:      []string{"opencode", "node", "bun"},
+		},
+		{
+			name:      "path-resolved command matches built-in preset",
+			agentName: "claude",
+			command:   "/usr/local/bin/claude",
+			want:      []string{"node", "claude"},
+		},
+		{
+			name:      "path-resolved command with unknown agent",
+			agentName: "my-custom-agent",
+			command:   "/opt/bin/opencode",
+			want:      []string{"opencode", "node", "bun"},
+		},
+		{
+			name:      "path-resolved unknown command falls back to basename",
+			agentName: "my-agent",
+			command:   "/usr/local/bin/my-binary",
+			want:      []string{"my-binary"},
+		},
+		{
+			name:      "empty agent and command",
+			agentName: "",
+			command:   "",
+			want:      []string{"node", "claude"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ResolveProcessNames(tt.agentName, tt.command)
+			if len(got) != len(tt.want) {
+				t.Fatalf("ResolveProcessNames(%q, %q) = %v, want %v", tt.agentName, tt.command, got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("ResolveProcessNames(%q, %q)[%d] = %q, want %q", tt.agentName, tt.command, i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+
+	// Test registry preset with absolute-path command.
+	// Custom agents loaded from agents.json may store full paths in Command.
+	// ResolveProcessNames must normalize both sides to match correctly.
+	t.Run("registry preset with absolute-path command matches", func(t *testing.T) {
+		RegisterAgentForTesting("custom-tool", AgentPresetInfo{
+			Name:         "custom-tool",
+			Command:      "/opt/bin/custom-tool",
+			ProcessNames: []string{"custom-tool", "node"},
+		})
+		t.Cleanup(func() {
+			ResetRegistryForTesting()
+		})
+
+		// Query with basename — should match via filepath.Base normalization
+		got := ResolveProcessNames("custom-tool", "custom-tool")
+		want := []string{"custom-tool", "node"}
+		if len(got) != len(want) {
+			t.Fatalf("ResolveProcessNames with abs-path registry = %v, want %v", got, want)
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Errorf("got[%d] = %q, want %q", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("registry preset with absolute-path command matches via command lookup", func(t *testing.T) {
+		RegisterAgentForTesting("abs-tool", AgentPresetInfo{
+			Name:         "abs-tool",
+			Command:      "/usr/local/bin/special-binary",
+			ProcessNames: []string{"special-binary", "helper"},
+		})
+		t.Cleanup(func() {
+			ResetRegistryForTesting()
+		})
+
+		// Query with different agent name but matching command basename
+		got := ResolveProcessNames("unknown-agent", "special-binary")
+		want := []string{"special-binary", "helper"}
+		if len(got) != len(want) {
+			t.Fatalf("ResolveProcessNames command-based lookup with abs-path = %v, want %v", got, want)
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Errorf("got[%d] = %q, want %q", i, got[i], want[i])
+			}
+		}
+	})
+}
+
+func TestAgentPresetApprovalFlags(t *testing.T) {
+	t.Parallel()
+	// Verify permissive-approval flags are set correctly for each E2E tested agent.
 	tests := []struct {
 		preset  AgentPreset
 		wantArg string // At least this arg should be present
 	}{
 		{AgentClaude, "--dangerously-skip-permissions"},
 		{AgentGemini, "yolo"}, // Part of "--approval-mode yolo"
-		{AgentCodex, "--yolo"},
+		{AgentCodex, "--dangerously-bypass-approvals-and-sandbox"},
+		{AgentCopilot, "--yolo"},
 	}
 
 	for _, tt := range tests {
@@ -294,7 +498,7 @@ func TestBuildResumeCommand(t *testing.T) {
 			agentName: "codex",
 			sessionID: "codex-sess-789",
 			wantEmpty: false,
-			contains:  []string{"codex", "resume", "codex-sess-789", "--yolo"},
+			contains:  []string{"codex", "resume", "codex-sess-789", "--dangerously-bypass-approvals-and-sandbox"},
 		},
 		{
 			name:      "empty session ID",
@@ -302,6 +506,13 @@ func TestBuildResumeCommand(t *testing.T) {
 			sessionID: "",
 			wantEmpty: true,
 			contains:  []string{"claude"},
+		},
+		{
+			name:      "copilot flag style",
+			agentName: "copilot",
+			sessionID: "cea0d5f0-662a-4a98-9585-060b9d2a7a19",
+			wantEmpty: false,
+			contains:  []string{"copilot", "--yolo", "--resume", "cea0d5f0-662a-4a98-9585-060b9d2a7a19"},
 		},
 		{
 			name:      "unknown agent",
@@ -342,6 +553,7 @@ func TestSupportsSessionResume(t *testing.T) {
 		{"cursor", true},
 		{"auggie", true},
 		{"amp", true},
+		{"copilot", true},
 		{"unknown", false},
 	}
 
@@ -366,6 +578,7 @@ func TestGetSessionIDEnvVar(t *testing.T) {
 		{"cursor", ""},   // Cursor uses --resume with chatId directly
 		{"auggie", ""},   // Auggie uses --resume directly
 		{"amp", ""},      // AMP uses 'threads continue' subcommand
+		{"copilot", ""},  // Copilot stores session IDs on disk, not in env
 		{"unknown", ""},
 	}
 
@@ -391,6 +604,8 @@ func TestGetProcessNames(t *testing.T) {
 		{"auggie", []string{"auggie"}},
 		{"amp", []string{"amp"}},
 		{"opencode", []string{"opencode", "node", "bun"}},
+		{"copilot", []string{"copilot"}},
+		{"pi", []string{"pi", "node", "bun"}},
 		{"unknown", []string{"node", "claude"}}, // Falls back to Claude's process
 	}
 
@@ -413,7 +628,7 @@ func TestGetProcessNames(t *testing.T) {
 func TestListAgentPresetsMatchesConstants(t *testing.T) {
 	t.Parallel()
 	// Ensure all AgentPreset constants are returned by ListAgentPresets
-	allConstants := []AgentPreset{AgentClaude, AgentGemini, AgentCodex, AgentCursor, AgentAuggie, AgentAmp}
+	allConstants := []AgentPreset{AgentClaude, AgentGemini, AgentCodex, AgentCursor, AgentAuggie, AgentAmp, AgentOpenCode, AgentCopilot, AgentPi}
 	presets := ListAgentPresets()
 
 	// Convert to map for quick lookup
@@ -458,7 +673,7 @@ func TestAgentCommandGeneration(t *testing.T) {
 		{
 			preset:       AgentCodex,
 			wantCommand:  "codex",
-			wantContains: []string{"--yolo"},
+			wantContains: []string{"--dangerously-bypass-approvals-and-sandbox"},
 		},
 		{
 			preset:       AgentCursor,
@@ -474,6 +689,11 @@ func TestAgentCommandGeneration(t *testing.T) {
 			preset:       AgentAmp,
 			wantCommand:  "amp",
 			wantContains: []string{"--dangerously-allow-all", "--no-ide"},
+		},
+		{
+			preset:       AgentCopilot,
+			wantCommand:  "copilot",
+			wantContains: []string{"--yolo"},
 		},
 	}
 
@@ -735,13 +955,13 @@ func TestOpenCodeProviderDefaults(t *testing.T) {
 		t.Errorf("defaultReadyDelayMs(opencode) = %d, want 8000", delay)
 	}
 
-	// Test defaultProcessNames for opencode
+	// Test defaultProcessNames for opencode (from preset: opencode, node, bun)
 	names := defaultProcessNames("opencode", "opencode")
-	if len(names) != 2 {
-		t.Errorf("defaultProcessNames(opencode) length = %d, want 2", len(names))
+	if len(names) != 3 {
+		t.Errorf("defaultProcessNames(opencode) length = %d, want 3", len(names))
 	}
-	if names[0] != "opencode" || names[1] != "node" {
-		t.Errorf("defaultProcessNames(opencode) = %v, want [opencode, node]", names)
+	if len(names) >= 3 && (names[0] != "opencode" || names[1] != "node" || names[2] != "bun") {
+		t.Errorf("defaultProcessNames(opencode) = %v, want [opencode, node, bun]", names)
 	}
 
 	// Test defaultInstructionsFile for opencode
@@ -776,5 +996,262 @@ func TestOpenCodeRuntimeConfigFromPreset(t *testing.T) {
 	original := GetAgentPreset(AgentOpenCode)
 	if _, exists := original.Env["MUTATED"]; exists {
 		t.Error("Mutation of RuntimeConfig.Env affected original preset")
+	}
+}
+
+func TestCopilotAgentPreset(t *testing.T) {
+	t.Parallel()
+	info := GetAgentPreset(AgentCopilot)
+	if info == nil {
+		t.Fatal("copilot preset not found")
+	}
+
+	if info.Command != "copilot" {
+		t.Errorf("copilot command = %q, want copilot", info.Command)
+	}
+
+	hasYolo := false
+	for _, arg := range info.Args {
+		if arg == "--yolo" {
+			hasYolo = true
+		}
+	}
+	if !hasYolo {
+		t.Error("copilot args missing --yolo")
+	}
+
+	if len(info.ProcessNames) != 1 || info.ProcessNames[0] != "copilot" {
+		t.Errorf("copilot ProcessNames = %v, want [copilot]", info.ProcessNames)
+	}
+
+	if info.SessionIDEnv != "" {
+		t.Errorf("copilot SessionIDEnv = %q, want empty", info.SessionIDEnv)
+	}
+
+	if info.ResumeFlag != "--resume" {
+		t.Errorf("copilot ResumeFlag = %q, want --resume", info.ResumeFlag)
+	}
+	if info.ResumeStyle != "flag" {
+		t.Errorf("copilot ResumeStyle = %q, want flag", info.ResumeStyle)
+	}
+
+	if info.SupportsHooks {
+		t.Error("copilot should not support hooks (instructions file is not executable)")
+	}
+
+	if info.SupportsForkSession {
+		t.Error("copilot should not support fork session")
+	}
+
+	if info.NonInteractive == nil {
+		t.Fatal("copilot NonInteractive is nil")
+	}
+	if info.NonInteractive.PromptFlag != "-p" {
+		t.Errorf("copilot NonInteractive.PromptFlag = %q, want -p", info.NonInteractive.PromptFlag)
+	}
+}
+
+func TestPiAgentPreset(t *testing.T) {
+	t.Parallel()
+	info := GetAgentPreset(AgentPi)
+	if info == nil {
+		t.Fatal("pi preset not found")
+	}
+
+	if info.Command != "pi" {
+		t.Errorf("pi command = %q, want pi", info.Command)
+	}
+
+	if len(info.Args) != 0 {
+		t.Errorf("pi args = %v, want empty", info.Args)
+	}
+
+	if len(info.ProcessNames) != 3 {
+		t.Errorf("pi ProcessNames length = %d, want 3", len(info.ProcessNames))
+	}
+	expectedNames := []string{"pi", "node", "bun"}
+	for i, want := range expectedNames {
+		if i < len(info.ProcessNames) && info.ProcessNames[i] != want {
+			t.Errorf("pi ProcessNames[%d] = %q, want %q", i, info.ProcessNames[i], want)
+		}
+	}
+
+	if !info.SupportsHooks {
+		t.Error("pi should support hooks")
+	}
+
+	if info.SupportsForkSession {
+		t.Error("pi should not support fork session")
+	}
+
+	if info.SessionIDEnv != "PI_SESSION_ID" {
+		t.Errorf("pi SessionIDEnv = %q, want PI_SESSION_ID", info.SessionIDEnv)
+	}
+
+	if info.NonInteractive == nil {
+		t.Fatal("pi NonInteractive is nil")
+	}
+	if info.NonInteractive.PromptFlag != "-p" {
+		t.Errorf("pi NonInteractive.PromptFlag = %q, want -p", info.NonInteractive.PromptFlag)
+	}
+}
+
+func TestCopilotProviderDefaults(t *testing.T) {
+	t.Parallel()
+
+	cmd := defaultRuntimeCommand("copilot")
+	if cmd != "copilot" {
+		t.Errorf("defaultRuntimeCommand(copilot) = %q, want copilot", cmd)
+	}
+
+	args := defaultRuntimeArgs("copilot")
+	if len(args) != 1 || args[0] != "--yolo" {
+		t.Errorf("defaultRuntimeArgs(copilot) = %v, want [--yolo]", args)
+	}
+
+	mode := defaultPromptMode("copilot")
+	if mode != "arg" {
+		t.Errorf("defaultPromptMode(copilot) = %q, want arg", mode)
+	}
+
+	env := defaultSessionIDEnv("copilot")
+	if env != "" {
+		t.Errorf("defaultSessionIDEnv(copilot) = %q, want empty", env)
+	}
+
+	configEnv := defaultConfigDirEnv("copilot")
+	if configEnv != "" {
+		t.Errorf("defaultConfigDirEnv(copilot) = %q, want empty", configEnv)
+	}
+
+	provider := defaultHooksProvider("copilot")
+	if provider != "copilot" {
+		t.Errorf("defaultHooksProvider(copilot) = %q, want copilot", provider)
+	}
+
+	if !defaultHooksInformational("copilot") {
+		t.Error("defaultHooksInformational(copilot) should be true")
+	}
+	if defaultHooksInformational("claude") {
+		t.Error("defaultHooksInformational(claude) should be false")
+	}
+
+	dir := defaultHooksDir("copilot")
+	if dir != ".copilot" {
+		t.Errorf("defaultHooksDir(copilot) = %q, want .copilot", dir)
+	}
+
+	file := defaultHooksFile("copilot")
+	if file != "copilot-instructions.md" {
+		t.Errorf("defaultHooksFile(copilot) = %q, want copilot-instructions.md", file)
+	}
+
+	names := defaultProcessNames("copilot", "copilot")
+	if len(names) != 1 || names[0] != "copilot" {
+		t.Errorf("defaultProcessNames(copilot) = %v, want [copilot]", names)
+	}
+
+	prefix := defaultReadyPromptPrefix("copilot")
+	if prefix != "❯ " {
+		t.Errorf("defaultReadyPromptPrefix(copilot) = %q, want \"❯ \"", prefix)
+	}
+
+	delay := defaultReadyDelayMs("copilot")
+	if delay != 5000 {
+		t.Errorf("defaultReadyDelayMs(copilot) = %d, want 5000", delay)
+	}
+
+	instFile := defaultInstructionsFile("copilot")
+	if instFile != "AGENTS.md" {
+		t.Errorf("defaultInstructionsFile(copilot) = %q, want AGENTS.md", instFile)
+	}
+}
+
+func TestCopilotRuntimeConfigFromPreset(t *testing.T) {
+	t.Parallel()
+	rc := RuntimeConfigFromPreset(AgentCopilot)
+	if rc == nil {
+		t.Fatal("RuntimeConfigFromPreset(copilot) returned nil")
+	}
+
+	if rc.Command != "copilot" {
+		t.Errorf("RuntimeConfig.Command = %q, want copilot", rc.Command)
+	}
+
+	if len(rc.Args) != 1 || rc.Args[0] != "--yolo" {
+		t.Errorf("RuntimeConfig.Args = %v, want [--yolo]", rc.Args)
+	}
+
+	if rc.Env != nil && len(rc.Env) > 0 {
+		t.Errorf("Expected nil/empty Env for Copilot preset, got %v", rc.Env)
+	}
+}
+
+func TestPiProviderDefaults(t *testing.T) {
+	t.Parallel()
+
+	input := &RuntimeConfig{Command: "pi"}
+	result := fillRuntimeDefaults(input)
+
+	if result.Tmux == nil {
+		t.Fatal("fillRuntimeDefaults(pi) should auto-fill Tmux")
+	}
+	if result.Tmux.ReadyDelayMs != 3000 {
+		t.Errorf("Tmux.ReadyDelayMs = %d, want 3000", result.Tmux.ReadyDelayMs)
+	}
+	wantNames := []string{"pi", "node", "bun"}
+	if len(result.Tmux.ProcessNames) != len(wantNames) {
+		t.Errorf("Tmux.ProcessNames = %v, want %v", result.Tmux.ProcessNames, wantNames)
+	}
+
+	if result.PromptMode != "arg" {
+		t.Errorf("PromptMode = %q, want arg", result.PromptMode)
+	}
+
+	if result.Hooks == nil {
+		t.Fatal("fillRuntimeDefaults(pi) should auto-fill Hooks")
+	}
+	if result.Hooks.Provider != "pi" {
+		t.Errorf("Hooks.Provider = %q, want pi", result.Hooks.Provider)
+	}
+}
+
+func TestPiRuntimeConfigFromPreset(t *testing.T) {
+	t.Parallel()
+	rc := RuntimeConfigFromPreset(AgentPi)
+	if rc == nil {
+		t.Fatal("RuntimeConfigFromPreset(pi) returned nil")
+	}
+
+	if rc.Command != "pi" {
+		t.Errorf("RuntimeConfig.Command = %q, want pi", rc.Command)
+	}
+
+	if rc.Env != nil && len(rc.Env) > 0 {
+		t.Errorf("Expected nil/empty Env for Pi preset, got %v", rc.Env)
+	}
+}
+
+// TestAllHookSupportingAgentsHaveHookFields ensures that every built-in preset
+// with SupportsHooks=true also declares the three fields required by the hooks
+// install path: HooksProvider, HooksDir, and HooksSettingsFile.
+//
+// If this test fails, add the missing fields to the offending preset in
+// builtinPresets (agents.go) before setting SupportsHooks=true.
+func TestAllHookSupportingAgentsHaveHookFields(t *testing.T) {
+	t.Parallel()
+	for name, preset := range builtinPresets {
+		if !preset.SupportsHooks {
+			continue
+		}
+		if preset.HooksProvider == "" {
+			t.Errorf("agent %q: SupportsHooks=true but HooksProvider is empty", name)
+		}
+		if preset.HooksDir == "" {
+			t.Errorf("agent %q: SupportsHooks=true but HooksDir is empty", name)
+		}
+		if preset.HooksSettingsFile == "" {
+			t.Errorf("agent %q: SupportsHooks=true but HooksSettingsFile is empty", name)
+		}
 	}
 }

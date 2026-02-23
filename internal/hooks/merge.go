@@ -9,6 +9,8 @@ import (
 )
 
 // MergeHooks merges a base config with applicable overrides for a target.
+// It does NOT incorporate built-in defaults from DefaultOverrides(); callers
+// that need the full production merge should use ComputeExpected() instead.
 //
 // Merge rules:
 //  1. Start with base hooks
@@ -79,6 +81,8 @@ func applyOverride(result, override *HooksConfig) *HooksConfig {
 	result.Stop = mergeEntries(result.Stop, override.Stop)
 	result.PreCompact = mergeEntries(result.PreCompact, override.PreCompact)
 	result.UserPromptSubmit = mergeEntries(result.UserPromptSubmit, override.UserPromptSubmit)
+	result.WorktreeCreate = mergeEntries(result.WorktreeCreate, override.WorktreeCreate)
+	result.WorktreeRemove = mergeEntries(result.WorktreeRemove, override.WorktreeRemove)
 	return result
 }
 
@@ -134,6 +138,8 @@ func cloneConfig(cfg *HooksConfig) *HooksConfig {
 		Stop:             cloneEntries(cfg.Stop),
 		PreCompact:       cloneEntries(cfg.PreCompact),
 		UserPromptSubmit: cloneEntries(cfg.UserPromptSubmit),
+		WorktreeCreate:   cloneEntries(cfg.WorktreeCreate),
+		WorktreeRemove:   cloneEntries(cfg.WorktreeRemove),
 	}
 }
 

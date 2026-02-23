@@ -7,6 +7,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/dog"
+	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -55,6 +56,7 @@ type DogDispatchOptions struct {
 	Create            bool   // Create dog if it doesn't exist
 	WorkDesc          string // Work description (formula or bead ID)
 	DelaySessionStart bool   // If true, don't start session (caller will start later)
+	AgentOverride     string // Agent override (e.g., "codex", "gemini")
 }
 
 // DogDispatchInfo contains information about a dog dispatch.
@@ -68,6 +70,7 @@ type DogDispatchInfo struct {
 	sessionDelayed bool
 	townRoot       string
 	workDesc       string
+	agentOverride  string
 	rigsConfig     *config.RigsConfig
 }
 
@@ -157,6 +160,7 @@ func DispatchToDog(dogName string, opts DogDispatchOptions) (*DogDispatchInfo, e
 			sessionDelayed: true,
 			townRoot:       townRoot,
 			workDesc:       opts.WorkDesc,
+			agentOverride:  opts.AgentOverride,
 			rigsConfig:     rigsConfig,
 		}, nil
 	}
@@ -166,12 +170,13 @@ func DispatchToDog(dogName string, opts DogDispatchOptions) (*DogDispatchInfo, e
 	sessMgr := dog.NewSessionManager(t, townRoot, mgr)
 
 	sessOpts := dog.SessionStartOptions{
-		WorkDesc: opts.WorkDesc,
+		WorkDesc:      opts.WorkDesc,
+		AgentOverride: opts.AgentOverride,
 	}
 	pane, err := sessMgr.EnsureRunning(targetDog.Name, sessOpts)
 	if err != nil {
 		// Log but don't fail - dog state is set, session may start later
-		fmt.Printf("Warning: could not start dog session: %v\n", err)
+		style.PrintWarning("could not start dog session: %v", err)
 		pane = ""
 	}
 
@@ -195,7 +200,8 @@ func (d *DogDispatchInfo) StartDelayedSession() (string, error) {
 	sessMgr := dog.NewSessionManager(t, d.townRoot, mgr)
 
 	opts := dog.SessionStartOptions{
-		WorkDesc: d.workDesc,
+		WorkDesc:      d.workDesc,
+		AgentOverride: d.agentOverride,
 	}
 	pane, err := sessMgr.EnsureRunning(d.DogName, opts)
 	if err != nil {

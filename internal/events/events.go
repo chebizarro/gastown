@@ -68,6 +68,12 @@ const (
 	TypeMerged       = "merged"
 	TypeMergeFailed  = "merge_failed"
 	TypeMergeSkipped = "merge_skipped"
+
+	// Scheduler events
+	TypeSchedulerEnqueue        = "scheduler_enqueue"         // Bead scheduled for deferred dispatch
+	TypeSchedulerDispatch       = "scheduler_dispatch"        // Bead dispatched from scheduler
+	TypeSchedulerDispatchFailed = "scheduler_dispatch_failed" // Bead dispatch failed (requeued)
+	TypeSchedulerCloseRetry     = "scheduler_close_retry"     // Context close needed last-resort attempt
 )
 
 // EventsFile is the name of the raw events log.
@@ -129,9 +135,9 @@ func write(event Event) error {
 	if err != nil {
 		return fmt.Errorf("opening events file: %w", err)
 	}
-	defer f.Close()
 
 	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
 		return fmt.Errorf("writing event: %w", err)
 	}
 
@@ -150,6 +156,10 @@ func write(event Event) error {
 		}
 	}
 	go publishToNostr(eventCopy)
+
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("closing events file: %w", err)
+	}
 
 	return nil
 }
@@ -347,4 +357,30 @@ func SessionPayload(sessionID, role, topic, cwd string) map[string]interface{} {
 		p["cwd"] = cwd
 	}
 	return p
+}
+
+// SchedulerEnqueuePayload creates a payload for scheduler enqueue events.
+func SchedulerEnqueuePayload(beadID, rig string) map[string]interface{} {
+	return map[string]interface{}{
+		"bead": beadID,
+		"rig":  rig,
+	}
+}
+
+// SchedulerDispatchPayload creates a payload for scheduler dispatch events.
+func SchedulerDispatchPayload(beadID, rig, polecat string) map[string]interface{} {
+	return map[string]interface{}{
+		"bead":    beadID,
+		"rig":     rig,
+		"polecat": polecat,
+	}
+}
+
+// SchedulerDispatchFailedPayload creates a payload for scheduler dispatch failure events.
+func SchedulerDispatchFailedPayload(beadID, rig, errMsg string) map[string]interface{} {
+	return map[string]interface{}{
+		"bead":  beadID,
+		"rig":   rig,
+		"error": errMsg,
+	}
 }

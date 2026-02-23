@@ -411,10 +411,9 @@ func TestRigAddCreatesCorrectStructure(t *testing.T) {
 		t.Errorf("refinery/rig/.git should be a file (worktree), not a directory")
 	}
 
-	// NOTE: Claude settings are no longer installed by gt rig add.
-	// Settings are now installed at parent directories (e.g., witness/.claude/settings.json)
-	// by each agent at startup time, and passed to Claude via --settings flag.
-	// Verify NO settings exist at parent directories yet (gt rig add doesn't create them).
+	// NOTE: Most agent settings are installed at startup time, not by gt rig add.
+	// Exception: polecats/.claude/ is scaffolded by gt rig add so polecat sessions
+	// don't fail on startup due to missing hooks (gt-ke4mj).
 	parentSettingsThatShouldNotExist := []struct {
 		path string
 		desc string
@@ -422,13 +421,22 @@ func TestRigAddCreatesCorrectStructure(t *testing.T) {
 		{filepath.Join(rigPath, "witness", ".claude", "settings.json"), "witness/.claude/settings.json"},
 		{filepath.Join(rigPath, "refinery", ".claude", "settings.json"), "refinery/.claude/settings.json"},
 		{filepath.Join(rigPath, "crew", ".claude", "settings.json"), "crew/.claude/settings.json"},
-		{filepath.Join(rigPath, "polecats", ".claude", "settings.json"), "polecats/.claude/settings.json"},
 	}
 
 	for _, s := range parentSettingsThatShouldNotExist {
 		if _, err := os.Stat(s.path); err == nil {
 			t.Errorf("%s should NOT exist after gt rig add (agents install settings at startup)", s.desc)
 		}
+	}
+
+	// Polecats settings should be scaffolded by gt rig add (gt-ke4mj).
+	polecatSettings := filepath.Join(rigPath, "polecats", ".claude", "settings.json")
+	if _, err := os.Stat(polecatSettings); os.IsNotExist(err) {
+		t.Errorf("polecats/.claude/settings.json should exist after gt rig add (scaffolded for polecat startup)")
+	}
+	polecatHandoff := filepath.Join(rigPath, "polecats", ".claude", "commands", "handoff.md")
+	if _, err := os.Stat(polecatHandoff); os.IsNotExist(err) {
+		t.Errorf("polecats/.claude/commands/handoff.md should exist after gt rig add (scaffolded for polecat startup)")
 	}
 
 	// NOTE: No per-directory CLAUDE.md/AGENTS.md is created at agent level.
@@ -532,47 +540,18 @@ func TestRigAddInitializesBeads(t *testing.T) {
 		}
 	}
 
-	// =========================================================================
-	// IMPORTANT: Verify routes.jsonl does NOT exist in the rig's .beads directory
-	// =========================================================================
-	//
-	// WHY WE DON'T CREATE routes.jsonl IN RIG DIRECTORIES:
-	//
-	// 1. BD'S WALK-UP ROUTING MECHANISM:
-	//    When bd needs to find routing configuration, it walks up the directory
-	//    tree looking for a .beads directory with routes.jsonl. It stops at the
-	//    first routes.jsonl it finds. If a rig has its own routes.jsonl, bd will
-	//    use that and NEVER reach the town-level routes.jsonl, breaking cross-rig
-	//    routing entirely.
-	//
-	// 2. TOWN-LEVEL ROUTING IS THE SOURCE OF TRUTH:
-	//    All routing configuration belongs in the town's .beads/routes.jsonl.
-	//    This single file contains prefix->path mappings for ALL rigs, enabling
-	//    bd to route issue IDs like "tr-123" to the correct rig directory.
-	//
-	// 3. HISTORICAL BUG - BD AUTO-EXPORT CORRUPTION:
-	//    There was a bug where bd's auto-export feature would write issue data
-	//    to routes.jsonl if issues.jsonl didn't exist. This corrupted routing
-	//    config with issue JSON objects. We now create empty issues.jsonl files
-	//    proactively to prevent this, but we also verify routes.jsonl doesn't
-	//    exist as a defense-in-depth measure.
-	//
-	// 4. DOCTOR CHECK EXISTS:
-	//    The "rig-routes-jsonl" doctor check detects and can fix (delete) any
-	//    routes.jsonl files that appear in rig .beads directories.
-	//
-	// If you're modifying rig creation and thinking about adding routes.jsonl
-	// to the rig's .beads directory - DON'T. It will break cross-rig routing.
-	// =========================================================================
+	// Verify routes.jsonl does NOT exist in rig .beads — routing belongs at town level.
+	// bd walks up the directory tree to find routes.jsonl; a rig-level copy would
+	// shadow the town-level routes and break cross-rig routing.
 	rigRoutesPath := filepath.Join(beadsDir, "routes.jsonl")
 	if _, err := os.Stat(rigRoutesPath); err == nil {
 		t.Errorf("routes.jsonl should NOT exist in rig .beads directory (breaks bd walk-up routing)")
 	}
 
-	// Verify issues.jsonl DOES exist (prevents bd auto-export corruption)
+	// Verify issues.jsonl exists (bd expects this for git-tracked issue data).
 	rigIssuesPath := filepath.Join(beadsDir, "issues.jsonl")
 	if _, err := os.Stat(rigIssuesPath); err != nil {
-		t.Errorf("issues.jsonl should exist in rig .beads directory (prevents auto-export corruption): %v", err)
+		t.Errorf("issues.jsonl should exist in rig .beads directory: %v", err)
 	}
 }
 
@@ -985,6 +964,7 @@ func TestAgentWorktreesStayClean(t *testing.T) {
 	if _, err := exec.LookPath("bd"); err != nil {
 		t.Skip("bd not installed, skipping integration test")
 	}
+	requireDoltServer(t)
 
 	testCases := []struct {
 		name            string
@@ -1015,6 +995,7 @@ func runAgentCleanTest(t *testing.T, hasTrackedBeads bool) {
 	t.Helper()
 
 	tmpDir := t.TempDir()
+	configureTestGitIdentity(t, tmpDir)
 	hqPath := filepath.Join(tmpDir, "test-hq")
 
 	// Build gt binary for testing

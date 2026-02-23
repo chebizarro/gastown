@@ -93,6 +93,48 @@ func TestParsePolecatDone_InvalidSubject(t *testing.T) {
 	}
 }
 
+func TestParsePolecatDone_MRFailed(t *testing.T) {
+	subject := "POLECAT_DONE nux"
+	body := `Exit: COMPLETED
+Issue: gt-abc123
+Branch: polecat/nux-abc123
+MRFailed: true
+Errors: MR bead creation failed: connection refused`
+
+	payload, err := ParsePolecatDone(subject, body)
+	if err != nil {
+		t.Fatalf("ParsePolecatDone() error = %v", err)
+	}
+
+	if !payload.MRFailed {
+		t.Error("MRFailed = false, want true")
+	}
+	if payload.MRID != "" {
+		t.Errorf("MRID = %q, want empty when MR failed", payload.MRID)
+	}
+	if payload.Exit != "COMPLETED" {
+		t.Errorf("Exit = %q, want COMPLETED", payload.Exit)
+	}
+}
+
+func TestParsePolecatDone_MRFailedAbsent(t *testing.T) {
+	// When MRFailed is not in the body, it should default to false
+	subject := "POLECAT_DONE nux"
+	body := `Exit: COMPLETED
+Issue: gt-abc123
+MR: gt-mr-xyz
+Branch: polecat/nux-abc123`
+
+	payload, err := ParsePolecatDone(subject, body)
+	if err != nil {
+		t.Fatalf("ParsePolecatDone() error = %v", err)
+	}
+
+	if payload.MRFailed {
+		t.Error("MRFailed = true, want false when not in body")
+	}
+}
+
 func TestParseHelp(t *testing.T) {
 	subject := "HELP: Tests failing on CI"
 	body := `Agent: gastown/polecats/nux
@@ -274,6 +316,55 @@ func TestParseMergeReady_InvalidSubject(t *testing.T) {
 	_, err := ParseMergeReady("Not a merge ready", "body")
 	if err == nil {
 		t.Error("ParseMergeReady() expected error for invalid subject")
+	}
+}
+
+func TestParseSwarmStart(t *testing.T) {
+	body := `SwarmID: batch-123
+Beads: bd-a, bd-b, bd-c
+Total: 3`
+
+	payload, err := ParseSwarmStart(body)
+	if err != nil {
+		t.Fatalf("ParseSwarmStart() error = %v", err)
+	}
+
+	if payload.SwarmID != "batch-123" {
+		t.Errorf("SwarmID = %q, want %q", payload.SwarmID, "batch-123")
+	}
+	if payload.Total != 3 {
+		t.Errorf("Total = %d, want %d", payload.Total, 3)
+	}
+	expectedBeads := []string{"bd-a", "bd-b", "bd-c"}
+	if len(payload.BeadIDs) != len(expectedBeads) {
+		t.Fatalf("BeadIDs has %d items, want %d", len(payload.BeadIDs), len(expectedBeads))
+	}
+	for i, b := range payload.BeadIDs {
+		if b != expectedBeads[i] {
+			t.Errorf("BeadIDs[%d] = %q, want %q", i, b, expectedBeads[i])
+		}
+	}
+	if payload.StartedAt.IsZero() {
+		t.Error("StartedAt should not be zero")
+	}
+}
+
+func TestParseSwarmStart_MinimalBody(t *testing.T) {
+	body := "SwarmID: batch-456"
+
+	payload, err := ParseSwarmStart(body)
+	if err != nil {
+		t.Fatalf("ParseSwarmStart() error = %v", err)
+	}
+
+	if payload.SwarmID != "batch-456" {
+		t.Errorf("SwarmID = %q, want %q", payload.SwarmID, "batch-456")
+	}
+	if payload.Total != 0 {
+		t.Errorf("Total = %d, want 0", payload.Total)
+	}
+	if len(payload.BeadIDs) != 0 {
+		t.Errorf("BeadIDs = %v, want empty", payload.BeadIDs)
 	}
 }
 

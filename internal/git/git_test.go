@@ -535,6 +535,37 @@ func TestCloneBareHasOriginRefs(t *testing.T) {
 	}
 }
 
+func TestIsEmpty_EmptyRepo(t *testing.T) {
+	dir := t.TempDir()
+	cmd := exec.Command("git", "init")
+	cmd.Dir = dir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+
+	g := NewGit(dir)
+	empty, err := g.IsEmpty()
+	if err != nil {
+		t.Fatalf("IsEmpty: %v", err)
+	}
+	if !empty {
+		t.Error("expected newly-initialized repo to be empty")
+	}
+}
+
+func TestIsEmpty_RepoWithCommit(t *testing.T) {
+	dir := initTestRepo(t)
+	g := NewGit(dir)
+
+	empty, err := g.IsEmpty()
+	if err != nil {
+		t.Fatalf("IsEmpty: %v", err)
+	}
+	if empty {
+		t.Error("expected repo with commits to not be empty")
+	}
+}
+
 func TestRefExists_ValidRef(t *testing.T) {
 	dir := initTestRepo(t)
 	g := NewGit(dir)
@@ -998,5 +1029,528 @@ func TestFetchPrune(t *testing.T) {
 	}
 	if exists {
 		t.Error("expected remote tracking branch to be pruned")
+	}
+}
+
+// initTestRepoWithSubmodule creates a parent repo with a submodule for testing.
+// Returns parentDir, submoduleRemoteDir (bare).
+func initTestRepoWithSubmodule(t *testing.T) (string, string) {
+	t.Helper()
+	tmp := t.TempDir()
+
+	// Create a "remote" bare repo for the submodule
+	subRemote := filepath.Join(tmp, "sub-remote.git")
+	runGit(t, tmp, "init", "--bare", "--initial-branch", "main", subRemote)
+
+	// Create a working clone of the submodule to add content
+	subWork := filepath.Join(tmp, "sub-work")
+	runGit(t, tmp, "clone", subRemote, subWork)
+	runGit(t, subWork, "config", "user.email", "test@test.com")
+	runGit(t, subWork, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(subWork, "lib.go"), []byte("package lib\n"), 0644); err != nil {
+		t.Fatalf("write sub file: %v", err)
+	}
+	runGit(t, subWork, "add", ".")
+	runGit(t, subWork, "commit", "-m", "initial sub commit")
+	runGit(t, subWork, "push", "origin", "main")
+
+	// Create the parent repo
+	parent := filepath.Join(tmp, "parent")
+	runGit(t, tmp, "init", "--initial-branch", "main", parent)
+	runGit(t, parent, "config", "user.email", "test@test.com")
+	runGit(t, parent, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(parent, "README.md"), []byte("# Parent\n"), 0644); err != nil {
+		t.Fatalf("write parent file: %v", err)
+	}
+	runGit(t, parent, "add", ".")
+	runGit(t, parent, "commit", "-m", "initial parent commit")
+
+	// Add the submodule
+	runGit(t, parent, "submodule", "add", subRemote, "libs/sub")
+	runGit(t, parent, "commit", "-m", "add submodule")
+
+	return parent, subRemote
+}
+
+func runGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	// Prepend -c protocol.file.allow=always to allow local file:// transport
+	fullArgs := append([]string{"-c", "protocol.file.allow=always"}, args...)
+	cmd := exec.Command("git", fullArgs...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
+	}
+}
+
+func TestInitSubmodules_NoSubmodules(t *testing.T) {
+	dir := initTestRepo(t)
+	// Should be a no-op, not an error
+	if err := InitSubmodules(dir); err != nil {
+		t.Fatalf("InitSubmodules on repo without submodules: %v", err)
+	}
+}
+
+func TestInitSubmodules_WithSubmodules(t *testing.T) {
+	parent, _ := initTestRepoWithSubmodule(t)
+
+	// The submodule should already be initialized from the test setup
+	libFile := filepath.Join(parent, "libs", "sub", "lib.go")
+	if _, err := os.Stat(libFile); err != nil {
+		t.Fatalf("expected submodule file to exist after setup: %v", err)
+	}
+
+	// Now test that InitSubmodules works on a fresh clone
+	tmp := t.TempDir()
+	cloneDest := filepath.Join(tmp, "clone")
+	// Clone without --recurse-submodules to simulate current behavior
+	cmd := exec.Command("git", "-c", "protocol.file.allow=always", "clone", parent, cloneDest)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("clone: %v\n%s", err, out)
+	}
+
+	// Submodule dir exists but is empty
+	subDir := filepath.Join(cloneDest, "libs", "sub")
+	entries, _ := os.ReadDir(subDir)
+	if len(entries) > 0 {
+		t.Fatal("expected empty submodule dir before init")
+	}
+
+	// Allow file:// transport for submodule init in test environment
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "protocol.file.allow")
+	t.Setenv("GIT_CONFIG_VALUE_0", "always")
+
+	// InitSubmodules should populate it
+	if err := InitSubmodules(cloneDest); err != nil {
+		t.Fatalf("InitSubmodules: %v", err)
+	}
+
+	libFile = filepath.Join(cloneDest, "libs", "sub", "lib.go")
+	if _, err := os.Stat(libFile); err != nil {
+		t.Fatalf("expected submodule file after InitSubmodules: %v", err)
+	}
+}
+
+func TestSubmoduleChanges(t *testing.T) {
+	parent, subRemote := initTestRepoWithSubmodule(t)
+
+	// Create a branch with a submodule change
+	runGit(t, parent, "checkout", "-b", "feature")
+
+	// Make a new commit in the submodule
+	subPath := filepath.Join(parent, "libs", "sub")
+	if err := os.WriteFile(filepath.Join(subPath, "new.go"), []byte("package lib\n// new\n"), 0644); err != nil {
+		t.Fatalf("write new sub file: %v", err)
+	}
+	runGit(t, subPath, "add", ".")
+	runGit(t, subPath, "commit", "-m", "new sub commit")
+	runGit(t, subPath, "push", "origin", "HEAD:main")
+
+	// Update the parent's submodule pointer
+	runGit(t, parent, "add", "libs/sub")
+	runGit(t, parent, "commit", "-m", "update submodule pointer")
+
+	// Now check for submodule changes between main and feature
+	g := NewGit(parent)
+	changes, err := g.SubmoduleChanges("main", "feature")
+	if err != nil {
+		t.Fatalf("SubmoduleChanges: %v", err)
+	}
+
+	if len(changes) != 1 {
+		t.Fatalf("expected 1 submodule change, got %d", len(changes))
+	}
+
+	sc := changes[0]
+	if sc.Path != "libs/sub" {
+		t.Errorf("expected path libs/sub, got %s", sc.Path)
+	}
+	if sc.OldSHA == "" {
+		t.Error("expected non-empty OldSHA")
+	}
+	if sc.NewSHA == "" {
+		t.Error("expected non-empty NewSHA")
+	}
+	if sc.OldSHA == sc.NewSHA {
+		t.Error("expected different SHAs")
+	}
+	if sc.URL != subRemote {
+		t.Errorf("expected URL %s, got %s", subRemote, sc.URL)
+	}
+}
+
+func TestSubmoduleChanges_NoSubmodules(t *testing.T) {
+	dir := initTestRepo(t)
+
+	// Create a branch with a regular file change
+	runGit(t, dir, "checkout", "-b", "feature")
+	if err := os.WriteFile(filepath.Join(dir, "new.txt"), []byte("hello\n"), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	runGit(t, dir, "add", ".")
+	runGit(t, dir, "commit", "-m", "add file")
+
+	// Detect the default branch name (may be "main" or "master" depending on git config)
+	cmd := exec.Command("git", "-C", dir, "rev-parse", "--verify", "main")
+	defaultBranch := "main"
+	if cmd.Run() != nil {
+		defaultBranch = "master"
+	}
+
+	g := NewGit(dir)
+	changes, err := g.SubmoduleChanges(defaultBranch, "feature")
+	if err != nil {
+		t.Fatalf("SubmoduleChanges: %v", err)
+	}
+	if len(changes) != 0 {
+		t.Fatalf("expected 0 submodule changes, got %d", len(changes))
+	}
+}
+
+func TestPushSubmoduleCommit(t *testing.T) {
+	parent, subRemote := initTestRepoWithSubmodule(t)
+
+	// Make a new commit in the submodule (but don't push it)
+	subPath := filepath.Join(parent, "libs", "sub")
+	if err := os.WriteFile(filepath.Join(subPath, "pushed.go"), []byte("package lib\n// pushed\n"), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	runGit(t, subPath, "add", ".")
+	runGit(t, subPath, "commit", "-m", "unpushed commit")
+
+	// Get the SHA of the new commit
+	cmd := exec.Command("git", "-C", subPath, "rev-parse", "HEAD")
+	shaBytes, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	sha := strings.TrimSpace(string(shaBytes))
+
+	// Verify it's not on the remote yet
+	lsCmd := exec.Command("git", "ls-remote", subRemote, "refs/heads/main")
+	lsOut, _ := lsCmd.Output()
+	remoteSHA := strings.Fields(string(lsOut))[0]
+	if remoteSHA == sha {
+		t.Fatal("commit should not be on remote yet")
+	}
+
+	// Push it using PushSubmoduleCommit
+	g := NewGit(parent)
+	if err := g.PushSubmoduleCommit("libs/sub", sha, "origin"); err != nil {
+		t.Fatalf("PushSubmoduleCommit: %v", err)
+	}
+
+	// Verify it's now on the remote
+	lsCmd = exec.Command("git", "ls-remote", subRemote, "refs/heads/main")
+	lsOut, _ = lsCmd.Output()
+	remoteSHA = strings.Fields(string(lsOut))[0]
+	if remoteSHA != sha {
+		t.Errorf("expected remote main to be %s, got %s", sha, remoteSHA)
+	}
+}
+
+func TestConfigurePushURL(t *testing.T) {
+	dir := initTestRepo(t)
+	g := NewGit(dir)
+
+	// Add a remote
+	cmd := exec.Command("git", "remote", "add", "origin", "https://github.com/upstream/repo.git")
+	cmd.Dir = dir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("add remote: %v", err)
+	}
+
+	// Configure push URL
+	pushURL := "https://github.com/fork/repo.git"
+	if err := g.ConfigurePushURL("origin", pushURL); err != nil {
+		t.Fatalf("ConfigurePushURL: %v", err)
+	}
+
+	// Verify via GetPushURL
+	got, err := g.GetPushURL("origin")
+	if err != nil {
+		t.Fatalf("GetPushURL: %v", err)
+	}
+	if got != pushURL {
+		t.Errorf("GetPushURL = %q, want %q", got, pushURL)
+	}
+
+	// Verify fetch URL is unchanged
+	fetchCmd := exec.Command("git", "remote", "get-url", "origin")
+	fetchCmd.Dir = dir
+	out, err := fetchCmd.Output()
+	if err != nil {
+		t.Fatalf("get fetch url: %v", err)
+	}
+	fetchURL := strings.TrimSpace(string(out))
+	if fetchURL != "https://github.com/upstream/repo.git" {
+		t.Errorf("fetch URL changed to %q, should be unchanged", fetchURL)
+	}
+}
+
+func TestGetPushURL_NoPushURL(t *testing.T) {
+	dir := initTestRepo(t)
+	g := NewGit(dir)
+
+	// Add remote without custom push URL
+	cmd := exec.Command("git", "remote", "add", "origin", "https://github.com/upstream/repo.git")
+	cmd.Dir = dir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("add remote: %v", err)
+	}
+
+	// GetPushURL returns fetch URL when no custom push URL is set
+	got, err := g.GetPushURL("origin")
+	if err != nil {
+		t.Fatalf("GetPushURL: %v", err)
+	}
+	if got != "https://github.com/upstream/repo.git" {
+		t.Errorf("GetPushURL = %q, want fetch URL when no push URL configured", got)
+	}
+}
+
+// TestStashCount_FiltersByBranch verifies that StashCount only counts stashes
+// belonging to the current branch, not stashes from other worktrees/branches.
+// Git stashes are repo-wide (stored in .git/refs/stash), so without filtering
+// a worktree would see sibling stashes and block Remove(force=true).
+func TestStashCount_FiltersByBranch(t *testing.T) {
+	t.Parallel()
+	dir := initTestRepo(t)
+	g := NewGit(dir)
+
+	// Create a stash on the default branch
+	if err := os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("dirty"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("git", "add", ".")
+	cmd.Dir = dir
+	_ = cmd.Run()
+	cmd = exec.Command("git", "stash", "push", "-m", "main-stash")
+	cmd.Dir = dir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git stash: %v", err)
+	}
+
+	// Create a worktree on a different branch
+	wtDir := t.TempDir()
+	cmd = exec.Command("git", "worktree", "add", wtDir, "-b", "polecat-branch")
+	cmd.Dir = dir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git worktree add: %v", err)
+	}
+
+	// StashCount from worktree should be 0 (stash belongs to main, not polecat-branch)
+	wtGit := NewGit(wtDir)
+	count, err := wtGit.StashCount()
+	if err != nil {
+		t.Fatalf("StashCount: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("StashCount from worktree = %d, want 0 (stash belongs to different branch)", count)
+	}
+
+	// StashCount from main repo should be 1
+	mainCount, err := g.StashCount()
+	if err != nil {
+		t.Fatalf("StashCount: %v", err)
+	}
+	if mainCount != 1 {
+		t.Errorf("StashCount from main = %d, want 1", mainCount)
+	}
+
+	// Create a stash on the worktree branch
+	if err := os.WriteFile(filepath.Join(wtDir, "wt-dirty.txt"), []byte("wt-dirty"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmd = exec.Command("git", "add", ".")
+	cmd.Dir = wtDir
+	_ = cmd.Run()
+	cmd = exec.Command("git", "stash", "push", "-m", "wt-stash")
+	cmd.Dir = wtDir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git stash in worktree: %v", err)
+	}
+
+	// Now worktree should see 1 (its own stash)
+	count, err = wtGit.StashCount()
+	if err != nil {
+		t.Fatalf("StashCount: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("StashCount from worktree after own stash = %d, want 1", count)
+	}
+
+	// Main repo should still see 1 (only its own stash)
+	mainCount, err = g.StashCount()
+	if err != nil {
+		t.Fatalf("StashCount: %v", err)
+	}
+	if mainCount != 1 {
+		t.Errorf("StashCount from main after worktree stash = %d, want 1", mainCount)
+	}
+}
+
+// TestStashCount_DetachedHEAD verifies that StashCount counts all stashes
+// when in detached HEAD state (cannot determine branch, falls back to counting all).
+func TestStashCount_DetachedHEAD(t *testing.T) {
+	t.Parallel()
+	dir := initTestRepo(t)
+	g := NewGit(dir)
+
+	// Create a stash on main
+	if err := os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("dirty"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("git", "add", ".")
+	cmd.Dir = dir
+	_ = cmd.Run()
+	cmd = exec.Command("git", "stash", "push", "-m", "some-stash")
+	cmd.Dir = dir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git stash: %v", err)
+	}
+
+	// Detach HEAD
+	cmd = exec.Command("git", "checkout", "--detach")
+	cmd.Dir = dir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git checkout --detach: %v", err)
+	}
+
+	// In detached HEAD, StashCount should count all stashes (safe fallback)
+	count, err := g.StashCount()
+	if err != nil {
+		t.Fatalf("StashCount: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("StashCount in detached HEAD = %d, want 1 (should count all stashes)", count)
+	}
+}
+
+// TestStashCount_CustomMessage verifies that StashCount handles both
+// "WIP on <branch>:" (auto-stash) and "On <branch>:" (custom message) formats.
+func TestStashCount_CustomMessage(t *testing.T) {
+	t.Parallel()
+	dir := initTestRepo(t)
+	g := NewGit(dir)
+
+	// Create a stash with custom message (produces "On <branch>: <message>" format)
+	if err := os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("dirty"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("git", "add", ".")
+	cmd.Dir = dir
+	_ = cmd.Run()
+	cmd = exec.Command("git", "stash", "push", "-m", "my custom message")
+	cmd.Dir = dir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git stash: %v", err)
+	}
+
+	// Should count the custom-message stash on current branch
+	count, err := g.StashCount()
+	if err != nil {
+		t.Fatalf("StashCount: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("StashCount with custom message stash = %d, want 1", count)
+	}
+}
+
+// TestStashCount_NoFalsePositiveFromCommitMessage verifies that a stash
+// from branch "develop" with commit message containing "on fix:" does NOT
+// match when the current branch is "fix".
+func TestStashCount_NoFalsePositiveFromCommitMessage(t *testing.T) {
+	t.Parallel()
+	dir := initTestRepo(t)
+
+	// Create branch "develop" and make a commit with message containing "on fix:"
+	cmd := exec.Command("git", "checkout", "-b", "develop")
+	cmd.Dir = dir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git checkout -b develop: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "work.txt"), []byte("work on fix: edge case"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmd = exec.Command("git", "add", ".")
+	cmd.Dir = dir
+	_ = cmd.Run()
+	cmd = exec.Command("git", "commit", "-m", "work on fix: edge case")
+	cmd.Dir = dir
+	_ = cmd.Run()
+
+	// Create a stash on "develop" — its reflog line will contain "on fix:" in the
+	// commit message, but the branch prefix is "WIP on develop:"
+	if err := os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("dirty"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmd = exec.Command("git", "add", ".")
+	cmd.Dir = dir
+	_ = cmd.Run()
+	cmd = exec.Command("git", "stash")
+	cmd.Dir = dir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git stash: %v", err)
+	}
+
+	// Switch to branch "fix" — should NOT see the "develop" stash
+	cmd = exec.Command("git", "checkout", "-b", "fix")
+	cmd.Dir = dir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git checkout -b fix: %v", err)
+	}
+
+	fixGit := NewGit(dir)
+	count, err := fixGit.StashCount()
+	if err != nil {
+		t.Fatalf("StashCount: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("StashCount on 'fix' branch = %d, want 0 (stash belongs to 'develop', commit msg has 'on fix:')", count)
+	}
+}
+
+func TestClearPushURL(t *testing.T) {
+	dir := initTestRepo(t)
+	g := NewGit(dir)
+
+	fetchURL := "https://github.com/upstream/repo.git"
+	pushURL := "https://github.com/fork/repo.git"
+
+	cmd := exec.Command("git", "remote", "add", "origin", fetchURL)
+	cmd.Dir = dir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("add remote: %v", err)
+	}
+
+	// Set a custom push URL
+	if err := g.ConfigurePushURL("origin", pushURL); err != nil {
+		t.Fatalf("ConfigurePushURL: %v", err)
+	}
+	got, _ := g.GetPushURL("origin")
+	if got != pushURL {
+		t.Fatalf("push URL after set = %q, want %q", got, pushURL)
+	}
+
+	// Clear the custom push URL
+	if err := g.ClearPushURL("origin"); err != nil {
+		t.Fatalf("ClearPushURL: %v", err)
+	}
+
+	// After clearing, GetPushURL should return the fetch URL
+	got, err := g.GetPushURL("origin")
+	if err != nil {
+		t.Fatalf("GetPushURL after clear: %v", err)
+	}
+	if got != fetchURL {
+		t.Errorf("push URL after clear = %q, want %q (fetch URL)", got, fetchURL)
+	}
+
+	// Clearing again should be a no-op (not an error)
+	if err := g.ClearPushURL("origin"); err != nil {
+		t.Errorf("ClearPushURL (idempotent) should not error, got: %v", err)
 	}
 }

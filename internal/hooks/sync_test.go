@@ -219,6 +219,55 @@ func TestMarshalSettingsEmpty(t *testing.T) {
 	}
 }
 
+func TestMarshalSettingsDoesNotMutateInput(t *testing.T) {
+	input := `{
+  "editorMode": "vim",
+  "hooks": {},
+  "customField": "value"
+}`
+	s, err := UnmarshalSettings([]byte(input))
+	if err != nil {
+		t.Fatalf("UnmarshalSettings: %v", err)
+	}
+
+	// Snapshot Extra before marshal
+	origLen := len(s.Extra)
+
+	_, err = MarshalSettings(s)
+	if err != nil {
+		t.Fatalf("MarshalSettings: %v", err)
+	}
+
+	// Extra should not have been modified
+	if len(s.Extra) != origLen {
+		t.Errorf("Extra was mutated: had %d keys, now has %d", origLen, len(s.Extra))
+	}
+}
+
+func TestMarshalSettingsDeletesZeroEditorMode(t *testing.T) {
+	input := `{
+  "editorMode": "vim",
+  "hooks": {}
+}`
+	s, err := UnmarshalSettings([]byte(input))
+	if err != nil {
+		t.Fatalf("UnmarshalSettings: %v", err)
+	}
+
+	// Clear editor mode
+	s.EditorMode = ""
+
+	output, err := MarshalSettings(s)
+	if err != nil {
+		t.Fatalf("MarshalSettings: %v", err)
+	}
+
+	// editorMode should NOT appear in output
+	if strings.Contains(string(output), "editorMode") {
+		t.Errorf("cleared editorMode still in output: %s", output)
+	}
+}
+
 func TestMarshalSettingsPreservesFieldOrder(t *testing.T) {
 	input := `{
   "editorMode": "vim",

@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/base32"
 	"encoding/json"
@@ -11,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/telemetry"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -136,9 +139,248 @@ func convoyTracksBead(beadsDir, convoyID, beadID string) bool {
 	return false
 }
 
+// ConvoyInfo holds convoy details for an issue's tracking convoy.
+type ConvoyInfo struct {
+	ID            string // Convoy bead ID (e.g., "hq-cv-abc")
+	Owned         bool   // true if convoy has gt:owned label
+	MergeStrategy string // "direct", "mr", "local", or "" (default = mr)
+}
+
+// IsOwnedDirect returns true if the convoy is owned with direct merge strategy.
+// This is the key check for skipping witness/refinery merge pipeline.
+func (c *ConvoyInfo) IsOwnedDirect() bool {
+	return c != nil && c.Owned && c.MergeStrategy == "direct"
+}
+
+// getConvoyInfoForIssue checks if an issue is tracked by a convoy and returns its info.
+// Returns nil if not tracked by any convoy.
+func getConvoyInfoForIssue(issueID string) *ConvoyInfo {
+	convoyID := isTrackedByConvoy(issueID)
+	if convoyID == "" {
+		return nil
+	}
+
+	townRoot, err := workspace.FindFromCwd()
+	if err != nil {
+		return nil
+	}
+	townBeads := filepath.Join(townRoot, ".beads")
+
+	// Get convoy details (labels + description) for ownership and merge strategy
+	showCmd := exec.Command("bd", "show", convoyID, "--json")
+	showCmd.Dir = townBeads
+	var stdout bytes.Buffer
+	showCmd.Stdout = &stdout
+
+	if err := showCmd.Run(); err != nil {
+		return &ConvoyInfo{ID: convoyID} // Return basic info even if details fail
+	}
+
+	var convoys []struct {
+		Labels      []string `json:"labels"`
+		Description string   `json:"description"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &convoys); err != nil || len(convoys) == 0 {
+		return &ConvoyInfo{ID: convoyID}
+	}
+
+	info := &ConvoyInfo{ID: convoyID}
+
+	// Check for gt:owned label
+	for _, label := range convoys[0].Labels {
+		if label == "gt:owned" {
+			info.Owned = true
+			break
+		}
+	}
+
+	// Parse merge strategy from description
+	info.MergeStrategy = parseConvoyMergeStrategy(convoys[0].Description)
+
+	return info
+}
+
+// getConvoyInfoFromIssue reads convoy info directly from the issue's attachment fields.
+// This is the primary lookup method (gt-7b6wf fix): gt sling stores convoy_id and
+// merge_strategy on the issue when dispatching, avoiding unreliable cross-rig dep
+// resolution. Returns nil if the issue has no convoy fields in its description.
+func getConvoyInfoFromIssue(issueID, cwd string) *ConvoyInfo {
+	if issueID == "" {
+		return nil
+	}
+
+	bd := beads.New(beads.ResolveBeadsDir(cwd))
+	issue, err := bd.Show(issueID)
+	if err != nil {
+		return nil
+	}
+
+	attachment := beads.ParseAttachmentFields(issue)
+	if attachment == nil || attachment.ConvoyID == "" {
+		return nil
+	}
+
+	return &ConvoyInfo{
+		ID:            attachment.ConvoyID,
+		MergeStrategy: attachment.MergeStrategy,
+		Owned:         attachment.ConvoyOwned,
+	}
+}
+
+// printConvoyConflict prints detailed information about a bead that is already
+// tracked by another convoy, including all beads in that convoy with their
+// statuses, and recommended actions the user can take.
+func printConvoyConflict(beadID, convoyID string) {
+	townRoot, err := workspace.FindFromCwd()
+	if err != nil {
+		fmt.Printf("\n  %s is already tracked by convoy %s\n", beadID, convoyID)
+		return
+	}
+	townBeads := filepath.Join(townRoot, ".beads")
+
+	// Get convoy title
+	var convoyTitle string
+	showCmd := exec.Command("bd", "show", convoyID, "--json")
+	showCmd.Dir = townBeads
+	var showOut bytes.Buffer
+	showCmd.Stdout = &showOut
+	if err := showCmd.Run(); err == nil {
+		var items []struct {
+			Title string `json:"title"`
+		}
+		if json.Unmarshal(showOut.Bytes(), &items) == nil && len(items) > 0 {
+			convoyTitle = items[0].Title
+		}
+	}
+
+	fmt.Printf("\n  Conflict: %s is already tracked by convoy %s", beadID, convoyID)
+	if convoyTitle != "" {
+		fmt.Printf(" (%s)", convoyTitle)
+	}
+	fmt.Println()
+
+	// Get all beads in the conflicting convoy
+	tracked, err := getTrackedIssues(townBeads, convoyID)
+	if err == nil && len(tracked) > 0 {
+		fmt.Printf("\n  Beads in convoy %s:\n", convoyID)
+		for _, t := range tracked {
+			marker := " "
+			if t.ID == beadID {
+				marker = "→"
+			}
+			statusIcon := "○"
+			switch t.Status {
+			case "open":
+				statusIcon = "●"
+			case "closed":
+				statusIcon = "✓"
+			case "hooked", "pinned":
+				statusIcon = "◆"
+			}
+			title := t.Title
+			if title == "" {
+				title = "(no title)"
+			}
+			suffix := ""
+			if t.ID == beadID {
+				suffix = "  ← conflict"
+			}
+			fmt.Printf("    %s %s %s  %s [%s]%s\n", marker, statusIcon, t.ID, title, t.Status, suffix)
+		}
+	}
+
+	fmt.Printf("\n  Options:\n")
+	fmt.Printf("    1. Remove the bead from this batch:\n")
+	fmt.Printf("         gt sling <other-beads...> <rig>   (without %s)\n", beadID)
+	fmt.Printf("    2. Move the bead to the new batch (remove from existing convoy first):\n")
+	fmt.Printf("         bd dep remove %s %s --type=tracks\n", convoyID, beadID)
+	fmt.Printf("         gt sling <all-beads...> <rig>\n")
+	fmt.Printf("    3. Close the existing convoy and re-sling all beads together:\n")
+	fmt.Printf("         gt convoy close %s --reason \"re-batching\"\n", convoyID)
+	fmt.Printf("         gt sling <all-beads...> <rig>\n")
+	fmt.Printf("    4. Add the other beads to the existing convoy instead:\n")
+	fmt.Printf("         gt convoy add %s <other-beads...>\n", convoyID)
+	fmt.Println()
+}
+
+// createBatchConvoy creates a single auto-convoy that tracks all beads in a batch sling.
+// Returns the convoy ID and the list of bead IDs that were successfully tracked.
+// Callers should only stamp ConvoyID on beads in the tracked set — a bead whose
+// dep add failed should not reference a convoy that has no knowledge of it.
+// If owned is true, the convoy is marked with gt:owned label.
+// beadIDs must be non-empty. The convoy title uses the rig name and bead count.
+func createBatchConvoy(beadIDs []string, rigName string, owned bool, mergeStrategy string) (string, []string, error) {
+	if len(beadIDs) == 0 {
+		return "", nil, fmt.Errorf("no beads to track")
+	}
+
+	townRoot, err := workspace.FindFromCwd()
+	if err != nil {
+		return "", nil, fmt.Errorf("finding town root: %w", err)
+	}
+
+	townBeads := filepath.Join(townRoot, ".beads")
+
+	convoyID := fmt.Sprintf("hq-cv-%s", slingGenerateShortID())
+
+	convoyTitle := fmt.Sprintf("Batch: %d beads to %s", len(beadIDs), rigName)
+	description := fmt.Sprintf("Auto-created convoy tracking %d beads", len(beadIDs))
+	if mergeStrategy != "" {
+		description += fmt.Sprintf("\nMerge: %s", mergeStrategy)
+	}
+
+	createArgs := []string{
+		"create",
+		"--type=convoy",
+		"--id=" + convoyID,
+		"--title=" + convoyTitle,
+		"--description=" + description,
+	}
+	if owned {
+		createArgs = append(createArgs, "--labels=gt:owned")
+	}
+	if beads.NeedsForceForID(convoyID) {
+		createArgs = append(createArgs, "--force")
+	}
+
+	createCmd := exec.Command("bd", createArgs...)
+	createCmd.Dir = townBeads
+	createCmd.Stderr = os.Stderr
+
+	if err := createCmd.Run(); err != nil {
+		return "", nil, fmt.Errorf("creating batch convoy: %w", err)
+	}
+
+	// Add tracking relations for all beads, recording which succeed.
+	var tracked []string
+	for _, beadID := range beadIDs {
+		depArgs := []string{"dep", "add", convoyID, beadID, "--type=tracks"}
+		depCmd := exec.Command("bd", depArgs...)
+		depCmd.Dir = townRoot
+		depCmd.Stderr = os.Stderr
+
+		if err := depCmd.Run(); err != nil {
+			// Log but continue — partial tracking is better than no tracking
+			fmt.Printf("  Warning: could not track %s in convoy: %v\n", beadID, err)
+		} else {
+			tracked = append(tracked, beadID)
+		}
+	}
+
+	return convoyID, tracked, nil
+}
+
 // createAutoConvoy creates an auto-convoy for a single issue and tracks it.
+// If owned is true, the convoy is marked with the gt:owned label for caller-managed lifecycle.
+// mergeStrategy is optional: "direct", "mr", or "local" (empty = default mr).
 // Returns the created convoy ID.
-func createAutoConvoy(beadID, beadTitle string) (string, error) {
+func createAutoConvoy(beadID, beadTitle string, owned bool, mergeStrategy string) (_ string, retErr error) {
+	defer func() { telemetry.RecordConvoyCreate(context.Background(), beadID, retErr) }()
+	// Guard against flag-like titles propagating into convoy names (gt-e0kx5)
+	if beads.IsFlagLikeTitle(beadTitle) {
+		return "", fmt.Errorf("refusing to create convoy: bead title %q looks like a CLI flag", beadTitle)
+	}
+
 	townRoot, err := workspace.FindFromCwd()
 	if err != nil {
 		return "", fmt.Errorf("finding town root: %w", err)
@@ -153,6 +395,9 @@ func createAutoConvoy(beadID, beadTitle string) (string, error) {
 	// Create convoy with title "Work: <issue-title>"
 	convoyTitle := fmt.Sprintf("Work: %s", beadTitle)
 	description := fmt.Sprintf("Auto-created convoy tracking %s", beadID)
+	if mergeStrategy != "" {
+		description += fmt.Sprintf("\nMerge: %s", mergeStrategy)
+	}
 
 	createArgs := []string{
 		"create",
@@ -160,6 +405,9 @@ func createAutoConvoy(beadID, beadTitle string) (string, error) {
 		"--id=" + convoyID,
 		"--title=" + convoyTitle,
 		"--description=" + description,
+	}
+	if owned {
+		createArgs = append(createArgs, "--labels=gt:owned")
 	}
 	if beads.NeedsForceForID(convoyID) {
 		createArgs = append(createArgs, "--force")

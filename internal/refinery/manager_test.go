@@ -4,13 +4,29 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/session"
 )
+
+func setupTestRegistry(t *testing.T) {
+	t.Helper()
+	// Use a prefix that won't collide with real gastown sessions.
+	// The "tr" prefix conflicts with actual rigs running on the host
+	// (e.g., tr-refinery, tr-witness), causing tests that assert
+	// "no session exists" to fail in gastown workspaces.
+	reg := session.NewPrefixRegistry()
+	reg.Register("xut", "testrig")
+	old := session.DefaultRegistry()
+	session.SetDefaultRegistry(reg)
+	t.Cleanup(func() { session.SetDefaultRegistry(old) })
+}
 
 func setupTestManager(t *testing.T) (*Manager, string) {
 	t.Helper()
+	setupTestRegistry(t)
 
 	// Create temp directory structure
 	tmpDir := t.TempDir()
@@ -30,7 +46,7 @@ func setupTestManager(t *testing.T) (*Manager, string) {
 func TestManager_SessionName(t *testing.T) {
 	mgr, _ := setupTestManager(t)
 
-	want := "gt-testrig-refinery"
+	want := "xut-refinery"
 	got := mgr.SessionName()
 	if got != want {
 		t.Errorf("SessionName() = %s, want %s", got, want)
@@ -166,5 +182,31 @@ func TestManager_Retry_Deprecated(t *testing.T) {
 	err := mgr.Retry("any-id", false)
 	if err != nil {
 		t.Errorf("Retry() unexpected error: %v", err)
+	}
+}
+
+func TestCompareScoredIssues_UsesDeterministicIDTieBreaker(t *testing.T) {
+	t.Helper()
+
+	first := scoredIssue{
+		issue: &beads.Issue{
+			ID:        "gt-1",
+			CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		},
+		score: 10,
+	}
+	second := scoredIssue{
+		issue: &beads.Issue{
+			ID:        "gt-2",
+			CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		},
+		score: 10,
+	}
+
+	if !compareScoredIssues(first, second) {
+		t.Fatalf("expected gt-1 to sort before gt-2 for equal scores")
+	}
+	if compareScoredIssues(second, first) {
+		t.Fatalf("expected gt-2 to sort after gt-1 for equal scores")
 	}
 }

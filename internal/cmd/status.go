@@ -1,8 +1,10 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -19,6 +21,7 @@ import (
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -86,6 +89,8 @@ type AgentRuntime struct {
 	State        string `json:"state,omitempty"`         // Agent state from agent bead
 	UnreadMail   int    `json:"unread_mail"`             // Number of unread messages
 	FirstSubject string `json:"first_subject,omitempty"` // Subject of first unread message
+	AgentAlias   string `json:"agent_alias,omitempty"`   // Configured agent name (e.g., "opus-46", "pi")
+	AgentInfo    string `json:"agent_info,omitempty"`    // Runtime summary (e.g., "claude/opus", "pi/kimi-k2p5")
 }
 
 // RigStatus represents status of a single rig.
@@ -130,6 +135,278 @@ type StatusSum struct {
 	ActiveHooks   int `json:"active_hooks"`
 }
 
+// resolveAgentDisplay inspects the actual running process in the tmux session
+// to determine what runtime and model are being used. Falls back to config
+// when the session isn't running.
+func resolveAgentDisplay(townSettings *config.TownSettings, role string, sessionName string, running bool) (alias, info string) {
+	// Map legacy role names to config role names
+	configRole := role
+	switch role {
+	case "coordinator":
+		configRole = "mayor"
+	case "health-check":
+		configRole = "deacon"
+	}
+
+	// Get alias from config
+	if townSettings != nil {
+		alias = townSettings.RoleAgents[configRole]
+		if alias == "" {
+			alias = townSettings.DefaultAgent
+		}
+	}
+
+	// If session is running, inspect the actual process
+	if running && sessionName != "" {
+		if detected := detectRuntimeFromSession(sessionName); detected != "" {
+			info = detected
+			return alias, info
+		}
+	}
+
+	// Fall back to config-based display
+	if townSettings != nil && alias != "" {
+		rc := townSettings.Agents[alias]
+		if rc != nil {
+			info = buildInfoFromConfig(rc)
+		} else {
+			info = alias
+		}
+	}
+	return alias, info
+}
+
+// detectRuntimeFromSession inspects the actual process tree in a tmux session
+// to determine what agent runtime and model are in use.
+func detectRuntimeFromSession(sessionName string) string {
+	// Get the PID of the shell process in the tmux pane
+	t := tmux.NewTmux()
+	pid, err := t.GetPanePID(sessionName)
+	if err != nil || pid == "" {
+		return ""
+	}
+
+	// Walk child processes to find the actual agent (not the shell)
+	cmdline := findAgentCmdline(pid)
+	if cmdline == "" {
+		return ""
+	}
+
+	return parseRuntimeInfo(cmdline)
+}
+
+// findAgentCmdline checks the pane process itself and its descendants for a known agent.
+// The pane PID may BE the agent (e.g., claude), or the agent may be a child (e.g., shell → pi).
+// Also handles wrapper processes (node /path/to/pi, bun /path/to/opencode).
+func findAgentCmdline(panePid string) string {
+	// Check the pane process itself first
+	cmdline := readCmdline(panePid)
+	if isAgentCmdline(cmdline) {
+		return cmdline
+	}
+
+	// Walk children (shell → agent)
+	childrenPath := "/proc/" + panePid + "/task/" + panePid + "/children"
+	childrenBytes, err := os.ReadFile(childrenPath)
+	if err != nil {
+		return cmdline // return whatever the pane process is
+	}
+
+	children := strings.Fields(string(childrenBytes))
+	for _, childPid := range children {
+		childCmd := readCmdline(childPid)
+		if isAgentCmdline(childCmd) {
+			return childCmd
+		}
+		// Check grandchildren (cgroup-wrap → agent)
+		gcPath := "/proc/" + childPid + "/task/" + childPid + "/children"
+		gcBytes, err := os.ReadFile(gcPath)
+		if err != nil {
+			continue
+		}
+		for _, gcPid := range strings.Fields(string(gcBytes)) {
+			gcCmd := readCmdline(gcPid)
+			if isAgentCmdline(gcCmd) {
+				return gcCmd
+			}
+		}
+	}
+
+	return cmdline // return pane process cmdline as fallback
+}
+
+// isAgentCmdline returns true if the cmdline contains a known agent,
+// either as the main command or as the first arg of a wrapper (node/bun).
+func isAgentCmdline(cmdline string) bool {
+	if cmdline == "" {
+		return false
+	}
+	parts := strings.Split(cmdline, "\x00")
+	if len(parts) == 0 {
+		return false
+	}
+	base := filepath.Base(parts[0])
+	if isKnownAgent(base) {
+		return true
+	}
+	// Check if wrapper (node/bun) is running an agent
+	if isAgentWrapper(base) && len(parts) > 1 {
+		argBase := filepath.Base(parts[1])
+		return isKnownAgent(argBase)
+	}
+	return false
+}
+
+// readCmdline reads /proc/<pid>/cmdline and returns it as a space-joined string.
+func readCmdline(pid string) string {
+	data, err := os.ReadFile("/proc/" + pid + "/cmdline")
+	if err != nil || len(data) == 0 {
+		return ""
+	}
+	// cmdline uses null bytes as separators
+	return string(data)
+}
+
+// extractBaseName gets the base command name from a null-separated cmdline.
+func extractBaseName(cmdline string) string {
+	if cmdline == "" {
+		return ""
+	}
+	parts := strings.Split(cmdline, "\x00")
+	if len(parts) == 0 {
+		return ""
+	}
+	return filepath.Base(parts[0])
+}
+
+// isKnownAgent returns true if the command is a recognized agent runtime.
+func isKnownAgent(base string) bool {
+	switch base {
+	case "claude", "pi", "opencode", "codex", "gemini", "cursor", "auggie", "amp", "aider":
+		return true
+	}
+	return false
+}
+
+// isAgentWrapper returns true if the command is a runtime wrapper (node, bun, etc.)
+// that may host an agent as its first argument.
+func isAgentWrapper(base string) bool {
+	switch base {
+	case "node", "bun", "npx", "bunx":
+		return true
+	}
+	return false
+}
+
+// parseRuntimeInfo extracts "runtime/model" from a null-separated cmdline.
+// Handles direct invocation (claude --model opus) and wrapper patterns (node /path/to/pi).
+func parseRuntimeInfo(cmdline string) string {
+	if cmdline == "" {
+		return ""
+	}
+	parts := strings.Split(cmdline, "\x00")
+	if len(parts) == 0 {
+		return ""
+	}
+
+	// Find the actual agent command — skip wrappers (node, bun, cgroup-wrap)
+	cmd := ""
+	startIdx := 0
+	for i, part := range parts {
+		base := filepath.Base(part)
+		if isKnownAgent(base) {
+			cmd = base
+			startIdx = i
+			break
+		}
+	}
+	if cmd == "" {
+		cmd = filepath.Base(parts[0])
+	}
+
+	// Extract model and provider from flags
+	model := ""
+	provider := ""
+	for i := startIdx; i < len(parts); i++ {
+		arg := parts[i]
+		if (arg == "--model" || arg == "-m") && i+1 < len(parts) && parts[i+1] != "" {
+			model = parts[i+1]
+		}
+		if arg == "--provider" && i+1 < len(parts) && parts[i+1] != "" {
+			provider = parts[i+1]
+		}
+	}
+
+	if model != "" {
+		return cmd + "/" + model
+	}
+	if provider != "" {
+		return cmd + "/" + provider
+	}
+
+	// For pi, check its settings file for actual default provider/model
+	if cmd == "pi" {
+		if piInfo := readPiDefaults(); piInfo != "" {
+			return "pi/" + piInfo
+		}
+	}
+
+	return cmd
+}
+
+// readPiDefaults reads ~/.pi/agent/settings.json to get the actual default provider/model.
+func readPiDefaults() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(home, ".pi", "agent", "settings.json"))
+	if err != nil {
+		return ""
+	}
+	var settings struct {
+		DefaultProvider string `json:"defaultProvider"`
+		DefaultModel    string `json:"defaultModel"`
+	}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return ""
+	}
+	if settings.DefaultModel != "" {
+		return settings.DefaultModel
+	}
+	if settings.DefaultProvider != "" {
+		return settings.DefaultProvider
+	}
+	return ""
+}
+
+// buildInfoFromConfig builds display info from a RuntimeConfig (fallback when not running).
+func buildInfoFromConfig(rc *config.RuntimeConfig) string {
+	if rc.Command == "" {
+		return "claude"
+	}
+	cmd := filepath.Base(rc.Command)
+	if cmd == "" {
+		cmd = "claude"
+	}
+	if cmd == "cgroup-wrap" && len(rc.Args) > 0 {
+		cmd = rc.Args[0]
+	}
+
+	model := ""
+	for i, arg := range rc.Args {
+		if (arg == "--model" || arg == "-m") && i+1 < len(rc.Args) {
+			model = rc.Args[i+1]
+			break
+		}
+	}
+
+	if model != "" {
+		return cmd + "/" + model
+	}
+	return cmd
+}
+
 func runStatus(cmd *cobra.Command, args []string) error {
 	if statusWatch {
 		return runStatusWatch(cmd, args)
@@ -137,7 +414,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	return runStatusOnce(cmd, args)
 }
 
-func runStatusWatch(cmd *cobra.Command, args []string) error {
+func runStatusWatch(_ *cobra.Command, _ []string) error {
 	if statusJSON {
 		return fmt.Errorf("--json and --watch cannot be used together")
 	}
@@ -154,22 +431,90 @@ func runStatusWatch(cmd *cobra.Command, args []string) error {
 
 	isTTY := term.IsTerminal(int(os.Stdout.Fd()))
 
+	// Cache the last successful status to handle transient tmux/beads
+	// failures. Watch mode spawns many tmux subprocesses per iteration;
+	// under load the tmux server can intermittently fail, causing all
+	// agents to appear as not running (empty bubbles).
+	var cachedStatus *TownStatus
+	var cachedAt time.Time
+	maxStale := time.Duration(statusInterval) * time.Second * 5
+
 	for {
+		var buf bytes.Buffer
+
 		if isTTY {
-			fmt.Print("\033[H\033[2J") // ANSI: cursor home + clear screen
+			buf.WriteString("\033[H\033[2J") // ANSI: cursor home + clear screen
 		}
 
 		timestamp := time.Now().Format("15:04:05")
 		header := fmt.Sprintf("[%s] gt status --watch (every %ds, Ctrl+C to stop)", timestamp, statusInterval)
 		if isTTY {
-			fmt.Printf("%s\n\n", style.Dim.Render(header))
+			fmt.Fprintf(&buf, "%s\n\n", style.Dim.Render(header))
 		} else {
-			fmt.Printf("%s\n\n", header)
+			fmt.Fprintf(&buf, "%s\n\n", header)
 		}
 
-		if err := runStatusOnce(cmd, args); err != nil {
-			fmt.Printf("Error: %v\n", err)
+		status, err := gatherStatus()
+		usedCache := false
+
+		// On error, retry once before giving up.
+		if err != nil {
+			status, err = gatherStatus()
 		}
+
+		if err == nil {
+			// Detect degraded results: zero running agents when we
+			// previously had some. This indicates a transient tmux
+			// failure rather than all agents legitimately stopping.
+			running := countRunningAgents(status)
+			if running == 0 && cachedStatus != nil &&
+				countRunningAgents(*cachedStatus) > 0 {
+				// Retry once to confirm.
+				retry, retryErr := gatherStatus()
+				if retryErr == nil &&
+					countRunningAgents(retry) > 0 {
+					status = retry
+				} else if time.Since(cachedAt) < maxStale {
+					status = *cachedStatus
+					usedCache = true
+				}
+			}
+		} else if cachedStatus != nil &&
+			time.Since(cachedAt) < maxStale {
+			// Complete failure even after retry — use cache.
+			status = *cachedStatus
+			usedCache = true
+			err = nil
+		}
+
+		if err != nil {
+			fmt.Fprintf(&buf, "Error: %v\n", err)
+		} else {
+			if !usedCache {
+				statusCopy := status
+				cachedStatus = &statusCopy
+				cachedAt = time.Now()
+			}
+			if usedCache {
+				staleNote := fmt.Sprintf(
+					"(using cached data from %s)",
+					cachedAt.Format("15:04:05"),
+				)
+				if isTTY {
+					fmt.Fprintf(&buf, "%s\n",
+						style.Dim.Render(staleNote))
+				} else {
+					fmt.Fprintf(&buf, "%s\n", staleNote)
+				}
+			}
+			if err := outputStatusText(&buf, status); err != nil {
+				fmt.Fprintf(&buf, "Error: %v\n", err)
+			}
+		}
+
+		// Write the entire frame atomically to prevent the terminal from
+		// rendering a blank screen between the clear and the content.
+		_, _ = os.Stdout.Write(buf.Bytes())
 
 		select {
 		case <-sigChan:
@@ -182,11 +527,41 @@ func runStatusWatch(cmd *cobra.Command, args []string) error {
 	}
 }
 
+// countRunningAgents returns the number of agents with Running=true
+// across all global agents and rig agents in the status.
+func countRunningAgents(s TownStatus) int {
+	count := 0
+	for _, a := range s.Agents {
+		if a.Running {
+			count++
+		}
+	}
+	for _, r := range s.Rigs {
+		for _, a := range r.Agents {
+			if a.Running {
+				count++
+			}
+		}
+	}
+	return count
+}
+
 func runStatusOnce(_ *cobra.Command, _ []string) error {
+	status, err := gatherStatus()
+	if err != nil {
+		return err
+	}
+	if statusJSON {
+		return outputStatusJSON(status)
+	}
+	return outputStatusText(os.Stdout, status)
+}
+
+func gatherStatus() (TownStatus, error) {
 	// Find town root
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
-		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+		return TownStatus{}, fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
 	// Load town config
@@ -205,6 +580,9 @@ func runStatusOnce(_ *cobra.Command, _ []string) error {
 		rigsConfig = &config.RigsConfig{Rigs: make(map[string]config.RigEntry)}
 	}
 
+	// Load town settings for agent display info
+	townSettings, _ := config.LoadOrCreateTownSettings(config.TownSettingsPath(townRoot))
+
 	// Create rig manager
 	g := git.NewGit(townRoot)
 	mgr := rig.NewManager(townRoot, rigsConfig, g)
@@ -222,7 +600,7 @@ func runStatusOnce(_ *cobra.Command, _ []string) error {
 		var sessionMu sync.Mutex
 		var sessionWg sync.WaitGroup
 		for _, s := range sessions {
-			if strings.HasPrefix(s, "gt-") || strings.HasPrefix(s, "hq-") {
+			if session.IsKnownSession(s) {
 				sessionWg.Add(1)
 				go func(name string) {
 					defer sessionWg.Done()
@@ -241,7 +619,7 @@ func runStatusOnce(_ *cobra.Command, _ []string) error {
 	// Discover rigs
 	rigs, err := mgr.DiscoverRigs()
 	if err != nil {
-		return fmt.Errorf("discovering rigs: %w", err)
+		return TownStatus{}, fmt.Errorf("discovering rigs: %w", err)
 	}
 
 	// Pre-fetch agent beads across all rig-specific beads DBs.
@@ -427,6 +805,22 @@ func runStatusOnce(_ *cobra.Command, _ []string) error {
 
 	wg.Wait()
 
+	// Enrich agents with runtime info — inspect actual running processes
+	for i := range status.Agents {
+		a := &status.Agents[i]
+		alias, info := resolveAgentDisplay(townSettings, a.Role, a.Session, a.Running)
+		a.AgentAlias = alias
+		a.AgentInfo = info
+	}
+	for i := range status.Rigs {
+		for j := range status.Rigs[i].Agents {
+			a := &status.Rigs[i].Agents[j]
+			alias, info := resolveAgentDisplay(townSettings, a.Role, a.Session, a.Running)
+			a.AgentAlias = alias
+			a.AgentInfo = info
+		}
+	}
+
 	// Aggregate summary (after parallel work completes)
 	for i, rs := range status.Rigs {
 		status.Summary.PolecatCount += rs.PolecatCount
@@ -441,11 +835,7 @@ func runStatusOnce(_ *cobra.Command, _ []string) error {
 	}
 	status.Summary.RigCount = len(rigs)
 
-	// Output
-	if statusJSON {
-		return outputStatusJSON(status)
-	}
-	return outputStatusText(status)
+	return status, nil
 }
 
 func outputStatusJSON(status TownStatus) error {
@@ -454,10 +844,10 @@ func outputStatusJSON(status TownStatus) error {
 	return enc.Encode(status)
 }
 
-func outputStatusText(status TownStatus) error {
+func outputStatusText(w io.Writer, status TownStatus) error {
 	// Header
-	fmt.Printf("%s %s\n", style.Bold.Render("Town:"), status.Name)
-	fmt.Printf("%s\n\n", style.Dim.Render(status.Location))
+	fmt.Fprintf(w, "%s %s\n", style.Bold.Render("Town:"), status.Name)
+	fmt.Fprintf(w, "%s\n\n", style.Dim.Render(status.Location))
 
 	// Overseer info
 	if status.Overseer != nil {
@@ -467,11 +857,11 @@ func outputStatusText(status TownStatus) error {
 		} else if status.Overseer.Username != "" && status.Overseer.Username != status.Overseer.Name {
 			overseerDisplay = fmt.Sprintf("%s (@%s)", status.Overseer.Name, status.Overseer.Username)
 		}
-		fmt.Printf("👤 %s %s\n", style.Bold.Render("Overseer:"), overseerDisplay)
+		fmt.Fprintf(w, "👤 %s %s\n", style.Bold.Render("Overseer:"), overseerDisplay)
 		if status.Overseer.UnreadMail > 0 {
-			fmt.Printf("   📬 %d unread\n", status.Overseer.UnreadMail)
+			fmt.Fprintf(w, "   📬 %d unread\n", status.Overseer.UnreadMail)
 		}
-		fmt.Println()
+		fmt.Fprintln(w)
 	}
 
 	// Role icons - uses centralized emojis from constants package
@@ -494,27 +884,27 @@ func outputStatusText(status TownStatus) error {
 			icon = roleIcons[agent.Name]
 		}
 		if statusVerbose {
-			fmt.Printf("%s %s\n", icon, style.Bold.Render(capitalizeFirst(agent.Name)))
-			renderAgentDetails(agent, "   ", nil, status.Location)
-			fmt.Println()
+			fmt.Fprintf(w, "%s %s\n", icon, style.Bold.Render(capitalizeFirst(agent.Name)))
+			renderAgentDetails(w, agent, "   ", nil, status.Location)
+			fmt.Fprintln(w)
 		} else {
 			// Compact: icon + name on one line
-			renderAgentCompact(agent, icon+" ", nil, status.Location)
+			renderAgentCompact(w, agent, icon+" ", nil, status.Location)
 		}
 	}
 	if !statusVerbose && len(status.Agents) > 0 {
-		fmt.Println()
+		fmt.Fprintln(w)
 	}
 
 	if len(status.Rigs) == 0 {
-		fmt.Printf("%s\n", style.Dim.Render("No rigs registered. Use 'gt rig add' to add one."))
+		fmt.Fprintf(w, "%s\n", style.Dim.Render("No rigs registered. Use 'gt rig add' to add one."))
 		return nil
 	}
 
 	// Rigs
 	for _, r := range status.Rigs {
 		// Rig header with separator
-		fmt.Printf("─── %s ───────────────────────────────────────────\n\n", style.Bold.Render(r.Name+"/"))
+		fmt.Fprintf(w, "─── %s ───────────────────────────────────────────\n\n", style.Bold.Render(r.Name+"/"))
 
 		// Group agents by role
 		var witnesses, refineries, crews, polecats []AgentRuntime
@@ -534,14 +924,14 @@ func outputStatusText(status TownStatus) error {
 		// Witness
 		if len(witnesses) > 0 {
 			if statusVerbose {
-				fmt.Printf("%s %s\n", roleIcons["witness"], style.Bold.Render("Witness"))
+				fmt.Fprintf(w, "%s %s\n", roleIcons["witness"], style.Bold.Render("Witness"))
 				for _, agent := range witnesses {
-					renderAgentDetails(agent, "   ", r.Hooks, status.Location)
+					renderAgentDetails(w, agent, "   ", r.Hooks, status.Location)
 				}
-				fmt.Println()
+				fmt.Fprintln(w)
 			} else {
 				for _, agent := range witnesses {
-					renderAgentCompact(agent, roleIcons["witness"]+" ", r.Hooks, status.Location)
+					renderAgentCompact(w, agent, roleIcons["witness"]+" ", r.Hooks, status.Location)
 				}
 			}
 		}
@@ -549,18 +939,18 @@ func outputStatusText(status TownStatus) error {
 		// Refinery
 		if len(refineries) > 0 {
 			if statusVerbose {
-				fmt.Printf("%s %s\n", roleIcons["refinery"], style.Bold.Render("Refinery"))
+				fmt.Fprintf(w, "%s %s\n", roleIcons["refinery"], style.Bold.Render("Refinery"))
 				for _, agent := range refineries {
-					renderAgentDetails(agent, "   ", r.Hooks, status.Location)
+					renderAgentDetails(w, agent, "   ", r.Hooks, status.Location)
 				}
 				// MQ summary (shown under refinery)
 				if r.MQ != nil {
 					mqStr := formatMQSummary(r.MQ)
 					if mqStr != "" {
-						fmt.Printf("   MQ: %s\n", mqStr)
+						fmt.Fprintf(w, "   MQ: %s\n", mqStr)
 					}
 				}
-				fmt.Println()
+				fmt.Fprintln(w)
 			} else {
 				for _, agent := range refineries {
 					// Compact: include MQ on same line if present
@@ -571,7 +961,7 @@ func outputStatusText(status TownStatus) error {
 							mqSuffix = "  " + mqStr
 						}
 					}
-					renderAgentCompactWithSuffix(agent, roleIcons["refinery"]+" ", r.Hooks, status.Location, mqSuffix)
+					renderAgentCompactWithSuffix(w, agent, roleIcons["refinery"]+" ", r.Hooks, status.Location, mqSuffix)
 				}
 			}
 		}
@@ -579,15 +969,15 @@ func outputStatusText(status TownStatus) error {
 		// Crew
 		if len(crews) > 0 {
 			if statusVerbose {
-				fmt.Printf("%s %s (%d)\n", roleIcons["crew"], style.Bold.Render("Crew"), len(crews))
+				fmt.Fprintf(w, "%s %s (%d)\n", roleIcons["crew"], style.Bold.Render("Crew"), len(crews))
 				for _, agent := range crews {
-					renderAgentDetails(agent, "   ", r.Hooks, status.Location)
+					renderAgentDetails(w, agent, "   ", r.Hooks, status.Location)
 				}
-				fmt.Println()
+				fmt.Fprintln(w)
 			} else {
-				fmt.Printf("%s %s (%d)\n", roleIcons["crew"], style.Bold.Render("Crew"), len(crews))
+				fmt.Fprintf(w, "%s %s (%d)\n", roleIcons["crew"], style.Bold.Render("Crew"), len(crews))
 				for _, agent := range crews {
-					renderAgentCompact(agent, "   ", r.Hooks, status.Location)
+					renderAgentCompact(w, agent, "   ", r.Hooks, status.Location)
 				}
 			}
 		}
@@ -595,31 +985,31 @@ func outputStatusText(status TownStatus) error {
 		// Polecats
 		if len(polecats) > 0 {
 			if statusVerbose {
-				fmt.Printf("%s %s (%d)\n", roleIcons["polecat"], style.Bold.Render("Polecats"), len(polecats))
+				fmt.Fprintf(w, "%s %s (%d)\n", roleIcons["polecat"], style.Bold.Render("Polecats"), len(polecats))
 				for _, agent := range polecats {
-					renderAgentDetails(agent, "   ", r.Hooks, status.Location)
+					renderAgentDetails(w, agent, "   ", r.Hooks, status.Location)
 				}
-				fmt.Println()
+				fmt.Fprintln(w)
 			} else {
-				fmt.Printf("%s %s (%d)\n", roleIcons["polecat"], style.Bold.Render("Polecats"), len(polecats))
+				fmt.Fprintf(w, "%s %s (%d)\n", roleIcons["polecat"], style.Bold.Render("Polecats"), len(polecats))
 				for _, agent := range polecats {
-					renderAgentCompact(agent, "   ", r.Hooks, status.Location)
+					renderAgentCompact(w, agent, "   ", r.Hooks, status.Location)
 				}
 			}
 		}
 
 		// No agents
 		if len(witnesses) == 0 && len(refineries) == 0 && len(crews) == 0 && len(polecats) == 0 {
-			fmt.Printf("   %s\n", style.Dim.Render("(no agents)"))
+			fmt.Fprintf(w, "   %s\n", style.Dim.Render("(no agents)"))
 		}
-		fmt.Println()
+		fmt.Fprintln(w)
 	}
 
 	return nil
 }
 
 // renderAgentDetails renders full agent bead details
-func renderAgentDetails(agent AgentRuntime, indent string, hooks []AgentHookInfo, townRoot string) { //nolint:unparam // indent kept for future customization
+func renderAgentDetails(w io.Writer, agent AgentRuntime, indent string, hooks []AgentHookInfo, townRoot string) { //nolint:unparam // indent kept for future customization
 	// Line 1: Agent bead ID + status
 	// Per gt-zecmc: derive status from tmux (observable reality), not bead state.
 	// "Discover, don't track" - agent liveness is observable from tmux session.
@@ -676,9 +1066,14 @@ func renderAgentDetails(agent AgentRuntime, indent string, hooks []AgentHookInfo
 		}
 	}
 
-	fmt.Printf("%s%s %s%s\n", indent, style.Dim.Render(agentBeadID), statusStr, stateInfo)
+	fmt.Fprintf(w, "%s%s %s%s\n", indent, style.Dim.Render(agentBeadID), statusStr, stateInfo)
 
-	// Line 2: Hook bead (pinned work)
+	// Line 2: Agent runtime info
+	if agent.AgentInfo != "" {
+		fmt.Printf("%s  agent: %s\n", indent, agent.AgentInfo)
+	}
+
+	// Line 3: Hook bead (pinned work)
 	hookStr := style.Dim.Render("(none)")
 	hookBead := agent.HookBead
 	hookTitle := agent.WorkTitle
@@ -705,7 +1100,7 @@ func renderAgentDetails(agent AgentRuntime, indent string, hooks []AgentHookInfo
 		hookStr = truncateWithEllipsis(hookTitle, 50)
 	}
 
-	fmt.Printf("%s  hook: %s\n", indent, hookStr)
+	fmt.Fprintf(w, "%s  hook: %s\n", indent, hookStr)
 
 	// Line 3: Mail (if any unread)
 	if agent.UnreadMail > 0 {
@@ -713,7 +1108,7 @@ func renderAgentDetails(agent AgentRuntime, indent string, hooks []AgentHookInfo
 		if agent.FirstSubject != "" {
 			mailStr = fmt.Sprintf("📬 %d unread → %s", agent.UnreadMail, truncateWithEllipsis(agent.FirstSubject, 35))
 		}
-		fmt.Printf("%s  mail: %s\n", indent, mailStr)
+		fmt.Fprintf(w, "%s  mail: %s\n", indent, mailStr)
 	}
 }
 
@@ -769,7 +1164,7 @@ func formatMQSummaryCompact(mq *MQSummary) string {
 }
 
 // renderAgentCompactWithSuffix renders a single-line agent status with an extra suffix
-func renderAgentCompactWithSuffix(agent AgentRuntime, indent string, hooks []AgentHookInfo, _ string, suffix string) {
+func renderAgentCompactWithSuffix(w io.Writer, agent AgentRuntime, indent string, hooks []AgentHookInfo, _ string, suffix string) {
 	// Build status indicator (gt-zecmc: use tmux state, not bead state)
 	statusIndicator := buildStatusIndicator(agent)
 
@@ -804,12 +1199,18 @@ func renderAgentCompactWithSuffix(agent AgentRuntime, indent string, hooks []Age
 		mailSuffix = fmt.Sprintf(" 📬%d", agent.UnreadMail)
 	}
 
-	// Print single line: name + status + hook + mail + suffix
-	fmt.Printf("%s%-12s %s%s%s%s\n", indent, agent.Name, statusIndicator, hookSuffix, mailSuffix, suffix)
+	// Agent runtime info
+	agentSuffix := ""
+	if agent.AgentInfo != "" {
+		agentSuffix = " " + style.Dim.Render("["+agent.AgentInfo+"]")
+	}
+
+	// Print single line: name + status + agent-info + hook + mail + suffix
+	fmt.Fprintf(w, "%s%-12s %s%s%s%s%s\n", indent, agent.Name, statusIndicator, agentSuffix, hookSuffix, mailSuffix, suffix)
 }
 
 // renderAgentCompact renders a single-line agent status
-func renderAgentCompact(agent AgentRuntime, indent string, hooks []AgentHookInfo, _ string) {
+func renderAgentCompact(w io.Writer, agent AgentRuntime, indent string, hooks []AgentHookInfo, _ string) {
 	// Build status indicator (gt-zecmc: use tmux state, not bead state)
 	statusIndicator := buildStatusIndicator(agent)
 
@@ -844,8 +1245,14 @@ func renderAgentCompact(agent AgentRuntime, indent string, hooks []AgentHookInfo
 		mailSuffix = fmt.Sprintf(" 📬%d", agent.UnreadMail)
 	}
 
-	// Print single line: name + status + hook + mail
-	fmt.Printf("%s%-12s %s%s%s\n", indent, agent.Name, statusIndicator, hookSuffix, mailSuffix)
+	// Agent runtime info
+	agentSuffix := ""
+	if agent.AgentInfo != "" {
+		agentSuffix = " " + style.Dim.Render("["+agent.AgentInfo+"]")
+	}
+
+	// Print single line: name + status + agent-info + hook + mail
+	fmt.Fprintf(w, "%s%-12s %s%s%s%s\n", indent, agent.Name, statusIndicator, agentSuffix, hookSuffix, mailSuffix)
 }
 
 // buildStatusIndicator creates the visual status indicator for an agent.
@@ -1079,7 +1486,7 @@ func discoverRigAgents(allSessions map[string]bool, r *rig.Rig, crews []string, 
 		defs = append(defs, agentDef{
 			name:    "refinery",
 			address: r.Name + "/refinery",
-			session: fmt.Sprintf("gt-%s-refinery", r.Name),
+			session: session.RefinerySessionName(session.PrefixFor(r.Name)),
 			role:    "refinery",
 			beadID:  beads.RefineryBeadIDWithPrefix(prefix, r.Name),
 		})
@@ -1090,7 +1497,7 @@ func discoverRigAgents(allSessions map[string]bool, r *rig.Rig, crews []string, 
 		defs = append(defs, agentDef{
 			name:    name,
 			address: r.Name + "/" + name,
-			session: fmt.Sprintf("gt-%s-%s", r.Name, name),
+			session: session.PolecatSessionName(session.PrefixFor(r.Name), name),
 			role:    "polecat",
 			beadID:  beads.PolecatBeadIDWithPrefix(prefix, r.Name, name),
 		})

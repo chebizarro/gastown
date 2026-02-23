@@ -18,6 +18,7 @@ import (
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/session"
+	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -33,6 +34,11 @@ type Manager struct {
 	rig     *rig.Rig
 	workDir string
 	output  io.Writer // Output destination for user-facing messages
+}
+
+type scoredIssue struct {
+	issue *beads.Issue
+	score float64
 }
 
 // NewManager creates a new refinery manager for a rig.
@@ -52,14 +58,29 @@ func (m *Manager) SetOutput(w io.Writer) {
 
 // SessionName returns the tmux session name for this refinery.
 func (m *Manager) SessionName() string {
-	return fmt.Sprintf("gt-%s-refinery", m.rig.Name)
+	return session.RefinerySessionName(session.PrefixFor(m.rig.Name))
 }
 
-// IsRunning checks if the refinery session is active.
-// ZFC: tmux session existence is the source of truth.
+// IsRunning checks if the refinery session is active and healthy.
+// Checks both tmux session existence AND agent process liveness to avoid
+// reporting zombie sessions (tmux alive but Claude dead) as "running".
+// ZFC: tmux session existence is the source of truth for session state,
+// but agent liveness determines if the session is actually functional.
 func (m *Manager) IsRunning() (bool, error) {
 	t := tmux.NewTmux()
-	return t.HasSession(m.SessionName())
+	sessionName := m.SessionName()
+	status := t.CheckSessionHealth(sessionName, 0)
+	return status == tmux.SessionHealthy, nil
+}
+
+// IsHealthy checks if the refinery is running and has been active recently.
+// Unlike IsRunning which only checks process liveness, this also detects hung
+// sessions where Claude is alive but hasn't produced output in maxInactivity.
+// Returns the detailed ZombieStatus for callers that need to distinguish
+// between different failure modes.
+func (m *Manager) IsHealthy(maxInactivity time.Duration) tmux.ZombieStatus {
+	t := tmux.NewTmux()
+	return t.CheckSessionHealth(m.SessionName(), maxInactivity)
 }
 
 // Status returns information about the refinery session.
@@ -131,24 +152,25 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 
 	// Ensure .gitignore has required Gas Town patterns
 	if err := rig.EnsureGitignorePatterns(refineryRigDir); err != nil {
-		fmt.Printf("Warning: could not update refinery .gitignore: %v\n", err)
+		style.PrintWarning("could not update refinery .gitignore: %v", err)
 	}
 
 	initialPrompt := session.BuildStartupPrompt(session.BeaconConfig{
-		Recipient: fmt.Sprintf("%s/refinery", m.rig.Name),
+		Recipient: session.BeaconRecipient("refinery", "", m.rig.Name),
 		Sender:    "deacon",
 		Topic:     "patrol",
 	}, "Run `gt prime --hook` and begin patrol.")
 
-	var command string
-	if agentOverride != "" {
-		var err error
-		command, err = config.BuildAgentStartupCommandWithAgentOverride("refinery", m.rig.Name, townRoot, m.rig.Path, initialPrompt, agentOverride)
-		if err != nil {
-			return fmt.Errorf("building startup command with agent override: %w", err)
-		}
-	} else {
-		command = config.BuildAgentStartupCommand("refinery", m.rig.Name, townRoot, m.rig.Path, initialPrompt)
+	command, err := config.BuildStartupCommandFromConfig(config.AgentEnvConfig{
+		Role:        "refinery",
+		Rig:         m.rig.Name,
+		TownRoot:    townRoot,
+		Prompt:      initialPrompt,
+		Topic:       "patrol",
+		SessionName: sessionID,
+	}, m.rig.Path, initialPrompt, agentOverride)
+	if err != nil {
+		return fmt.Errorf("building startup command: %w", err)
 	}
 
 	// Create session with command directly to avoid send-keys race condition.
@@ -163,7 +185,9 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 		Role:     "refinery",
 		Rig:      m.rig.Name,
 		TownRoot: townRoot,
+		Agent:    agentOverride,
 	})
+	envVars = session.MergeRuntimeLivenessEnv(envVars, runtimeConfig)
 
 	// Add refinery-specific flag
 	envVars["GT_REFINERY"] = "1"
@@ -189,8 +213,6 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 		return fmt.Errorf("waiting for refinery to start: %w", err)
 	}
 
-	// Wait for runtime to be fully ready
-	runtime.SleepForReadyDelay(runtimeConfig)
 	_ = runtime.RunStartupFallback(t, sessionID, "refinery", runtimeConfig)
 
 	return nil
@@ -230,10 +252,6 @@ func (m *Manager) Queue() ([]QueueItem, error) {
 
 	// Score and sort issues by priority score (highest first)
 	now := time.Now()
-	type scoredIssue struct {
-		issue *beads.Issue
-		score float64
-	}
 	scored := make([]scoredIssue, 0, len(issues))
 	for _, issue := range issues {
 		// Defensive filter: bd status filters can drift; queue must only include open MRs.
@@ -245,7 +263,7 @@ func (m *Manager) Queue() ([]QueueItem, error) {
 	}
 
 	sort.Slice(scored, func(i, j int) bool {
-		return scored[i].score > scored[j].score
+		return compareScoredIssues(scored[i], scored[j])
 	})
 
 	// Convert scored issues to queue items
@@ -264,6 +282,16 @@ func (m *Manager) Queue() ([]QueueItem, error) {
 	}
 
 	return items, nil
+}
+
+func compareScoredIssues(a, b scoredIssue) bool {
+	if a.score != b.score {
+		return a.score > b.score
+	}
+	if a.issue == nil || b.issue == nil {
+		return a.issue != nil
+	}
+	return a.issue.ID < b.issue.ID
 }
 
 // calculateIssueScore computes the priority score for an MR issue.

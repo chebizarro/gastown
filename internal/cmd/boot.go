@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -13,8 +15,13 @@ import (
 	"github.com/steveyegge/gastown/internal/deacon"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
+
+// deaconRestartThreshold is how long a Deacon heartbeat must be stale before
+// the boot command kills and restarts the session (vs. just nudging it).
+const deaconRestartThreshold = 30 * time.Minute
 
 var (
 	bootStatusJSON    bool
@@ -203,7 +210,6 @@ func runBootSpawn(cmd *cobra.Command, args []string) error {
 
 	// Save starting status
 	status := &boot.Status{
-		Running:   true,
 		StartedAt: time.Now(),
 	}
 	if err := b.SaveStatus(status); err != nil {
@@ -214,7 +220,6 @@ func runBootSpawn(cmd *cobra.Command, args []string) error {
 	if err := b.Spawn(bootAgentOverride); err != nil {
 		status.Error = err.Error()
 		status.CompletedAt = time.Now()
-		status.Running = false
 		_ = b.SaveStatus(status)
 		return fmt.Errorf("spawning boot: %w", err)
 	}
@@ -242,7 +247,6 @@ func runBootTriage(cmd *cobra.Command, args []string) error {
 
 	startTime := time.Now()
 	status := &boot.Status{
-		Running:   true,
 		StartedAt: startTime,
 	}
 
@@ -252,7 +256,6 @@ func runBootTriage(cmd *cobra.Command, args []string) error {
 
 	status.LastAction = action
 	status.Target = target
-	status.Running = false
 	status.CompletedAt = time.Now()
 
 	if triageErr != nil {
@@ -289,6 +292,13 @@ func runDegradedTriage(b *boot.Boot) (action, target string, err error) {
 
 	tm := b.Tmux()
 
+	// Scan and execute pending death warrants. This is a side effect that runs
+	// before the normal triage decision — warrant execution is mechanical and
+	// does not affect which action runDegradedTriage returns to the caller.
+	if townRoot != "" {
+		executeWarrants(filepath.Join(townRoot, "warrants"), tm)
+	}
+
 	// Check if Deacon session exists
 	deaconSession := getDeaconSessionName()
 	hasDeacon, err := tm.HasSession(deaconSession)
@@ -316,11 +326,11 @@ func runDegradedTriage(b *boot.Boot) (action, target string, err error) {
 	// A session can exist but be stuck (not making progress)
 	if townRoot != "" {
 		hb := deacon.ReadHeartbeat(townRoot)
-		if hb.ShouldPoke() {
+		if hb.IsVeryStale() {
 			// Heartbeat is stale (>15 min) - Deacon is stuck
 			// Nudge the session to try to wake it up
 			age := hb.Age()
-			if age > 30*time.Minute {
+			if age > deaconRestartThreshold {
 				// Very stuck - restart the session.
 				// Use KillSessionWithProcesses to ensure all descendant processes are killed.
 				fmt.Printf("Deacon heartbeat is %s old - restarting session\n", age.Round(time.Minute))
@@ -463,6 +473,48 @@ func getMoleculeLastActivity(molID string) (time.Time, error) {
 		}
 	}
 	return latest, nil
+}
+
+// executeWarrants scans the warrants directory and executes any pending warrants.
+// It is called as a side effect during degraded triage, before the normal
+// Deacon health decision is made. Errors are non-fatal: a failed execution is
+// logged and skipped rather than aborting triage.
+func executeWarrants(warrantDir string, tm *tmux.Tmux) {
+	entries, err := os.ReadDir(warrantDir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			fmt.Printf("Warning: reading warrants dir: %v\n", err)
+		}
+		return
+	}
+
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".warrant.json") {
+			continue
+		}
+
+		path := filepath.Join(warrantDir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			fmt.Printf("Warning: reading warrant file %s: %v\n", entry.Name(), err)
+			continue
+		}
+
+		var w Warrant
+		if err := json.Unmarshal(data, &w); err != nil {
+			fmt.Printf("Warning: parsing warrant file %s: %v\n", entry.Name(), err)
+			continue
+		}
+
+		if w.Executed {
+			continue
+		}
+
+		if err := executeOneWarrant(&w, path, tm); err != nil {
+			fmt.Printf("Warning: executing warrant for %s: %v\n", w.Target, err)
+			continue
+		}
+	}
 }
 
 // formatDurationAgo formats a duration for human display.

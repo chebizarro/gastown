@@ -12,7 +12,6 @@ import (
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
-	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 // Session errors
@@ -26,19 +25,16 @@ type SessionManager struct {
 	tmux     *tmux.Tmux
 	mgr      *Manager
 	townRoot string
-	townName string
 }
 
 // NewSessionManager creates a new dog session manager.
 // The Manager parameter is used to sync persistent dog state (idle/working)
 // when sessions start and stop.
 func NewSessionManager(t *tmux.Tmux, townRoot string, mgr *Manager) *SessionManager {
-	townName, _ := workspace.GetTownName(townRoot)
 	return &SessionManager{
 		tmux:     t,
 		mgr:      mgr,
 		townRoot: townRoot,
-		townName: townName,
 	}
 }
 
@@ -70,9 +66,12 @@ type SessionInfo struct {
 }
 
 // SessionName generates the tmux session name for a dog.
-// Pattern: gt-{town}-deacon-{name}
+// Pattern: hq-dog-{name}
+// Dogs are town-level (managed by deacon), so they use the hq- prefix.
+// We use "hq-dog-" instead of "hq-deacon-" to avoid tmux prefix-matching
+// collisions with the "hq-deacon" session.
 func (m *SessionManager) SessionName(dogName string) string {
-	return fmt.Sprintf("gt-%s-deacon-%s", m.townName, dogName)
+	return fmt.Sprintf("hq-dog-%s", dogName)
 }
 
 // kennelPath returns the path to the dog's kennel directory.
@@ -101,7 +100,7 @@ func (m *SessionManager) Start(dogName string, opts SessionStartOptions) error {
 	if opts.WorkDesc != "" {
 		workInfo = fmt.Sprintf(" Work assigned: %s.", opts.WorkDesc)
 	}
-	instructions := fmt.Sprintf("I am Dog %s.%s Check mail for work: `"+cli.Name()+" mail inbox`. Execute assigned formula/bead. When done, send DOG_DONE mail to deacon/ and return to idle.", dogName, workInfo)
+	instructions := fmt.Sprintf("I am Dog %s.%s Check mail for work: `"+cli.Name()+" mail inbox`. Execute assigned formula/bead. When done, send DOG_DONE mail to deacon/, run `"+cli.Name()+" dog done`, then exit the session. Do NOT idle at the prompt after completing work.", dogName, workInfo)
 
 	// Use unified session lifecycle.
 	theme := tmux.DogTheme()
@@ -112,7 +111,7 @@ func (m *SessionManager) Start(dogName string, opts SessionStartOptions) error {
 		TownRoot:  m.townRoot,
 		AgentName: dogName,
 		Beacon: session.BeaconConfig{
-			Recipient: fmt.Sprintf("deacon/dogs/%s", dogName),
+			Recipient: session.BeaconRecipient("dog", dogName, ""),
 			Sender:    "deacon",
 			Topic:     "assigned",
 		},

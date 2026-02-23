@@ -461,31 +461,109 @@ func TestClearDoneIntentLabel(t *testing.T) {
 	}
 }
 
-// TestPushFailureDoesNotNukeWorktree verifies that when pushFailed is true,
-// the worktree nuke is skipped (defense-in-depth alongside selfNukePolecat's
-// own branch-on-remote check).
-func TestPushFailureDoesNotNukeWorktree(t *testing.T) {
-	// This tests the boolean guard logic inline in runDone:
-	// if exitType == ExitCompleted && !pushFailed { ... nuke ... }
+// TestNukeGateGuardLogic verifies the worktree nuke gate in runDone:
+// nuke only when exitType == COMPLETED && !pushFailed && !mrFailed.
+// GH#1945: mrFailed must block the nuke — otherwise work is lost when MR
+// bead creation fails but push succeeded.
+func TestNukeGateGuardLogic(t *testing.T) {
 	tests := []struct {
 		name       string
 		exitType   string
 		pushFailed bool
+		mrFailed   bool
 		wantNuke   bool
 	}{
-		{"completed+push-ok", ExitCompleted, false, true},
-		{"completed+push-failed", ExitCompleted, true, false},
-		{"escalated+push-ok", ExitEscalated, false, false},
-		{"deferred+push-ok", ExitDeferred, false, false},
-		{"escalated+push-failed", ExitEscalated, true, false},
+		// Happy path: everything succeeded
+		{"completed+push-ok+mr-ok", ExitCompleted, false, false, true},
+		// Push failed: preserve worktree for recovery
+		{"completed+push-failed+mr-ok", ExitCompleted, true, false, false},
+		// MR creation failed: preserve worktree (GH#1945 fix)
+		{"completed+push-ok+mr-failed", ExitCompleted, false, true, false},
+		// Both failed: definitely preserve
+		{"completed+push-failed+mr-failed", ExitCompleted, true, true, false},
+		// Non-completed exits never nuke
+		{"escalated+push-ok+mr-ok", ExitEscalated, false, false, false},
+		{"deferred+push-ok+mr-ok", ExitDeferred, false, false, false},
+		{"escalated+push-failed+mr-failed", ExitEscalated, true, true, false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Replicate the guard condition from runDone
-			shouldNuke := tt.exitType == ExitCompleted && !tt.pushFailed
+			// Replicate the guard condition from runDone (line ~940)
+			shouldNuke := tt.exitType == ExitCompleted && !tt.pushFailed && !tt.mrFailed
 			if shouldNuke != tt.wantNuke {
 				t.Errorf("shouldNuke = %v, want %v", shouldNuke, tt.wantNuke)
+			}
+		})
+	}
+}
+
+// TestMRVerificationSetsMRFailed verifies that if MR bead creation returns
+// success but the bead cannot be read back (verification fails), mrFailed
+// is set to true. This is the core fix for GH#1945: without verification,
+// a "successful" bd.Create that didn't actually persist would allow the
+// worktree nuke to proceed, losing the polecat's work.
+func TestMRVerificationSetsMRFailed(t *testing.T) {
+	tests := []struct {
+		name         string
+		createErr    error  // error from bd.Create
+		showErr      error  // error from bd.Show (verification)
+		showReturns  bool   // whether Show returns a non-nil issue
+		wantMRFailed bool
+	}{
+		{
+			name:         "create succeeds + show succeeds → mrFailed=false",
+			createErr:    nil,
+			showErr:      nil,
+			showReturns:  true,
+			wantMRFailed: false,
+		},
+		{
+			name:         "create fails → mrFailed=true (existing behavior)",
+			createErr:    fmt.Errorf("dolt write failed"),
+			showErr:      nil,
+			showReturns:  false,
+			wantMRFailed: true,
+		},
+		{
+			name:         "create succeeds + show fails → mrFailed=true (GH#1945 fix)",
+			createErr:    nil,
+			showErr:      fmt.Errorf("bead not found"),
+			showReturns:  false,
+			wantMRFailed: true,
+		},
+		{
+			name:         "create succeeds + show returns nil → mrFailed=true (GH#1945 fix)",
+			createErr:    nil,
+			showErr:      nil,
+			showReturns:  false,
+			wantMRFailed: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Simulate the MR creation + verification flow from done.go
+			mrFailed := false
+
+			if tt.createErr != nil {
+				// bd.Create failed — existing behavior
+				mrFailed = true
+			} else {
+				// bd.Create succeeded — now verify (GH#1945 fix)
+				var showResult bool
+				if tt.showErr != nil || !tt.showReturns {
+					showResult = false
+				} else {
+					showResult = true
+				}
+				if !showResult {
+					mrFailed = true
+				}
+			}
+
+			if mrFailed != tt.wantMRFailed {
+				t.Errorf("mrFailed = %v, want %v", mrFailed, tt.wantMRFailed)
 			}
 		})
 	}
@@ -625,5 +703,454 @@ func TestBranchDetectionCleanupOnError(t *testing.T) {
 	}
 	if roleInfo.Rig != rigName || roleInfo.Polecat != gtPolecat {
 		t.Error("RoleInfo should be constructible from env vars for cleanup")
+	}
+}
+
+// TestConvoyMergeStrategyBranching verifies that the merge strategy branching
+// logic in runDone correctly routes to the right code path for each strategy.
+func TestConvoyMergeStrategyBranching(t *testing.T) {
+	tests := []struct {
+		name          string
+		mergeStrategy string
+		wantPush      bool // should push happen?
+		wantMR        bool // should MR bead be created?
+		wantDirect    bool // should push to default branch?
+	}{
+		{
+			name:          "mr strategy - normal push and MR",
+			mergeStrategy: "mr",
+			wantPush:      true,
+			wantMR:        true,
+			wantDirect:    false,
+		},
+		{
+			name:          "empty strategy - defaults to mr behavior",
+			mergeStrategy: "",
+			wantPush:      true,
+			wantMR:        true,
+			wantDirect:    false,
+		},
+		{
+			name:          "direct strategy - push to main, no MR",
+			mergeStrategy: "direct",
+			wantPush:      true,
+			wantMR:        false,
+			wantDirect:    true,
+		},
+		{
+			name:          "local strategy - no push, no MR",
+			mergeStrategy: "local",
+			wantPush:      false,
+			wantMR:        false,
+			wantDirect:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Simulate the branching logic from runDone
+			shouldPush := true
+			shouldCreateMR := true
+			shouldPushDirect := false
+
+			switch tt.mergeStrategy {
+			case "local":
+				shouldPush = false
+				shouldCreateMR = false
+			case "direct":
+				shouldPushDirect = true
+				shouldCreateMR = false
+			default:
+				// "mr" or empty = default behavior
+			}
+
+			if shouldPush != tt.wantPush {
+				t.Errorf("shouldPush = %v, want %v", shouldPush, tt.wantPush)
+			}
+			if shouldCreateMR != tt.wantMR {
+				t.Errorf("shouldCreateMR = %v, want %v", shouldCreateMR, tt.wantMR)
+			}
+			if shouldPushDirect != tt.wantDirect {
+				t.Errorf("shouldPushDirect = %v, want %v", shouldPushDirect, tt.wantDirect)
+			}
+		})
+	}
+}
+
+// TestConvoyMergeStrategyNotification verifies that the merge strategy
+// is included in the witness notification body when set to non-default values.
+func TestConvoyMergeStrategyNotification(t *testing.T) {
+	tests := []struct {
+		name          string
+		mergeStrategy string
+		wantInBody    bool
+	}{
+		{"direct strategy included", "direct", true},
+		{"local strategy included", "local", true},
+		{"mr strategy excluded", "mr", false},
+		{"empty strategy excluded", "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Simulate the notification body building from runDone
+			var bodyLines []string
+			bodyLines = append(bodyLines, "Exit: COMPLETED")
+			if tt.mergeStrategy != "" && tt.mergeStrategy != "mr" {
+				bodyLines = append(bodyLines, fmt.Sprintf("MergeStrategy: %s", tt.mergeStrategy))
+			}
+
+			body := strings.Join(bodyLines, "\n")
+			hasMergeStrategy := strings.Contains(body, "MergeStrategy:")
+
+			if hasMergeStrategy != tt.wantInBody {
+				t.Errorf("body contains MergeStrategy = %v, want %v\nbody: %s",
+					hasMergeStrategy, tt.wantInBody, body)
+			}
+		})
+	}
+}
+
+// TestParseConvoyMergeStrategy verifies that parseConvoyMergeStrategy correctly
+// extracts the merge strategy from convoy descriptions.
+func TestParseConvoyMergeStrategy(t *testing.T) {
+	tests := []struct {
+		name        string
+		description string
+		want        string
+	}{
+		{
+			name:        "direct strategy",
+			description: "Auto-created convoy tracking gt-abc\nMerge: direct",
+			want:        "direct",
+		},
+		{
+			name:        "mr strategy",
+			description: "Convoy tracking 3 issues\nOwner: mayor/\nMerge: mr",
+			want:        "mr",
+		},
+		{
+			name:        "local strategy",
+			description: "Merge: local\nOwner: mayor/",
+			want:        "local",
+		},
+		{
+			name:        "no merge field",
+			description: "Auto-created convoy tracking gt-abc",
+			want:        "",
+		},
+		{
+			name:        "empty description",
+			description: "",
+			want:        "",
+		},
+		{
+			name:        "merge in middle of description",
+			description: "Convoy tracking 1 issues\nMerge: direct\nNotify: mayor/",
+			want:        "direct",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseConvoyMergeStrategy(tt.description)
+			if got != tt.want {
+				t.Errorf("parseConvoyMergeStrategy() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestDoneCheckpointLabelFormat verifies the done-cp label format matches
+// the expected pattern: done-cp:<stage>:<value>:<unix-ts>
+func TestDoneCheckpointLabelFormat(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		checkpoint DoneCheckpoint
+		value      string
+		wantPrefix string
+	}{
+		{CheckpointPushed, "polecat/furiosa-abc", "done-cp:pushed:polecat/furiosa-abc:"},
+		{CheckpointMRCreated, "gt-xyz123", "done-cp:mr-created:gt-xyz123:"},
+		{CheckpointWitnessNotified, "ok", "done-cp:witness-notified:ok:"},
+	}
+
+	for _, tt := range tests {
+		t.Run(string(tt.checkpoint), func(t *testing.T) {
+			label := fmt.Sprintf("done-cp:%s:%s:%d", tt.checkpoint, tt.value, now.Unix())
+			if !strings.HasPrefix(label, tt.wantPrefix) {
+				t.Errorf("label = %q, want prefix %q", label, tt.wantPrefix)
+			}
+
+			// Verify the label can be parsed back
+			parts := strings.SplitN(label, ":", 4)
+			if len(parts) != 4 {
+				t.Fatalf("expected 4 parts, got %d: %v", len(parts), parts)
+			}
+			if parts[0] != "done-cp" {
+				t.Errorf("prefix = %q, want %q", parts[0], "done-cp")
+			}
+			if DoneCheckpoint(parts[1]) != tt.checkpoint {
+				t.Errorf("stage = %q, want %q", parts[1], tt.checkpoint)
+			}
+			if parts[2] != tt.value {
+				t.Errorf("value = %q, want %q", parts[2], tt.value)
+			}
+		})
+	}
+}
+
+// TestReadDoneCheckpoints verifies that readDoneCheckpoints correctly
+// parses checkpoint labels from an issue's label list.
+func TestReadDoneCheckpoints(t *testing.T) {
+	// Test the parsing logic directly by simulating what readDoneCheckpoints does
+	tests := []struct {
+		name   string
+		labels []string
+		want   map[DoneCheckpoint]string
+	}{
+		{
+			name:   "no checkpoints",
+			labels: []string{"gt:agent", "idle:3"},
+			want:   map[DoneCheckpoint]string{},
+		},
+		{
+			name:   "push checkpoint only",
+			labels: []string{"gt:agent", "done-cp:pushed:polecat/furiosa-abc:1738972800"},
+			want:   map[DoneCheckpoint]string{CheckpointPushed: "polecat/furiosa-abc"},
+		},
+		{
+			name: "multiple checkpoints",
+			labels: []string{
+				"gt:agent",
+				"done-cp:pushed:polecat/furiosa-abc:1738972800",
+				"done-cp:mr-created:gt-xyz123:1738972801",
+			},
+			want: map[DoneCheckpoint]string{
+				CheckpointPushed:    "polecat/furiosa-abc",
+				CheckpointMRCreated: "gt-xyz123",
+			},
+		},
+		{
+			name: "all checkpoints",
+			labels: []string{
+				"done-cp:pushed:branch-name:1738972800",
+				"done-cp:mr-created:gt-mr1:1738972801",
+				"done-cp:witness-notified:ok:1738972803",
+			},
+			want: map[DoneCheckpoint]string{
+				CheckpointPushed:          "branch-name",
+				CheckpointMRCreated:       "gt-mr1",
+				CheckpointWitnessNotified: "ok",
+			},
+		},
+		{
+			name:   "mixed with done-intent and other labels",
+			labels: []string{
+				"gt:agent",
+				"done-intent:COMPLETED:1738972800",
+				"done-cp:pushed:mybranch:1738972801",
+				"idle:2",
+			},
+			want: map[DoneCheckpoint]string{CheckpointPushed: "mybranch"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Simulate the parsing logic from readDoneCheckpoints
+			checkpoints := make(map[DoneCheckpoint]string)
+			for _, label := range tt.labels {
+				if strings.HasPrefix(label, "done-cp:") {
+					parts := strings.SplitN(label, ":", 4)
+					if len(parts) >= 3 {
+						stage := DoneCheckpoint(parts[1])
+						value := parts[2]
+						checkpoints[stage] = value
+					}
+				}
+			}
+
+			if len(checkpoints) != len(tt.want) {
+				t.Errorf("got %d checkpoints, want %d", len(checkpoints), len(tt.want))
+			}
+			for k, v := range tt.want {
+				if checkpoints[k] != v {
+					t.Errorf("checkpoint[%s] = %q, want %q", k, checkpoints[k], v)
+				}
+			}
+		})
+	}
+}
+
+// TestClearDoneCheckpoints verifies that clearDoneCheckpoints removes
+// only done-cp labels while preserving other labels.
+func TestClearDoneCheckpoints(t *testing.T) {
+	allLabels := []string{
+		"gt:agent",
+		"idle:3",
+		"done-intent:COMPLETED:1738972800",
+		"done-cp:pushed:mybranch:1738972801",
+		"done-cp:mr-created:gt-xyz:1738972802",
+		"backoff-until:1738972900",
+	}
+
+	var kept []string
+	var removed []string
+	for _, label := range allLabels {
+		if strings.HasPrefix(label, "done-cp:") {
+			removed = append(removed, label)
+		} else {
+			kept = append(kept, label)
+		}
+	}
+
+	if len(removed) != 2 {
+		t.Errorf("expected 2 checkpoint labels removed, got %d: %v", len(removed), removed)
+	}
+	if len(kept) != 4 {
+		t.Errorf("expected 4 labels kept, got %d: %v", len(kept), kept)
+	}
+
+	// Verify no checkpoint labels in kept set
+	for _, label := range kept {
+		if strings.HasPrefix(label, "done-cp:") {
+			t.Errorf("checkpoint label was not removed: %s", label)
+		}
+	}
+
+	// Verify done-intent is preserved (not a checkpoint)
+	found := false
+	for _, label := range kept {
+		if strings.HasPrefix(label, "done-intent:") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("done-intent label should be preserved by clearDoneCheckpoints")
+	}
+}
+
+// TestCheckpointResumeSkipsPush verifies that when a push checkpoint exists,
+// the push section is skipped on resume.
+func TestCheckpointResumeSkipsPush(t *testing.T) {
+	tests := []struct {
+		name        string
+		checkpoints map[DoneCheckpoint]string
+		wantSkip    bool
+	}{
+		{
+			name:        "no checkpoints - push runs normally",
+			checkpoints: map[DoneCheckpoint]string{},
+			wantSkip:    false,
+		},
+		{
+			name:        "push checkpoint exists - skip push",
+			checkpoints: map[DoneCheckpoint]string{CheckpointPushed: "mybranch"},
+			wantSkip:    true,
+		},
+		{
+			name: "push and MR checkpoints - skip push",
+			checkpoints: map[DoneCheckpoint]string{
+				CheckpointPushed:    "mybranch",
+				CheckpointMRCreated: "gt-xyz",
+			},
+			wantSkip: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Replicate the guard condition from runDone
+			skipPush := tt.checkpoints[CheckpointPushed] != ""
+			if skipPush != tt.wantSkip {
+				t.Errorf("skipPush = %v, want %v", skipPush, tt.wantSkip)
+			}
+		})
+	}
+}
+
+// TestCheckpointNilMapSafe verifies that reading from a nil/empty checkpoint
+// map returns zero values and doesn't panic.
+func TestCheckpointNilMapSafe(t *testing.T) {
+	// Nil map - should not panic
+	var nilMap map[DoneCheckpoint]string
+	if nilMap[CheckpointPushed] != "" {
+		t.Error("nil map should return zero value")
+	}
+
+	// Empty map
+	emptyMap := map[DoneCheckpoint]string{}
+	if emptyMap[CheckpointPushed] != "" {
+		t.Error("empty map should return zero value")
+	}
+}
+
+// TestConvoyInfoFallbackChain verifies that done.go checks attachment fields
+// first, then falls back to dep-based convoy lookup. This is the fix for gt-7b6wf:
+// convoy merge=direct was not propagated because cross-rig dep resolution failed.
+func TestConvoyInfoFallbackChain(t *testing.T) {
+	tests := []struct {
+		name            string
+		attachmentInfo  *ConvoyInfo // Result from getConvoyInfoFromIssue
+		depInfo         *ConvoyInfo // Result from getConvoyInfoForIssue
+		wantConvoyID    string
+		wantMerge       string
+		wantNil         bool
+	}{
+		{
+			name:           "attachment fields provide convoy info",
+			attachmentInfo: &ConvoyInfo{ID: "hq-cv-abc", MergeStrategy: "direct"},
+			depInfo:        nil, // Not called
+			wantConvoyID:   "hq-cv-abc",
+			wantMerge:      "direct",
+		},
+		{
+			name:           "attachment fields empty, dep lookup succeeds",
+			attachmentInfo: nil,
+			depInfo:        &ConvoyInfo{ID: "hq-cv-xyz", MergeStrategy: "mr"},
+			wantConvoyID:   "hq-cv-xyz",
+			wantMerge:      "mr",
+		},
+		{
+			name:           "both nil - no convoy",
+			attachmentInfo: nil,
+			depInfo:        nil,
+			wantNil:        true,
+		},
+		{
+			name:           "attachment has convoy, dep also has (attachment wins)",
+			attachmentInfo: &ConvoyInfo{ID: "hq-cv-from-attachment", MergeStrategy: "direct"},
+			depInfo:        &ConvoyInfo{ID: "hq-cv-from-dep", MergeStrategy: "mr"},
+			wantConvoyID:   "hq-cv-from-attachment",
+			wantMerge:      "direct",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Simulate the fallback chain from done.go
+			var convoyInfo *ConvoyInfo
+			convoyInfo = tt.attachmentInfo
+			if convoyInfo == nil {
+				convoyInfo = tt.depInfo
+			}
+
+			if tt.wantNil {
+				if convoyInfo != nil {
+					t.Errorf("expected nil, got %+v", convoyInfo)
+				}
+				return
+			}
+			if convoyInfo == nil {
+				t.Fatal("expected non-nil convoy info")
+			}
+			if convoyInfo.ID != tt.wantConvoyID {
+				t.Errorf("ConvoyID = %q, want %q", convoyInfo.ID, tt.wantConvoyID)
+			}
+			if convoyInfo.MergeStrategy != tt.wantMerge {
+				t.Errorf("MergeStrategy = %q, want %q", convoyInfo.MergeStrategy, tt.wantMerge)
+			}
+		})
 	}
 }

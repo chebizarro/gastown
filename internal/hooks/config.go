@@ -32,6 +32,8 @@ type HooksConfig struct {
 	Stop             []HookEntry `json:"Stop,omitempty"`
 	PreCompact       []HookEntry `json:"PreCompact,omitempty"`
 	UserPromptSubmit []HookEntry `json:"UserPromptSubmit,omitempty"`
+	WorktreeCreate   []HookEntry `json:"WorktreeCreate,omitempty"`
+	WorktreeRemove   []HookEntry `json:"WorktreeRemove,omitempty"`
 }
 
 // SettingsJSON represents the full Claude Code settings.json structure.
@@ -76,19 +78,26 @@ func UnmarshalSettings(data []byte) (*SettingsJSON, error) {
 }
 
 // MarshalSettings serializes a SettingsJSON, preserving unknown fields.
+// Does not mutate the input — works on a copy of Extra.
 func MarshalSettings(s *SettingsJSON) ([]byte, error) {
-	if s.Extra == nil {
-		s.Extra = make(map[string]json.RawMessage)
+	// Copy Extra to avoid mutating the input
+	out := make(map[string]json.RawMessage, len(s.Extra))
+	for k, v := range s.Extra {
+		out[k] = v
 	}
 
-	// Write known fields back into the map
+	// Write known fields back into the map, or delete if zero-valued
 	if s.EditorMode != "" {
 		raw, _ := json.Marshal(s.EditorMode)
-		s.Extra["editorMode"] = raw
+		out["editorMode"] = raw
+	} else {
+		delete(out, "editorMode")
 	}
 	if s.EnabledPlugins != nil {
 		raw, _ := json.Marshal(s.EnabledPlugins)
-		s.Extra["enabledPlugins"] = raw
+		out["enabledPlugins"] = raw
+	} else {
+		delete(out, "enabledPlugins")
 	}
 
 	// Always write hooks (even if empty, it's the managed section)
@@ -96,9 +105,9 @@ func MarshalSettings(s *SettingsJSON) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	s.Extra["hooks"] = raw
+	out["hooks"] = raw
 
-	return json.MarshalIndent(s.Extra, "", "  ")
+	return json.MarshalIndent(out, "", "  ")
 }
 
 // LoadSettings reads and parses a settings.json file, preserving unknown fields.
@@ -157,9 +166,79 @@ func Merge(base, override *HooksConfig) *HooksConfig {
 	return applyOverride(result, override)
 }
 
+// DefaultOverrides returns built-in role-specific hook overrides.
+// On-disk overrides (in ~/.gt/hooks-overrides/) layer on top of these.
+//
+// Crew workers get auto-session-cycling on PreCompact: instead of compacting
+// context (which degrades quality), the session is replaced with a fresh one.
+// The successor picks up hooked work via SessionStart hook (gt prime --hook).
+func DefaultOverrides() map[string]*HooksConfig {
+	pathSetup := `export PATH="$HOME/go/bin:$HOME/.local/bin:$PATH"`
+
+	return map[string]*HooksConfig{
+		// Crew workers: auto-cycle session on context compaction (gt-op78).
+		// Instead of compacting (lossy), replace with fresh session that
+		// inherits hooked work. The --cycle flag does: collect state →
+		// send handoff mail → respawn pane with fresh Claude instance.
+		"crew": {
+			PreCompact: []HookEntry{
+				{
+					Matcher: "",
+					Hooks: []Hook{
+						{
+							Type:    "command",
+							Command: fmt.Sprintf("%s && gt handoff --cycle --reason compaction", pathSetup),
+						},
+					},
+				},
+			},
+		},
+		// Witness roles: patrol-formula-guard (gt-e47hxn).
+		// Blocks patrol formulas from using persistent molecules — must use wisps.
+		// Without this, witnesses could accidentally create permanent patrol molecules
+		// that survive session restarts and accumulate unbounded.
+		"witness": {
+			PreToolUse: []HookEntry{
+				{
+					Matcher: "Bash(*bd mol pour*patrol*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*bd mol pour *mol-witness*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*bd mol pour *mol-deacon*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*bd mol pour *mol-refinery*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+			},
+		},
+	}
+}
+
 // ComputeExpected computes the expected HooksConfig for a target by loading
 // the base config and applying all applicable overrides in order of specificity.
 // If no base config exists, uses DefaultBase().
+//
+// For each override key, built-in defaults (from DefaultOverrides)
+// are merged first, then on-disk overrides layer on top. On-disk overrides can
+// replace or extend base hooks by providing matching PreToolUse entries.
 func ComputeExpected(target string) (*HooksConfig, error) {
 	base, err := LoadBase()
 	if err != nil {
@@ -170,8 +249,15 @@ func ComputeExpected(target string) (*HooksConfig, error) {
 		}
 	}
 
+	defaults := DefaultOverrides()
 	result := base
 	for _, overrideKey := range GetApplicableOverrides(target) {
+		// Always apply built-in defaults first
+		if def, ok := defaults[overrideKey]; ok {
+			result = Merge(result, def)
+		}
+
+		// Then layer on-disk overrides on top
 		override, err := LoadOverride(overrideKey)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -286,7 +372,7 @@ func isRig(path string) bool {
 }
 
 // EventTypes returns the known hook event type names in display order.
-var EventTypes = []string{"PreToolUse", "PostToolUse", "SessionStart", "Stop", "PreCompact", "UserPromptSubmit"}
+var EventTypes = []string{"PreToolUse", "PostToolUse", "SessionStart", "Stop", "PreCompact", "UserPromptSubmit", "WorktreeCreate", "WorktreeRemove"}
 
 // GetEntries returns the hook entries for a given event type.
 func (c *HooksConfig) GetEntries(eventType string) []HookEntry {
@@ -303,6 +389,10 @@ func (c *HooksConfig) GetEntries(eventType string) []HookEntry {
 		return c.PreCompact
 	case "UserPromptSubmit":
 		return c.UserPromptSubmit
+	case "WorktreeCreate":
+		return c.WorktreeCreate
+	case "WorktreeRemove":
+		return c.WorktreeRemove
 	default:
 		return nil
 	}
@@ -323,6 +413,10 @@ func (c *HooksConfig) SetEntries(eventType string, entries []HookEntry) {
 		c.PreCompact = entries
 	case "UserPromptSubmit":
 		c.UserPromptSubmit = entries
+	case "WorktreeCreate":
+		c.WorktreeCreate = entries
+	case "WorktreeRemove":
+		c.WorktreeRemove = entries
 	}
 }
 
@@ -554,8 +648,24 @@ func loadConfig(path string) (*HooksConfig, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parsing %s: %w", path, err)
 	}
+	if err := validateUniqueMatchers(&cfg); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", path, err)
+	}
 
 	return &cfg, nil
+}
+
+func validateUniqueMatchers(cfg *HooksConfig) error {
+	for _, eventType := range EventTypes {
+		seen := make(map[string]struct{})
+		for _, entry := range cfg.GetEntries(eventType) {
+			if _, exists := seen[entry.Matcher]; exists {
+				return fmt.Errorf("duplicate matcher %q in %s", entry.Matcher, eventType)
+			}
+			seen[entry.Matcher] = struct{}{}
+		}
+	}
+	return nil
 }
 
 // saveConfig writes a HooksConfig to a JSON file, creating directories as needed.

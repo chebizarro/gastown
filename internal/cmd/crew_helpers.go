@@ -3,13 +3,13 @@ package cmd
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/crew"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -40,7 +40,7 @@ func getCrewManager(rigName string) (*crew.Manager, *rig.Rig, error) {
 
 // crewSessionName generates the tmux session name for a crew worker.
 func crewSessionName(rigName, crewName string) string {
-	return fmt.Sprintf("gt-%s-crew-%s", rigName, crewName)
+	return session.CrewSessionName(session.PrefixFor(rigName), crewName)
 }
 
 // crewDetection holds the result of detecting crew workspace from cwd.
@@ -94,57 +94,42 @@ func detectCrewFromCwd() (*crewDetection, error) {
 	}, nil
 }
 
-// parseCrewSessionName extracts rig and crew name from a tmux session name.
-// Format: gt-<rig>-crew-<name>
+// parseCrewSessionName extracts rig, crew name, and prefix from a tmux session name.
+// Format: <prefix>-crew-<name>
 // Returns empty strings and false if the format doesn't match.
-func parseCrewSessionName(sessionName string) (rigName, crewName string, ok bool) {
-	// Must start with "gt-" and contain "-crew-"
-	if !strings.HasPrefix(sessionName, "gt-") {
-		return "", "", false
+func parseCrewSessionName(sessionName string) (rigName, crewName, prefix string, ok bool) {
+	identity, err := session.ParseSessionName(sessionName)
+	if err != nil {
+		return "", "", "", false
 	}
-
-	// Remove "gt-" prefix
-	rest := sessionName[3:]
-
-	// Find "-crew-" separator
-	idx := strings.Index(rest, "-crew-")
-	if idx == -1 {
-		return "", "", false
+	if identity.Role != session.RoleCrew {
+		return "", "", "", false
 	}
-
-	rigName = rest[:idx]
-	crewName = rest[idx+6:] // len("-crew-") = 6
-
-	if rigName == "" || crewName == "" {
-		return "", "", false
+	if identity.Rig == "" || identity.Name == "" {
+		return "", "", "", false
 	}
-
-	return rigName, crewName, true
+	return identity.Rig, identity.Name, identity.Prefix, true
 }
 
-// findRigCrewSessions returns all crew sessions for a given rig, sorted alphabetically.
-// Uses tmux list-sessions to find sessions matching gt-<rig>-crew-* pattern.
-func findRigCrewSessions(rigName string) ([]string, error) { //nolint:unparam // error return kept for future use
-	cmd := exec.Command("tmux", "list-sessions", "-F", "#{session_name}")
-	out, err := cmd.Output()
+// findRigCrewSessions returns all crew sessions for a given rig.
+// Finds sessions matching <prefix>-crew-* pattern.
+// rigPrefix is the rig's beads prefix (e.g., "gt", "bd") — passed directly from
+// the parsed session identity to avoid re-derivation failures when the registry
+// isn't loaded.
+func findRigCrewSessions(rigPrefix string) ([]string, error) { //nolint:unparam // error return kept for future use
+	allSessions, err := listTmuxSessions()
 	if err != nil {
-		// No tmux server or no sessions
 		return nil, nil
 	}
 
-	prefix := fmt.Sprintf("gt-%s-crew-", rigName)
+	prefix := rigPrefix + "-crew-"
 	var sessions []string
 
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if line == "" {
-			continue
-		}
-		if strings.HasPrefix(line, prefix) {
-			sessions = append(sessions, line)
+	for _, s := range allSessions {
+		if strings.HasPrefix(s, prefix) {
+			sessions = append(sessions, s)
 		}
 	}
 
-	// Sessions are already sorted by tmux, but sort explicitly for consistency
-	// (alphabetical by session name means alphabetical by crew name)
 	return sessions, nil
 }

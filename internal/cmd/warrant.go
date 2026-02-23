@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -25,12 +26,12 @@ var (
 
 // Warrant represents a death warrant for an agent
 type Warrant struct {
-	ID        string    `json:"id"`
-	Target    string    `json:"target"`    // e.g., "gastown/polecats/alpha", "deacon/dogs/bravo"
-	Reason    string    `json:"reason"`
-	FiledBy   string    `json:"filed_by"`
-	FiledAt   time.Time `json:"filed_at"`
-	Executed  bool      `json:"executed,omitempty"`
+	ID         string     `json:"id"`
+	Target     string     `json:"target"` // e.g., "gastown/polecats/alpha", "deacon/dogs/bravo"
+	Reason     string     `json:"reason"`
+	FiledBy    string     `json:"filed_by"`
+	FiledAt    time.Time  `json:"filed_at"`
+	Executed   bool       `json:"executed,omitempty"`
 	ExecutedAt *time.Time `json:"executed_at,omitempty"`
 }
 
@@ -302,34 +303,69 @@ func runWarrantExecute(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Determine session name from target
-	sessionName, err := targetToSessionName(target)
-	if err != nil {
-		return fmt.Errorf("determining session name: %w", err)
-	}
-
-	// Kill the session if it exists
 	tm := tmux.NewTmux()
-	if has, _ := tm.HasSession(sessionName); has {
-		if err := tm.KillSession(sessionName); err != nil {
-			return fmt.Errorf("killing session %s: %w", sessionName, err)
-		}
-		fmt.Printf("✓ Terminated session %s\n", sessionName)
-	} else {
-		fmt.Printf("  Session %s not found (already dead)\n", sessionName)
-	}
 
-	// Mark warrant as executed
 	if warrant != nil {
-		now := time.Now()
-		warrant.Executed = true
-		warrant.ExecutedAt = &now
-
-		data, _ := json.MarshalIndent(warrant, "", "  ")
-		_ = os.WriteFile(warrantPath, data, 0644)
+		if err := executeOneWarrant(warrant, warrantPath, tm); err != nil {
+			return fmt.Errorf("executing warrant: %w", err)
+		}
+	} else {
+		// --force without a warrant file: just kill the session
+		sessionName, err := targetToSessionName(target)
+		if err != nil {
+			return fmt.Errorf("determining session name: %w", err)
+		}
+		if has, err := tm.HasSession(sessionName); err != nil {
+			return fmt.Errorf("checking session %s: %w", sessionName, err)
+		} else if has {
+			if err := tm.KillSessionWithProcesses(sessionName); err != nil {
+				return fmt.Errorf("killing session %s: %w", sessionName, err)
+			}
+			fmt.Printf("✓ Terminated session %s\n", sessionName)
+		} else {
+			fmt.Printf("  Session %s not found (already dead)\n", sessionName)
+		}
 	}
 
 	fmt.Printf("✓ Warrant executed for %s\n", style.Bold.Render(target))
+	return nil
+}
+
+// executeOneWarrant executes a single pending warrant: checks if the target
+// session exists, kills it with full process tree cleanup, and marks the warrant
+// as executed on disk. Returns nil on success. On error, the warrant is NOT
+// marked as executed so it can be retried on the next triage cycle.
+func executeOneWarrant(w *Warrant, warrantPath string, tm *tmux.Tmux) error {
+	sessionName, err := targetToSessionName(w.Target)
+	if err != nil {
+		return fmt.Errorf("invalid target %s: %w", w.Target, err)
+	}
+
+	has, err := tm.HasSession(sessionName)
+	if err != nil {
+		return fmt.Errorf("checking session %s: %w", sessionName, err)
+	}
+
+	if has {
+		if err := tm.KillSessionWithProcesses(sessionName); err != nil {
+			return fmt.Errorf("killing session %s: %w", sessionName, err)
+		}
+		fmt.Printf("Warrant executed: terminated session %s (%s)\n", sessionName, w.Target)
+	} else {
+		fmt.Printf("Warrant executed: session %s already dead (%s)\n", sessionName, w.Target)
+	}
+
+	now := time.Now()
+	w.Executed = true
+	w.ExecutedAt = &now
+	data, err := json.MarshalIndent(w, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshaling warrant: %w", err)
+	}
+	if err := os.WriteFile(warrantPath, data, 0644); err != nil {
+		return fmt.Errorf("writing warrant file: %w", err)
+	}
+
 	return nil
 }
 
@@ -337,27 +373,29 @@ func runWarrantExecute(cmd *cobra.Command, args []string) error {
 func targetToSessionName(target string) (string, error) {
 	parts := strings.Split(target, "/")
 
-	// Handle different target formats
 	switch {
 	case len(parts) == 3 && parts[1] == "polecats":
-		// gastown/polecats/alpha -> gt-gastown-alpha
-		return fmt.Sprintf("gt-%s-%s", parts[0], parts[2]), nil
+		// gastown/polecats/alpha -> {prefix}-alpha
+		return session.PolecatSessionName(session.PrefixFor(parts[0]), parts[2]), nil
+	case len(parts) == 3 && parts[1] == "crew":
+		// gastown/crew/bob -> {prefix}-crew-bob
+		return session.CrewSessionName(session.PrefixFor(parts[0]), parts[2]), nil
+	case len(parts) == 2 && parts[1] == "witness":
+		// gastown/witness -> {prefix}-witness
+		return session.WitnessSessionName(session.PrefixFor(parts[0])), nil
+	case len(parts) == 2 && parts[1] == "refinery":
+		// gastown/refinery -> {prefix}-refinery
+		return session.RefinerySessionName(session.PrefixFor(parts[0])), nil
 	case len(parts) == 2 && parts[0] == "deacon" && parts[1] == "dogs":
-		// This shouldn't happen - need dog name
 		return "", fmt.Errorf("invalid target: need dog name (e.g., deacon/dogs/alpha)")
 	case len(parts) == 3 && parts[0] == "deacon" && parts[1] == "dogs":
-		// deacon/dogs/alpha -> gt-dog-alpha (or gt-<town>-deacon-alpha)
-		townRoot, err := workspace.FindFromCwd()
-		if err != nil {
-			return fmt.Sprintf("gt-dog-%s", parts[2]), nil
-		}
-		townName, err := workspace.GetTownName(townRoot)
-		if err != nil {
-			return fmt.Sprintf("gt-dog-%s", parts[2]), nil
-		}
-		return fmt.Sprintf("gt-%s-deacon-%s", townName, parts[2]), nil
+		// deacon/dogs/alpha -> hq-dog-alpha
+		return fmt.Sprintf("hq-dog-%s", parts[2]), nil
 	default:
-		// Fallback: just use the target with dashes
-		return "gt-" + strings.ReplaceAll(target, "/", "-"), nil
+		prefix := session.DefaultPrefix
+		if len(parts) > 0 {
+			prefix = session.PrefixFor(parts[0])
+		}
+		return prefix + "-" + strings.ReplaceAll(target, "/", "-"), nil
 	}
 }

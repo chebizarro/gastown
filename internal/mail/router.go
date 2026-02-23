@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -23,6 +26,10 @@ var ErrUnknownQueue = errors.New("unknown queue")
 // ErrUnknownAnnounce indicates an announce channel name was not found in configuration.
 var ErrUnknownAnnounce = errors.New("unknown announce channel")
 
+// DefaultIdleNotifyTimeout is how long the router waits for a recipient's
+// session to become idle before falling back to a queued nudge.
+const DefaultIdleNotifyTimeout = 1 * time.Second
+
 // Router handles message delivery via beads.
 // It routes messages to the correct beads database based on address:
 // - Town-level (mayor/, deacon/) -> {townRoot}/.beads
@@ -31,6 +38,12 @@ type Router struct {
 	workDir  string // fallback directory to run bd commands in
 	townRoot string // town root directory (e.g., ~/gt)
 	tmux     *tmux.Tmux
+
+	// IdleNotifyTimeout controls how long to wait for a session to become
+	// idle before falling back to a queued nudge. Zero uses the default.
+	IdleNotifyTimeout time.Duration
+
+	notifyWg sync.WaitGroup // tracks in-flight async notifications
 }
 
 // NewRouter creates a new mail router.
@@ -54,6 +67,13 @@ func NewRouterWithTownRoot(workDir, townRoot string) *Router {
 		townRoot: townRoot,
 		tmux:     tmux.NewTmux(),
 	}
+}
+
+// WaitPendingNotifications blocks until all in-flight async notifications
+// have completed. CLI commands should call this before exiting to avoid
+// losing notifications that are still being delivered.
+func (r *Router) WaitPendingNotifications() {
+	r.notifyWg.Wait()
 }
 
 // isListAddress returns true if the address uses list:name syntax.
@@ -172,14 +192,11 @@ func detectTownRoot(startDir string) string {
 	return townRoot
 }
 
-// resolveBeadsDir returns the correct .beads directory for the given address.
+// resolveBeadsDir returns the correct .beads directory for mail delivery.
 //
-// Two-level beads architecture:
-// - ALL mail uses town beads ({townRoot}/.beads) regardless of address
-// - Rig-level beads ({rig}/.beads) are for project issues only, not mail
-//
-// This ensures messages are visible to all agents in the town.
-func (r *Router) resolveBeadsDir(_ string) string { // address unused: all mail uses town-level beads
+// All mail uses town beads ({townRoot}/.beads). Rig-level beads ({rig}/.beads)
+// are for project issues only, not mail.
+func (r *Router) resolveBeadsDir() string {
 	// If no town root, fall back to workDir's .beads
 	if r.townRoot == "" {
 		return filepath.Join(r.workDir, ".beads")
@@ -284,11 +301,13 @@ func parseGroupAddress(address string) *ParsedGroup {
 
 // agentBead represents an agent bead as returned by bd list --label=gt:agent.
 type agentBead struct {
-	ID          string `json:"id"`
-	Title       string `json:"title"`
-	Description string `json:"description"`
-	Status      string `json:"status"`
-	CreatedBy   string `json:"created_by"`
+	ID          string   `json:"id"`
+	Title       string   `json:"title"`
+	Description string   `json:"description"`
+	Status      string   `json:"status"`
+	CreatedBy   string   `json:"created_by"`
+	Type        string   `json:"issue_type"`
+	Labels      []string `json:"labels"`
 }
 
 // agentBeadToAddress converts an agent bead to a mail address.
@@ -328,25 +347,45 @@ func agentBeadToAddress(bead *agentBead) string {
 		return parseRigAgentAddress(bead)
 	}
 
+	// Agent bead IDs include the role explicitly: gt-<rig>-<role>[-<name>]
+	// Scan from right for known role markers to handle hyphenated rig names.
 	parts := strings.Split(rest, "-")
 
-	switch len(parts) {
-	case 1:
+	if len(parts) == 1 {
 		// Town-level: gt-mayor, gt-deacon
 		return parts[0] + "/"
-	case 2:
-		// Rig singleton: gt-gastown-witness
-		return parts[0] + "/" + parts[1]
-	default:
-		// Rig named agent: gt-gastown-crew-max, gt-gastown-polecat-Toast
-		// Skip the role part (parts[1]) and use rig/name format
-		if len(parts) >= 3 {
-			// Rejoin if name has hyphens: gt-gastown-polecat-my-agent
-			name := strings.Join(parts[2:], "-")
-			return parts[0] + "/" + name
-		}
-		return ""
 	}
+
+	// Scan from right for known role markers
+	for i := len(parts) - 1; i >= 1; i-- {
+		switch parts[i] {
+		case "witness", "refinery":
+			// Singleton role: rig is everything before the role
+			rig := strings.Join(parts[:i], "-")
+			return rig + "/" + parts[i]
+		case "crew", "polecat":
+			// Named role: rig is before role, name is after (skip role in address)
+			rig := strings.Join(parts[:i], "-")
+			if i+1 < len(parts) {
+				name := strings.Join(parts[i+1:], "-")
+				return rig + "/" + name
+			}
+			return rig + "/"
+		case "dog":
+			// Town-level named: gt-dog-alpha
+			if i+1 < len(parts) {
+				name := strings.Join(parts[i+1:], "-")
+				return "dog/" + name
+			}
+			return "dog/"
+		}
+	}
+
+	// Fallback: assume first part is rig, rest is role/name
+	if len(parts) == 2 {
+		return parts[0] + "/" + parts[1]
+	}
+	return ""
 }
 
 // parseRigAgentAddress extracts address from a rig-prefixed agent bead.
@@ -354,6 +393,7 @@ func agentBeadToAddress(bead *agentBead) string {
 // Examples:
 //   - ppf-pyspark_pipeline_framework-witness → pyspark_pipeline_framework/witness
 //   - ppf-pyspark_pipeline_framework-polecat-Toast → pyspark_pipeline_framework/Toast
+//   - bd-beads-crew-beavis → beads/beavis
 func parseRigAgentAddress(bead *agentBead) string {
 	// Parse rig and role_type from description
 	var roleType, rig string
@@ -367,7 +407,10 @@ func parseRigAgentAddress(bead *agentBead) string {
 	}
 
 	if rig == "" || rig == "null" || roleType == "" || roleType == "null" {
-		return ""
+		// Fallback: parse from bead ID by scanning for known role markers.
+		// ID format: <prefix>-<rig>-<role>[-<name>]
+		// Known rig-level roles: crew, polecat, witness, refinery
+		return parseRigAgentAddressFromID(bead.ID)
 	}
 
 	// For singleton roles (witness, refinery), address is rig/role
@@ -391,18 +434,99 @@ func parseRigAgentAddress(bead *agentBead) string {
 	return rig + "/" + roleType
 }
 
+// parseRigAgentAddressFromID extracts a mail address from a rig-prefixed bead ID
+// when the description metadata is missing. Scans for known role markers in the ID
+// to determine the rig name and agent name.
+//
+// ID format: <prefix>-<rig>-<role>[-<name>]
+//
+// Singleton roles (witness, refinery) must NOT have a name segment — IDs like
+// "bd-beads-witness-extra" are malformed and return "".
+//
+// Keep role lists in sync with beads.RigLevelRoles and beads.NamedRoles.
+func parseRigAgentAddressFromID(id string) string {
+	// Singleton roles: no name segment allowed
+	singletonRoles := []string{"witness", "refinery"}
+	// Named roles: require a name segment
+	namedRoles := []string{"crew", "polecat"}
+
+	for _, role := range namedRoles {
+		marker := "-" + role + "-"
+		if idx := strings.Index(id, marker); idx >= 0 {
+			// Everything between prefix- and -role- is the rig name.
+			// The prefix ends at the first hyphen: <prefix>-<rig>-...
+			// But prefix could be multi-char (bd, gt, ppf), so we find
+			// the rig as the substring between the first hyphen and the role marker.
+			firstHyphen := strings.Index(id, "-")
+			if firstHyphen < 0 || firstHyphen >= idx {
+				continue
+			}
+			rig := id[firstHyphen+1 : idx]
+			if rig == "" {
+				continue
+			}
+			name := id[idx+len(marker):]
+			if name != "" {
+				// Named role (crew, polecat): address is rig/name
+				return rig + "/" + name
+			}
+			// crew/polecat without a name — malformed, skip
+			continue
+		}
+	}
+
+	for _, role := range singletonRoles {
+		// Singleton roles match only at end of ID: <prefix>-<rig>-<role>
+		// Reject if a name segment follows (e.g. -witness-extra is malformed).
+		marker := "-" + role + "-"
+		if strings.Contains(id, marker) {
+			// Has a name segment after the role — malformed singleton
+			continue
+		}
+
+		suffix := "-" + role
+		if strings.HasSuffix(id, suffix) {
+			// Find rig between first hyphen and the suffix
+			firstHyphen := strings.Index(id, "-")
+			if firstHyphen < 0 {
+				continue
+			}
+			suffixStart := len(id) - len(suffix)
+			if firstHyphen >= suffixStart {
+				continue
+			}
+			rig := id[firstHyphen+1 : suffixStart]
+			if rig == "" {
+				continue
+			}
+			return rig + "/" + role
+		}
+	}
+
+	return ""
+}
+
 // parseAgentAddressFromDescription extracts agent address from description metadata.
-// Looks for "role_type: X" and "rig: Y" patterns in the description.
+// Looks for "location: X" first (explicit address), then falls back to
+// "role_type: X" and "rig: Y" patterns in the description.
 func parseAgentAddressFromDescription(desc string) string {
-	var roleType, rig string
+	var roleType, rig, location string
 
 	for _, line := range strings.Split(desc, "\n") {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "role_type:") {
+		if strings.HasPrefix(line, "location:") {
+			location = strings.TrimSpace(strings.TrimPrefix(line, "location:"))
+		} else if strings.HasPrefix(line, "role_type:") {
 			roleType = strings.TrimSpace(strings.TrimPrefix(line, "role_type:"))
 		} else if strings.HasPrefix(line, "rig:") {
 			rig = strings.TrimSpace(strings.TrimPrefix(line, "rig:"))
 		}
+	}
+
+	// Explicit location takes priority (used by dogs and other agents
+	// whose address can't be derived from role_type + rig alone)
+	if location != "" && location != "null" {
+		return location
 	}
 
 	// Handle null values from description
@@ -535,7 +659,7 @@ func (r *Router) queryAgents(descContains string) []*agentBead {
 	var allAgents []*agentBead
 
 	// Query town-level beads
-	townBeadsDir := r.resolveBeadsDir("")
+	townBeadsDir := r.resolveBeadsDir()
 	townAgents, err := r.queryAgentsInDir(townBeadsDir, descContains)
 	if err != nil {
 		// Don't fail yet - rig beads might still have results
@@ -577,6 +701,7 @@ func (r *Router) queryAgents(descContains string) []*agentBead {
 }
 
 // queryAgentsInDir queries agent beads in a specific beads directory with optional description filtering.
+// Queries both the issues and wisps tables, merging results.
 func (r *Router) queryAgentsInDir(beadsDir, descContains string) ([]*agentBead, error) {
 	args := []string{"list", "--label=gt:agent", "--json", "--limit=0"}
 
@@ -586,25 +711,68 @@ func (r *Router) queryAgentsInDir(beadsDir, descContains string) ([]*agentBead, 
 
 	ctx, cancel := bdReadCtx()
 	defer cancel()
-	stdout, err := runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
-	if err != nil {
-		return nil, fmt.Errorf("querying agents in %s: %w", beadsDir, err)
-	}
 
+	// Query issues table (backward compat during migration)
+	stdout, issuesErr := runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
+
+	// Also query wisps table for migrated agent beads (best-effort)
+	wispCtx, wispCancel := bdReadCtx()
+	defer wispCancel()
+	wispOut, _ := runBdCommand(wispCtx, []string{"mol", "wisp", "list", "--json"}, filepath.Dir(beadsDir), beadsDir)
+
+	// Merge results: collect agent beads from both sources
+	seenIDs := make(map[string]bool)
 	var agents []*agentBead
-	if err := json.Unmarshal(stdout, &agents); err != nil {
-		return nil, fmt.Errorf("parsing agent query result: %w", err)
+
+	// Parse wisps first (primary source after migration)
+	if len(wispOut) > 0 {
+		var wispAgents []*agentBead
+		if json.Unmarshal(wispOut, &wispAgents) == nil {
+			for _, agent := range wispAgents {
+				if isAgentBeadEntry(agent) {
+					seenIDs[agent.ID] = true
+					agents = append(agents, agent)
+				}
+			}
+		}
 	}
 
-	// Filter for open agents only (closed agents are inactive)
+	// Then issues (backward compat, skip duplicates)
+	if len(stdout) > 0 {
+		var issueAgents []*agentBead
+		if json.Unmarshal(stdout, &issueAgents) == nil {
+			for _, agent := range issueAgents {
+				if !seenIDs[agent.ID] {
+					agents = append(agents, agent)
+				}
+			}
+		}
+	} else if issuesErr != nil && len(agents) == 0 {
+		return nil, fmt.Errorf("querying agents in %s: %w", beadsDir, issuesErr)
+	}
+
+	// Filter for active agents (closed/deleted agents are inactive)
 	var active []*agentBead
 	for _, agent := range agents {
-		if agent.Status == "open" || agent.Status == "in_progress" {
+		if agent.Status == "open" || agent.Status == "in_progress" || agent.Status == "hooked" {
 			active = append(active, agent)
 		}
 	}
 
 	return active, nil
+}
+
+// isAgentBeadEntry checks if an agentBead entry is an actual agent bead.
+func isAgentBeadEntry(a *agentBead) bool {
+	if a.Type == "agent" {
+		return true
+	}
+	for _, l := range a.Labels {
+		if l == "gt:agent" {
+			return true
+		}
+	}
+	return false
 }
 
 // queryAgentsFromDir queries agent beads from a specific beads directory.
@@ -779,6 +947,7 @@ func (r *Router) sendToSingle(msg *Message) error {
 	var labels []string
 	labels = append(labels, "gt:message")
 	labels = append(labels, "from:"+msg.From)
+	labels = append(labels, DeliverySendLabels()...)
 	if msg.ThreadID != "" {
 		labels = append(labels, "thread:"+msg.ThreadID)
 	}
@@ -791,8 +960,10 @@ func (r *Router) sendToSingle(msg *Message) error {
 		labels = append(labels, "cc:"+ccIdentity)
 	}
 
-	// Build command: bd create <subject> --assignee=<recipient> -d <body> --labels=gt:message,...
-	args := []string{"create", msg.Subject,
+	// Build command: bd create --assignee=<recipient> -d <body> --labels=gt:message,... -- <subject>
+	// Flags go first, then -- to end flag parsing, then the positional subject.
+	// This prevents subjects like "--help" from being parsed as flags (see web/api.go).
+	args := []string{"create",
 		"--assignee", toIdentity,
 		"-d", msg.Body,
 	}
@@ -809,12 +980,16 @@ func (r *Router) sendToSingle(msg *Message) error {
 	// Add actor for attribution (sender identity)
 	args = append(args, "--actor", msg.From)
 
-	// Add --ephemeral flag for ephemeral messages (stored in single DB, filtered from JSONL export)
+	// Add --ephemeral flag for ephemeral messages (wisps, not synced to git)
 	if r.shouldBeWisp(msg) {
 		args = append(args, "--ephemeral")
 	}
 
-	beadsDir := r.resolveBeadsDir(msg.To)
+	// End flag parsing with --, then add subject as positional argument.
+	// This prevents subjects like "--help" or "--json" from being parsed as flags.
+	args = append(args, "--", msg.Subject)
+
+	beadsDir := r.resolveBeadsDir()
 	if err := r.ensureCustomTypes(beadsDir); err != nil {
 		return err
 	}
@@ -825,10 +1000,19 @@ func (r *Router) sendToSingle(msg *Message) error {
 		return fmt.Errorf("sending message: %w", err)
 	}
 
-	// Notify recipient if they have an active session (best-effort notification)
-	// Skip notification for self-mail (handoffs to future-self don't need present-self notified)
-	if !isSelfMail(msg.From, msg.To) {
-		_ = r.notifyRecipient(msg)
+	// Notify recipient if they have an active session (best-effort notification).
+	// Skip when the caller explicitly suppressed notification (--no-notify)
+	// or for self-mail (handoffs to future-self don't need present-self notified).
+	// Notification is async: the durable write is complete, so the caller
+	// doesn't block on idle probing (up to 1s per recipient in fan-out).
+	// Callers that exit soon after Send should call WaitPendingNotifications.
+	if !msg.SuppressNotify && !isSelfMail(msg.From, msg.To) {
+		msgCopy := *msg // copy to avoid data race if caller mutates msg
+		r.notifyWg.Add(1)
+		go func() {
+			defer r.notifyWg.Done()
+			r.notifyRecipient(&msgCopy) //nolint:errcheck
+		}()
 	}
 
 	return nil
@@ -892,6 +1076,7 @@ func (r *Router) sendToQueue(msg *Message) error {
 	labels = append(labels, "gt:message")
 	labels = append(labels, "from:"+msg.From)
 	labels = append(labels, "queue:"+queueName)
+	labels = append(labels, DeliverySendLabels()...)
 	if msg.ThreadID != "" {
 		labels = append(labels, "thread:"+msg.ThreadID)
 	}
@@ -903,9 +1088,11 @@ func (r *Router) sendToQueue(msg *Message) error {
 		labels = append(labels, "cc:"+ccIdentity)
 	}
 
-	// Build command: bd create <subject> --assignee=queue:<name> -d <body>
+	// Build command: bd create --assignee=queue:<name> -d <body> ... -- <subject>
+	// Flags go first, then -- to end flag parsing, then the positional subject.
+	// This prevents subjects like "--help" from being parsed as flags.
 	// Use queue:<name> as assignee so inbox queries can filter by queue
-	args := []string{"create", msg.Subject,
+	args := []string{"create",
 		"--assignee", msg.To, // queue:name
 		"-d", msg.Body,
 	}
@@ -925,8 +1112,11 @@ func (r *Router) sendToQueue(msg *Message) error {
 	// Queue messages are never ephemeral - they need to persist until claimed
 	// (deliberately not checking shouldBeWisp)
 
+	// End flag parsing, then subject as positional argument
+	args = append(args, "--", msg.Subject)
+
 	// Queue messages go to town-level beads (shared location)
-	beadsDir := r.resolveBeadsDir("")
+	beadsDir := r.resolveBeadsDir()
 	if err := r.ensureCustomTypes(beadsDir); err != nil {
 		return err
 	}
@@ -963,7 +1153,10 @@ func (r *Router) sendToAnnounce(msg *Message) error {
 		}
 	}
 
-	// Build labels for type, from/thread/reply-to/cc plus announce metadata
+	// Build labels for type, from/thread/reply-to/cc plus announce metadata.
+	// Note: delivery:pending is intentionally omitted for announce messages —
+	// broadcast messages have no single recipient to ack against. Subscriber
+	// fan-out copies go through sendToSingle which adds delivery tracking.
 	var labels []string
 	labels = append(labels, "gt:message")
 	labels = append(labels, "from:"+msg.From)
@@ -979,9 +1172,11 @@ func (r *Router) sendToAnnounce(msg *Message) error {
 		labels = append(labels, "cc:"+ccIdentity)
 	}
 
-	// Build command: bd create <subject> --assignee=announce:<name> -d <body>
+	// Build command: bd create --assignee=announce:<name> -d <body> ... -- <subject>
+	// Flags go first, then -- to end flag parsing, then the positional subject.
+	// This prevents subjects like "--help" from being parsed as flags.
 	// Use announce:<name> as assignee so queries can filter by channel
-	args := []string{"create", msg.Subject,
+	args := []string{"create",
 		"--assignee", msg.To, // announce:name
 		"-d", msg.Body,
 	}
@@ -1001,8 +1196,11 @@ func (r *Router) sendToAnnounce(msg *Message) error {
 	// Announce messages are never ephemeral - they need to persist for readers
 	// (deliberately not checking shouldBeWisp)
 
+	// End flag parsing, then subject as positional argument
+	args = append(args, "--", msg.Subject)
+
 	// Announce messages go to town-level beads (shared location)
-	beadsDir := r.resolveBeadsDir("")
+	beadsDir := r.resolveBeadsDir()
 	if err := r.ensureCustomTypes(beadsDir); err != nil {
 		return err
 	}
@@ -1041,7 +1239,10 @@ func (r *Router) sendToChannel(msg *Message) error {
 		return fmt.Errorf("channel %s is closed", channelName)
 	}
 
-	// Build labels for type, from/thread/reply-to/cc plus channel metadata
+	// Build labels for type, from/thread/reply-to/cc plus channel metadata.
+	// Note: delivery:pending is intentionally omitted for the channel-origin
+	// copy — it has no single recipient to ack. Subscriber fan-out copies go
+	// through sendToSingle which adds delivery tracking.
 	var labels []string
 	labels = append(labels, "gt:message")
 	labels = append(labels, "from:"+msg.From)
@@ -1057,9 +1258,11 @@ func (r *Router) sendToChannel(msg *Message) error {
 		labels = append(labels, "cc:"+ccIdentity)
 	}
 
-	// Build command: bd create <subject> --assignee=channel:<name> -d <body>
+	// Build command: bd create --assignee=channel:<name> -d <body> ... -- <subject>
+	// Flags go first, then -- to end flag parsing, then the positional subject.
+	// This prevents subjects like "--help" from being parsed as flags.
 	// Use channel:<name> as assignee so queries can filter by channel
-	args := []string{"create", msg.Subject,
+	args := []string{"create",
 		"--assignee", msg.To, // channel:name
 		"-d", msg.Body,
 	}
@@ -1079,8 +1282,11 @@ func (r *Router) sendToChannel(msg *Message) error {
 	// Channel messages are never ephemeral - they persist according to retention policy
 	// (deliberately not checking shouldBeWisp)
 
+	// End flag parsing, then subject as positional argument
+	args = append(args, "--", msg.Subject)
+
 	// Channel messages go to town-level beads (shared location)
-	beadsDir := r.resolveBeadsDir("")
+	beadsDir := r.resolveBeadsDir()
 	if err := r.ensureCustomTypes(beadsDir); err != nil {
 		return err
 	}
@@ -1128,7 +1334,7 @@ func (r *Router) pruneAnnounce(announceName string, retainCount int) error {
 		return nil // No retention limit
 	}
 
-	beadsDir := r.resolveBeadsDir("")
+	beadsDir := r.resolveBeadsDir()
 	if err := r.ensureCustomTypes(beadsDir); err != nil {
 		return err
 	}
@@ -1187,13 +1393,19 @@ func isSelfMail(from, to string) bool {
 // GetMailbox returns a Mailbox for the given address.
 // Routes to the correct beads database based on the address.
 func (r *Router) GetMailbox(address string) (*Mailbox, error) {
-	beadsDir := r.resolveBeadsDir(address)
+	beadsDir := r.resolveBeadsDir()
 	workDir := filepath.Dir(beadsDir) // Parent of .beads
 	return NewMailboxFromAddress(address, workDir), nil
 }
 
 // notifyRecipient sends a notification to a recipient's tmux session.
-// Uses NudgeSession to add the notification to the agent's conversation history.
+//
+// Notification strategy (idle-aware):
+//  1. If the session is idle (prompt visible), send an immediate nudge.
+//  2. If the session is busy, enqueue a nudge for cooperative delivery at
+//     the next turn boundary.
+//  3. For the overseer (human operator), always use a visible banner.
+//
 // Supports mayor/, deacon/, rig/crew/name, rig/polecats/name, and rig/name addresses.
 // Respects agent DND/muted state - skips notification if recipient has DND enabled.
 func (r *Router) notifyRecipient(msg *Message) error {
@@ -1204,9 +1416,14 @@ func (r *Router) notifyRecipient(msg *Message) error {
 		}
 	}
 
-	sessionIDs := addressToSessionIDs(msg.To)
+	sessionIDs := AddressToSessionIDs(msg.To)
 	if len(sessionIDs) == 0 {
 		return nil // Unable to determine session ID
+	}
+
+	timeout := r.IdleNotifyTimeout
+	if timeout == 0 {
+		timeout = DefaultIdleNotifyTimeout
 	}
 
 	// Try each possible session ID until we find one that exists.
@@ -1224,12 +1441,52 @@ func (r *Router) notifyRecipient(msg *Message) error {
 			return r.tmux.SendNotificationBanner(sessionID, msg.From, msg.Subject)
 		}
 
-		// Send notification to the agent's conversation history
 		notification := fmt.Sprintf("📬 You have new mail from %s. Subject: %s. Run 'gt mail inbox' to read.", msg.From, msg.Subject)
+
+		// Idle-aware notification: try immediate nudge first, fall back to queue.
+		waitErr := r.tmux.WaitForIdle(sessionID, timeout)
+		if waitErr == nil {
+			// Session is idle → send immediate nudge
+			if err := r.tmux.NudgeSession(sessionID, notification); err == nil {
+				return nil
+			} else if errors.Is(err, tmux.ErrSessionNotFound) {
+				// Session disappeared between idle check and nudge — try next candidate
+				continue
+			} else if errors.Is(err, tmux.ErrNoServer) {
+				return nil
+			}
+			// NudgeSession failed for non-terminal reason — fall through to queue
+		} else if errors.Is(waitErr, tmux.ErrNoServer) {
+			// No tmux server — no point trying other candidates
+			return nil
+		} else if errors.Is(waitErr, tmux.ErrSessionNotFound) {
+			// Session disappeared — try next candidate
+			continue
+		}
+
+		// Busy or nudge failed → enqueue for cooperative delivery at the
+		// agent's next turn boundary.
+		if r.townRoot != "" {
+			return nudge.Enqueue(r.townRoot, sessionID, nudge.QueuedNudge{
+				Sender:  msg.From,
+				Message: notification,
+			})
+		}
+		// Fallback to direct nudge if town root unavailable
 		return r.tmux.NudgeSession(sessionID, notification)
 	}
 
 	return nil // No active session found
+}
+
+// IsRecipientMuted checks if a mail recipient has DND/muted notifications enabled.
+// Returns true if the recipient is muted and should not receive tmux nudges.
+// Fails open (returns false) if the agent bead cannot be found or the town root is not set.
+func (r *Router) IsRecipientMuted(address string) bool {
+	if r.townRoot == "" {
+		return false
+	}
+	return r.isRecipientMuted(address)
 }
 
 // isRecipientMuted checks if a mail recipient has DND/muted notifications enabled.
@@ -1270,27 +1527,32 @@ func addressToAgentBeadID(address string) string {
 	rig := parts[0]
 	target := parts[1]
 
+	rigPrefix := session.PrefixFor(rig)
+
 	switch {
 	case target == "witness":
-		return fmt.Sprintf("gt-%s-witness", rig)
+		return session.WitnessSessionName(rigPrefix)
 	case target == "refinery":
-		return fmt.Sprintf("gt-%s-refinery", rig)
+		return session.RefinerySessionName(rigPrefix)
 	case strings.HasPrefix(target, "crew/"):
 		crewName := strings.TrimPrefix(target, "crew/")
-		return fmt.Sprintf("gt-%s-crew-%s", rig, crewName)
+		return session.CrewSessionName(rigPrefix, crewName)
+	case strings.HasPrefix(target, "polecats/"):
+		pcName := strings.TrimPrefix(target, "polecats/")
+		return session.PolecatSessionName(rigPrefix, pcName)
 	default:
-		return fmt.Sprintf("gt-%s-polecat-%s", rig, target)
+		return session.PolecatSessionName(rigPrefix, target)
 	}
 }
 
-// addressToSessionIDs converts a mail address to possible tmux session IDs.
+// AddressToSessionIDs converts a mail address to possible tmux session IDs.
 // Returns multiple candidates since the canonical address format (rig/name)
 // doesn't distinguish between crew workers (gt-rig-crew-name) and polecats
 // (gt-rig-name). The caller should try each and use the one that exists.
 //
 // This supersedes the approach in PR #896 which only handled slash-to-dash
 // conversion but didn't address the crew/polecat ambiguity.
-func addressToSessionIDs(address string) []string {
+func AddressToSessionIDs(address string) []string {
 	// Overseer address: "overseer" (human operator)
 	if address == "overseer" {
 		return []string{session.OverseerSessionName()}
@@ -1314,35 +1576,34 @@ func addressToSessionIDs(address string) []string {
 
 	rig := parts[0]
 	target := parts[1]
+	rigPrefix := session.PrefixFor(rig)
 
 	// If target already has crew/ or polecats/ prefix, use it directly
-	// e.g., "gastown/crew/holden" → "gt-gastown-crew-holden"
-	if strings.HasPrefix(target, "crew/") || strings.HasPrefix(target, "polecats/") {
-		return []string{fmt.Sprintf("gt-%s-%s", rig, strings.ReplaceAll(target, "/", "-"))}
+	// e.g., "gastown/crew/holden" → "gt-crew-holden"
+	if strings.HasPrefix(target, "crew/") {
+		crewName := strings.TrimPrefix(target, "crew/")
+		return []string{session.CrewSessionName(rigPrefix, crewName)}
+	}
+	if strings.HasPrefix(target, "polecats/") {
+		polecatName := strings.TrimPrefix(target, "polecats/")
+		return []string{session.PolecatSessionName(rigPrefix, polecatName)}
 	}
 
 	// Special cases that don't need crew variant
-	if target == "witness" || target == "refinery" {
-		return []string{fmt.Sprintf("gt-%s-%s", rig, target)}
+	if target == "witness" {
+		return []string{session.WitnessSessionName(rigPrefix)}
+	}
+	if target == "refinery" {
+		return []string{session.RefinerySessionName(rigPrefix)}
 	}
 
 	// For normalized addresses like "gastown/holden", try both:
-	// 1. Crew format: gt-gastown-crew-holden
-	// 2. Polecat format: gt-gastown-holden
+	// 1. Crew format: gt-crew-holden
+	// 2. Polecat format: gt-holden
 	// Return crew first since crew workers are more commonly missed.
 	return []string{
-		session.CrewSessionName(rig, target),    // gt-rig-crew-name
-		session.PolecatSessionName(rig, target), // gt-rig-name
+		session.CrewSessionName(rigPrefix, target),    // <prefix>-crew-name
+		session.PolecatSessionName(rigPrefix, target), // <prefix>-name
 	}
 }
 
-// addressToSessionID converts a mail address to a tmux session ID.
-// Returns empty string if address format is not recognized.
-// Deprecated: Use addressToSessionIDs for proper crew/polecat handling.
-func addressToSessionID(address string) string {
-	ids := addressToSessionIDs(address)
-	if len(ids) == 0 {
-		return ""
-	}
-	return ids[0]
-}

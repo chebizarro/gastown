@@ -3,6 +3,7 @@ package web
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -12,8 +13,10 @@ import (
 	"strings"
 	"sync"
 	"time"
-)
 
+	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/session"
+)
 
 // CommandRequest is the JSON request body for /api/run.
 type CommandRequest struct {
@@ -51,9 +54,15 @@ type APIHandler struct {
 	optionsCache     *OptionsResponse
 	optionsCacheTime time.Time
 	optionsCacheMu   sync.RWMutex
+	// cmdSem limits concurrent command executions to prevent resource exhaustion.
+	cmdSem chan struct{}
 }
 
 const optionsCacheTTL = 30 * time.Second
+
+// maxConcurrentCommands limits how many gt subprocesses can run at once.
+// handleOptions alone spawns 7; allow headroom for other concurrent handlers.
+const maxConcurrentCommands = 12
 
 // NewAPIHandler creates a new API handler with the given run timeouts.
 func NewAPIHandler(defaultRunTimeout, maxRunTimeout time.Duration) *APIHandler {
@@ -65,6 +74,7 @@ func NewAPIHandler(defaultRunTimeout, maxRunTimeout time.Duration) *APIHandler {
 		workDir:           workDir,
 		defaultRunTimeout: defaultRunTimeout,
 		maxRunTimeout:     maxRunTimeout,
+		cmdSem:            make(chan struct{}, maxConcurrentCommands),
 	}
 }
 
@@ -90,6 +100,8 @@ func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleOptions(w, r)
 	case path == "/mail/inbox" && r.Method == http.MethodGet:
 		h.handleMailInbox(w, r)
+	case path == "/mail/threads" && r.Method == http.MethodGet:
+		h.handleMailThreads(w, r)
 	case path == "/mail/read" && r.Method == http.MethodGet:
 		h.handleMailRead(w, r)
 	case path == "/mail/send" && r.Method == http.MethodPost:
@@ -98,12 +110,20 @@ func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleIssueShow(w, r)
 	case path == "/issues/create" && r.Method == http.MethodPost:
 		h.handleIssueCreate(w, r)
+	case path == "/issues/close" && r.Method == http.MethodPost:
+		h.handleIssueClose(w, r)
+	case path == "/issues/update" && r.Method == http.MethodPost:
+		h.handleIssueUpdate(w, r)
 	case path == "/pr/show" && r.Method == http.MethodGet:
 		h.handlePRShow(w, r)
 	case path == "/crew" && r.Method == http.MethodGet:
 		h.handleCrew(w, r)
 	case path == "/ready" && r.Method == http.MethodGet:
 		h.handleReady(w, r)
+	case path == "/events" && r.Method == http.MethodGet:
+		h.handleSSE(w, r)
+	case path == "/session/preview" && r.Method == http.MethodGet:
+		h.handleSessionPreview(w, r)
 	default:
 		http.Error(w, "Not found", http.StatusNotFound)
 	}
@@ -183,8 +203,17 @@ func (h *APIHandler) handleCommands(w http.ResponseWriter, _ *http.Request) {
 
 // runGtCommand executes a gt command with the given args.
 func (h *APIHandler) runGtCommand(ctx context.Context, timeout time.Duration, args []string) (string, error) {
+	// Apply timeout first so it bounds both semaphore wait and command execution.
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+
+	// Acquire semaphore slot to limit concurrent subprocess spawns.
+	select {
+	case h.cmdSem <- struct{}{}:
+		defer func() { <-h.cmdSem }()
+	case <-ctx.Done():
+		return "", fmt.Errorf("command slot unavailable: %w", ctx.Err())
+	}
 
 	cmd := exec.CommandContext(ctx, h.gtPath, args...)
 	if h.workDir != "" {
@@ -239,6 +268,8 @@ type MailMessage struct {
 	Timestamp string `json:"timestamp"`
 	Read      bool   `json:"read"`
 	Priority  string `json:"priority,omitempty"`
+	ThreadID  string `json:"thread_id,omitempty"`
+	ReplyTo   string `json:"reply_to,omitempty"`
 }
 
 // MailInboxResponse is the response for /api/mail/inbox.
@@ -246,6 +277,23 @@ type MailInboxResponse struct {
 	Messages    []MailMessage `json:"messages"`
 	UnreadCount int           `json:"unread_count"`
 	Total       int           `json:"total"`
+}
+
+// MailThread represents a group of messages in a conversation thread.
+type MailThread struct {
+	ThreadID    string        `json:"thread_id"`
+	Subject     string        `json:"subject"`
+	LastMessage MailMessage   `json:"last_message"`
+	Messages    []MailMessage `json:"messages"`
+	Count       int           `json:"count"`
+	UnreadCount int           `json:"unread_count"`
+}
+
+// MailThreadsResponse is the response for /api/mail/threads.
+type MailThreadsResponse struct {
+	Threads     []MailThread `json:"threads"`
+	UnreadCount int          `json:"unread_count"`
+	Total       int          `json:"total"`
 }
 
 // handleMailInbox returns the user's inbox.
@@ -295,6 +343,132 @@ func (h *APIHandler) handleMailInbox(w http.ResponseWriter, r *http.Request) {
 		UnreadCount: unread,
 		Total:       len(messages),
 	})
+}
+
+// handleMailThreads returns the inbox grouped by conversation threads.
+func (h *APIHandler) handleMailThreads(w http.ResponseWriter, r *http.Request) {
+	output, err := h.runGtCommand(r.Context(), 10*time.Second, []string{"mail", "inbox", "--json"})
+	if err != nil {
+		// Fall back to text parsing
+		output, err = h.runGtCommand(r.Context(), 10*time.Second, []string{"mail", "inbox"})
+		if err != nil {
+			h.sendError(w, "Failed to fetch inbox: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		messages := parseMailInboxText(output)
+		threads := groupIntoThreads(messages)
+		unread := 0
+		for _, t := range threads {
+			unread += t.UnreadCount
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(MailThreadsResponse{
+			Threads:     threads,
+			UnreadCount: unread,
+			Total:       len(messages),
+		})
+		return
+	}
+
+	var messages []MailMessage
+	if err := json.Unmarshal([]byte(output), &messages); err != nil {
+		h.sendError(w, "Failed to parse inbox: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	threads := groupIntoThreads(messages)
+	unread := 0
+	for _, t := range threads {
+		unread += t.UnreadCount
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(MailThreadsResponse{
+		Threads:     threads,
+		UnreadCount: unread,
+		Total:       len(messages),
+	})
+}
+
+// groupIntoThreads groups messages into conversation threads.
+// Messages are grouped by ThreadID when available, otherwise by ReplyTo chain,
+// and finally by subject similarity as a fallback.
+func groupIntoThreads(messages []MailMessage) []MailThread {
+	// Map from thread key to slice of messages
+	threadMap := make(map[string][]MailMessage)
+	// Track message ID -> thread key for reply-to chaining
+	msgToThread := make(map[string]string)
+	// Maintain insertion order of thread keys
+	var threadOrder []string
+	threadSeen := make(map[string]bool)
+
+	for _, msg := range messages {
+		var threadKey string
+
+		// Priority 1: Use ThreadID if present
+		if msg.ThreadID != "" {
+			threadKey = "thread:" + msg.ThreadID
+		} else if msg.ReplyTo != "" {
+			// Priority 2: Follow reply-to chain
+			if parentKey, ok := msgToThread[msg.ReplyTo]; ok {
+				threadKey = parentKey
+			} else {
+				// Start a new thread anchored to the reply-to ID
+				threadKey = "reply:" + msg.ReplyTo
+			}
+		} else {
+			// Priority 3: Standalone message (its own thread)
+			threadKey = "msg:" + msg.ID
+		}
+
+		threadMap[threadKey] = append(threadMap[threadKey], msg)
+		msgToThread[msg.ID] = threadKey
+
+		if !threadSeen[threadKey] {
+			threadOrder = append(threadOrder, threadKey)
+			threadSeen[threadKey] = true
+		}
+	}
+
+	// Build thread structs, ordered by most recent message
+	var threads []MailThread
+	for _, key := range threadOrder {
+		msgs := threadMap[key]
+		if len(msgs) == 0 {
+			continue
+		}
+
+		// Last message is the most recent (messages come in chronological order)
+		last := msgs[len(msgs)-1]
+
+		// Use the first message's subject as the thread subject (strip Re: prefixes)
+		subject := msgs[0].Subject
+		subject = strings.TrimPrefix(subject, "Re: ")
+		subject = strings.TrimPrefix(subject, "RE: ")
+
+		unread := 0
+		for _, m := range msgs {
+			if !m.Read {
+				unread++
+			}
+		}
+
+		threadID := key
+		if last.ThreadID != "" {
+			threadID = last.ThreadID
+		}
+
+		threads = append(threads, MailThread{
+			ThreadID:    threadID,
+			Subject:     subject,
+			LastMessage: last,
+			Messages:    msgs,
+			Count:       len(msgs),
+			UnreadCount: unread,
+		})
+	}
+
+	return threads
 }
 
 // handleMailRead reads a specific message by ID.
@@ -461,6 +635,10 @@ func parseMailReadOutput(output string, msgID string) MailMessage {
 			msg.To = strings.TrimPrefix(line, "To: ")
 		} else if strings.HasPrefix(line, "ID: ") {
 			msg.ID = strings.TrimPrefix(line, "ID: ")
+		} else if strings.HasPrefix(line, "Thread: ") {
+			msg.ThreadID = strings.TrimSpace(strings.TrimPrefix(line, "Thread: "))
+		} else if strings.HasPrefix(line, "Reply-To: ") {
+			msg.ReplyTo = strings.TrimSpace(strings.TrimPrefix(line, "Reply-To: "))
 		} else if line == "" && msg.From != "" && !inBody {
 			inBody = true
 		} else if inBody {
@@ -494,17 +672,24 @@ type OptionsResponse struct {
 // handleOptions returns dynamic options for command arguments.
 // Results are cached for 30 seconds to avoid slow repeated fetches.
 func (h *APIHandler) handleOptions(w http.ResponseWriter, r *http.Request) {
-	// Check cache first
+	// Check cache first — serialize under RLock to a buffer so we don't
+	// hold the lock while writing to the ResponseWriter (which can block
+	// on slow clients).
 	h.optionsCacheMu.RLock()
 	if h.optionsCache != nil && time.Since(h.optionsCacheTime) < optionsCacheTTL {
-		cached := h.optionsCache
+		data, err := json.Marshal(h.optionsCache)
 		h.optionsCacheMu.RUnlock()
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-Cache", "HIT")
-		_ = json.NewEncoder(w).Encode(cached)
-		return
+		if err == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Cache", "HIT")
+			_, _ = w.Write(data)
+			_, _ = w.Write([]byte("\n"))
+			return
+		}
+		// Marshal failure is unexpected; fall through to refetch.
+	} else {
+		h.optionsCacheMu.RUnlock()
 	}
-	h.optionsCacheMu.RUnlock()
 
 	// Cache miss - fetch fresh data
 	resp := &OptionsResponse{}
@@ -541,9 +726,9 @@ func (h *APIHandler) handleOptions(w http.ResponseWriter, r *http.Request) {
 	// Fetch convoys
 	go func() {
 		defer wg.Done()
-		if output, err := h.runGtCommand(r.Context(), 3*time.Second, []string{"convoy", "list"}); err == nil {
+		if output, err := h.runBdCommand(r.Context(), 3*time.Second, []string{"list", "--type=convoy", "--json"}); err == nil {
 			mu.Lock()
-			resp.Convoys = parseConvoyListOutput(output)
+			resp.Convoys = parseConvoyListJSON(output)
 			mu.Unlock()
 		} else {
 			log.Printf("warning: handleOptions: convoy list: %v", err)
@@ -636,22 +821,22 @@ func parseRigListOutput(output string) []string {
 	return rigs
 }
 
-// parseConvoyListOutput extracts convoy IDs from text output.
-func parseConvoyListOutput(output string) []string {
-	var convoys []string
-	lines := strings.Split(output, "\n")
-	for _, line := range lines {
-		// Look for lines that start with convoy ID pattern
-		trimmed := strings.TrimSpace(line)
-		if trimmed != "" && !strings.HasPrefix(trimmed, "Convoy") && !strings.HasPrefix(trimmed, "No ") {
-			// Try to extract the first word as convoy ID
-			parts := strings.Fields(trimmed)
-			if len(parts) > 0 {
-				convoys = append(convoys, parts[0])
-			}
+// parseConvoyListJSON extracts convoy IDs from JSON output of "bd list --type=convoy --json".
+func parseConvoyListJSON(jsonStr string) []string {
+	var convoys []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(jsonStr), &convoys); err != nil {
+		log.Printf("warning: parseConvoyListJSON: %v", err)
+		return nil
+	}
+	ids := make([]string, 0, len(convoys))
+	for _, c := range convoys {
+		if c.ID != "" {
+			ids = append(ids, c.ID)
 		}
 	}
-	return convoys
+	return ids
 }
 
 // parseHooksListOutput extracts bead names from hooks list output.
@@ -783,6 +968,7 @@ type IssueShowResponse struct {
 	Type        string   `json:"type,omitempty"`
 	Status      string   `json:"status,omitempty"`
 	Priority    string   `json:"priority,omitempty"`
+	Owner       string   `json:"owner,omitempty"`
 	Description string   `json:"description,omitempty"`
 	Created     string   `json:"created,omitempty"`
 	Updated     string   `json:"updated,omitempty"`
@@ -798,20 +984,12 @@ func (h *APIHandler) handleIssueShow(w http.ResponseWriter, r *http.Request) {
 		h.sendError(w, "Missing issue ID", http.StatusBadRequest)
 		return
 	}
-	// Issue IDs may use external:prefix:id format for cross-rig dependencies
-	// (see internal/web/fetcher.go:extractIssueID). Unwrap to the raw bead ID
-	// before validation and before passing to bd show, which doesn't handle
-	// the external: prefix. This also fixes a pre-existing bug where the
-	// wrapped ID was passed to bd show and always failed to resolve.
-	showID := issueID
-	if strings.HasPrefix(issueID, "external:") {
-		parts := strings.SplitN(issueID, ":", 3)
-		if len(parts) == 3 {
-			showID = parts[2]
-		} else {
-			h.sendError(w, "Malformed external issue ID (expected external:prefix:id)", http.StatusBadRequest)
-			return
-		}
+	// Issue IDs may use external:prefix:id format for cross-rig dependencies.
+	// Unwrap to the raw bead ID before validation and bd show.
+	showID := beads.ExtractIssueID(issueID)
+	if strings.HasPrefix(issueID, "external:") && showID == issueID {
+		h.sendError(w, "Malformed external issue ID (expected external:prefix:id)", http.StatusBadRequest)
+		return
 	}
 	if !isValidID(showID) {
 		h.sendError(w, "Invalid issue ID format", http.StatusBadRequest)
@@ -948,10 +1126,136 @@ func (h *APIHandler) handleIssueCreate(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+// IssueCloseRequest is the request body for closing an issue.
+type IssueCloseRequest struct {
+	ID string `json:"id"`
+}
+
+// handleIssueClose closes an issue via bd close.
+func (h *APIHandler) handleIssueClose(w http.ResponseWriter, r *http.Request) {
+	var req IssueCloseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.sendError(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.ID == "" {
+		h.sendError(w, "Issue ID is required", http.StatusBadRequest)
+		return
+	}
+	if !isValidID(req.ID) {
+		h.sendError(w, "Invalid issue ID format", http.StatusBadRequest)
+		return
+	}
+
+	output, err := h.runBdCommand(r.Context(), 12*time.Second, []string{"close", req.ID})
+
+	w.Header().Set("Content-Type", "application/json")
+	if err != nil {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Failed to close issue: " + err.Error(),
+			"output":  output,
+		})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "Issue closed",
+		"output":  output,
+	})
+}
+
+// IssueUpdateRequest is the request body for updating an issue.
+type IssueUpdateRequest struct {
+	ID       string `json:"id"`
+	Status   string `json:"status,omitempty"`   // "open", "in_progress"
+	Priority int    `json:"priority,omitempty"` // 1-4
+	Assignee string `json:"assignee,omitempty"`
+}
+
+// handleIssueUpdate updates issue fields via bd update.
+func (h *APIHandler) handleIssueUpdate(w http.ResponseWriter, r *http.Request) {
+	var req IssueUpdateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.sendError(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.ID == "" {
+		h.sendError(w, "Issue ID is required", http.StatusBadRequest)
+		return
+	}
+	if !isValidID(req.ID) {
+		h.sendError(w, "Invalid issue ID format", http.StatusBadRequest)
+		return
+	}
+
+	// Build bd update args
+	args := []string{"update", req.ID}
+	hasUpdate := false
+
+	if req.Status != "" {
+		// Validate allowed status values
+		switch req.Status {
+		case "open", "in_progress":
+			args = append(args, "--status="+req.Status)
+			hasUpdate = true
+		default:
+			h.sendError(w, "Invalid status (allowed: open, in_progress)", http.StatusBadRequest)
+			return
+		}
+	}
+
+	if req.Priority >= 1 && req.Priority <= 4 {
+		args = append(args, fmt.Sprintf("--priority=%d", req.Priority))
+		hasUpdate = true
+	}
+
+	if req.Assignee != "" {
+		if !isValidID(req.Assignee) {
+			h.sendError(w, "Invalid assignee format", http.StatusBadRequest)
+			return
+		}
+		args = append(args, "--assignee="+req.Assignee)
+		hasUpdate = true
+	}
+
+	if !hasUpdate {
+		h.sendError(w, "No update fields provided", http.StatusBadRequest)
+		return
+	}
+
+	output, err := h.runBdCommand(r.Context(), 12*time.Second, args)
+
+	w.Header().Set("Content-Type", "application/json")
+	if err != nil {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Failed to update issue: " + err.Error(),
+			"output":  output,
+		})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "Issue updated",
+		"output":  output,
+	})
+}
+
 // runBdCommand executes a bd command with the given args.
 func (h *APIHandler) runBdCommand(ctx context.Context, timeout time.Duration, args []string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+
+	// Acquire semaphore slot — shared with runGtCommand/runGhCommand.
+	select {
+	case h.cmdSem <- struct{}{}:
+		defer func() { <-h.cmdSem }()
+	case <-ctx.Done():
+		return "", fmt.Errorf("command slot unavailable: %w", ctx.Err())
+	}
 
 	cmd := exec.CommandContext(ctx, "bd", args...)
 	if h.workDir != "" {
@@ -994,6 +1298,7 @@ func parseIssueShowJSON(output string) (IssueShowResponse, bool) {
 		Status      string   `json:"status"`
 		Priority    int      `json:"priority"`
 		Type        string   `json:"issue_type"`
+		Owner       string   `json:"owner"`
 		CreatedAt   string   `json:"created_at"`
 		UpdatedAt   string   `json:"updated_at"`
 		DependsOn   []string `json:"depends_on,omitempty"`
@@ -1015,6 +1320,7 @@ func parseIssueShowJSON(output string) (IssueShowResponse, bool) {
 		Type:        item.Type,
 		Status:      item.Status,
 		Priority:    priority,
+		Owner:       item.Owner,
 		Description: item.Description,
 		Created:     item.CreatedAt,
 		Updated:     item.UpdatedAt,
@@ -1075,7 +1381,16 @@ func parseIssueShowOutput(output string, issueID string) IssueShowResponse {
 			continue
 		}
 
-		if strings.HasPrefix(line, "Type:") {
+		if strings.HasPrefix(line, "Owner:") {
+			// Format: "Owner: mayor · Type: task"
+			ownerLine := strings.TrimPrefix(line, "Owner:")
+			ownerParts := strings.Split(ownerLine, "·")
+			resp.Owner = strings.TrimSpace(ownerParts[0])
+			if len(ownerParts) >= 2 {
+				typePart := strings.TrimSpace(ownerParts[1])
+				resp.Type = strings.TrimSpace(strings.TrimPrefix(typePart, "Type:"))
+			}
+		} else if strings.HasPrefix(line, "Type:") {
 			resp.Type = strings.TrimSpace(strings.TrimPrefix(line, "Type:"))
 		} else if strings.HasPrefix(line, "Created:") {
 			// Split always returns >= 1 element; parts[0] is safe unconditionally
@@ -1212,6 +1527,14 @@ func (h *APIHandler) runGhCommand(ctx context.Context, timeout time.Duration, ar
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// Acquire semaphore slot — shared with runGtCommand/runBdCommand.
+	select {
+	case h.cmdSem <- struct{}{}:
+		defer func() { <-h.cmdSem }()
+	case <-ctx.Done():
+		return "", fmt.Errorf("command slot unavailable: %w", ctx.Err())
+	}
+
 	cmd := exec.CommandContext(ctx, "gh", args...)
 	if h.workDir != "" {
 		cmd.Dir = h.workDir
@@ -1250,10 +1573,10 @@ func parsePRShowOutput(jsonStr string) PRShowResponse {
 	}
 
 	var data struct {
-		Number       int    `json:"number"`
-		Title        string `json:"title"`
-		State        string `json:"state"`
-		Author       struct {
+		Number int    `json:"number"`
+		Title  string `json:"title"`
+		State  string `json:"state"`
+		Author struct {
 			Login string `json:"login"`
 		} `json:"author"`
 		URL          string `json:"url"`
@@ -1319,18 +1642,18 @@ func parsePRShowOutput(jsonStr string) PRShowResponse {
 type CrewMember struct {
 	Name       string `json:"name"`
 	Rig        string `json:"rig"`
-	State      string `json:"state"`       // spinning, finished, ready, questions
+	State      string `json:"state"` // spinning, finished, ready, questions
 	Hook       string `json:"hook,omitempty"`
 	HookTitle  string `json:"hook_title,omitempty"`
-	Session    string `json:"session"`     // attached, detached, none
+	Session    string `json:"session"` // attached, detached, none
 	LastActive string `json:"last_active"`
 }
 
 // CrewResponse is the response for /api/crew.
 type CrewResponse struct {
-	Crew    []CrewMember `json:"crew"`
-	ByRig   map[string][]CrewMember `json:"by_rig"`
-	Total   int          `json:"total"`
+	Crew  []CrewMember            `json:"crew"`
+	ByRig map[string][]CrewMember `json:"by_rig"`
+	Total int                     `json:"total"`
 }
 
 // ReadyItem represents a ready work item.
@@ -1344,9 +1667,9 @@ type ReadyItem struct {
 
 // ReadyResponse is the response for /api/ready.
 type ReadyResponse struct {
-	Items   []ReadyItem         `json:"items"`
+	Items    []ReadyItem            `json:"items"`
 	BySource map[string][]ReadyItem `json:"by_source"`
-	Summary struct {
+	Summary  struct {
 		Total   int `json:"total"`
 		P1Count int `json:"p1_count"`
 		P2Count int `json:"p2_count"`
@@ -1361,7 +1684,7 @@ func (h *APIHandler) handleCrew(w http.ResponseWriter, r *http.Request) {
 
 	// Run gt crew list --all --json to get crew across all rigs
 	output, err := h.runGtCommand(ctx, 10*time.Second, []string{"crew", "list", "--all", "--json"})
-	
+
 	resp := CrewResponse{
 		Crew:  make([]CrewMember, 0),
 		ByRig: make(map[string][]CrewMember),
@@ -1381,7 +1704,7 @@ func (h *APIHandler) handleCrew(w http.ResponseWriter, r *http.Request) {
 		Session string `json:"session,omitempty"`
 		Hook    string `json:"hook,omitempty"`
 	}
-	
+
 	if err := json.Unmarshal([]byte(output), &crewData); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
@@ -1390,7 +1713,7 @@ func (h *APIHandler) handleCrew(w http.ResponseWriter, r *http.Request) {
 
 	// Convert to CrewMember format with state detection
 	for _, c := range crewData {
-		sessionName := fmt.Sprintf("gt-%s-crew-%s", c.Rig, c.Name)
+		sessionName := session.CrewSessionName(session.PrefixFor(c.Rig), c.Name)
 		state, lastActive, sessionStatus := h.detectCrewState(ctx, sessionName, c.Hook)
 
 		member := CrewMember{
@@ -1444,7 +1767,7 @@ func (h *APIHandler) detectCrewState(ctx context.Context, sessionName, hook stri
 
 		// Calculate activity age
 		activityAge := time.Since(time.Unix(activityUnix, 0))
-		lastActive := formatCrewActivityAge(activityAge)
+		lastActive := formatTimestamp(time.Unix(activityUnix, 0))
 
 		// Check if Claude is running in the session
 		isClaudeRunning := h.isClaudeRunningInSession(ctx, sessionName)
@@ -1468,20 +1791,24 @@ func (h *APIHandler) detectCrewState(ctx context.Context, sessionName, hook stri
 
 // isClaudeRunningInSession checks if Claude/agent is actively running.
 func (h *APIHandler) isClaudeRunningInSession(ctx context.Context, sessionName string) bool {
-	// Check for claude, codex, or other agent processes in the pane
-	cmd := exec.CommandContext(ctx, "tmux", "list-panes", "-t", sessionName, "-F", "#{pane_current_command}")
+	// Target pane 0 explicitly (:0.0) to avoid false positives from
+	// user-created split panes running shells or other commands.
+	cmd := exec.CommandContext(ctx, "tmux", "display-message", "-t", sessionName+":0.0", "-p", "#{pane_current_command}")
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	if err := cmd.Run(); err != nil {
 		return false
 	}
-	
-	output := strings.ToLower(stdout.String())
+
+	output := strings.ToLower(strings.TrimSpace(stdout.String()))
+	if output == "" {
+		return false
+	}
 	// Check for common agent commands
-	return strings.Contains(output, "claude") || 
-	       strings.Contains(output, "node") || 
-	       strings.Contains(output, "codex") ||
-	       strings.Contains(output, "opencode")
+	return strings.Contains(output, "claude") ||
+		strings.Contains(output, "node") ||
+		strings.Contains(output, "codex") ||
+		strings.Contains(output, "opencode")
 }
 
 // hasQuestionInPane checks the last output for question indicators.
@@ -1545,20 +1872,6 @@ func determineCrewState(activityAge time.Duration, isClaudeRunning bool, hook st
 	}
 }
 
-// formatCrewActivityAge formats activity age for display.
-func formatCrewActivityAge(age time.Duration) string {
-	switch {
-	case age < time.Minute:
-		return "just now"
-	case age < time.Hour:
-		return fmt.Sprintf("%dm ago", int(age.Minutes()))
-	case age < 24*time.Hour:
-		return fmt.Sprintf("%dh ago", int(age.Hours()))
-	default:
-		return fmt.Sprintf("%dd ago", int(age.Hours()/24))
-	}
-}
-
 // handleReady returns ready work items across town.
 func (h *APIHandler) handleReady(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
@@ -1566,7 +1879,7 @@ func (h *APIHandler) handleReady(w http.ResponseWriter, r *http.Request) {
 
 	// Run gt ready --json to get ready work
 	output, err := h.runGtCommand(ctx, 12*time.Second, []string{"ready", "--json"})
-	
+
 	resp := ReadyResponse{
 		Items:    make([]ReadyItem, 0),
 		BySource: make(map[string][]ReadyItem),
@@ -1633,6 +1946,61 @@ func (h *APIHandler) handleReady(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+// SessionPreviewResponse is the response for /api/session/preview.
+type SessionPreviewResponse struct {
+	Session   string `json:"session"`
+	Content   string `json:"content"`
+	Timestamp string `json:"timestamp"`
+}
+
+// handleSessionPreview returns the last N lines of tmux capture-pane output for a session.
+func (h *APIHandler) handleSessionPreview(w http.ResponseWriter, r *http.Request) {
+	sessionName := r.URL.Query().Get("session")
+	if sessionName == "" {
+		h.sendError(w, "Missing session parameter", http.StatusBadRequest)
+		return
+	}
+
+	// Validate session name: must start with a known prefix and contain only safe characters
+	hasValidPrefix := session.HasKnownPrefix(sessionName)
+	if !hasValidPrefix {
+		h.sendError(w, "Invalid session name: must start with a known rig prefix", http.StatusBadRequest)
+		return
+	}
+	for _, c := range sessionName {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+			h.sendError(w, "Invalid session name: contains invalid characters", http.StatusBadRequest)
+			return
+		}
+	}
+
+	// Run tmux capture-pane to get the last 30 lines
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "tmux", "capture-pane", "-t", sessionName, "-p", "-J", "-S", "-30")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			h.sendError(w, "tmux capture-pane timed out", http.StatusGatewayTimeout)
+			return
+		}
+		h.sendError(w, "Failed to capture pane: "+stderr.String(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(SessionPreviewResponse{
+		Session:   sessionName,
+		Content:   stdout.String(),
+		Timestamp: time.Now().Format(time.RFC3339),
+	})
+}
+
 // parseCommandArgs splits a command string into args, respecting quotes.
 func parseCommandArgs(command string) []string {
 	var args []string
@@ -1667,4 +2035,105 @@ func parseCommandArgs(command string) []string {
 	}
 
 	return args
+}
+
+// handleSSE streams Server-Sent Events to the dashboard client.
+// It polls key dashboard state every 2 seconds and sends an event when
+// changes are detected, allowing the client to trigger a re-render.
+// Falls through gracefully if the client disconnects.
+func (h *APIHandler) handleSSE(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "SSE not supported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	ctx := r.Context()
+
+	// Send initial connection event
+	fmt.Fprintf(w, "event: connected\ndata: ok\n\n")
+	flusher.Flush()
+
+	var lastHash string
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	// Send keepalive comment every 15 seconds to prevent connection timeouts
+	keepalive := time.NewTicker(15 * time.Second)
+	defer keepalive.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-keepalive.C:
+			fmt.Fprintf(w, ": keepalive\n\n")
+			flusher.Flush()
+		case <-ticker.C:
+			hash := h.computeDashboardHash(ctx)
+			if hash != "" && hash != lastHash {
+				lastHash = hash
+				fmt.Fprintf(w, "event: dashboard-update\ndata: %s\n\n", hash)
+				flusher.Flush()
+			}
+		}
+	}
+}
+
+// computeDashboardHash generates a lightweight hash of key dashboard state.
+// It runs quick commands in parallel and hashes their output to detect changes.
+func (h *APIHandler) computeDashboardHash(ctx context.Context) string {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	var mu sync.Mutex
+	var parts []string
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	// Check worker/polecat state
+	go func() {
+		defer wg.Done()
+		if out, err := h.runGtCommand(ctx, 3*time.Second, []string{"status", "--json"}); err == nil {
+			mu.Lock()
+			parts = append(parts, "status:"+out)
+			mu.Unlock()
+		}
+	}()
+
+	// Check hooks state
+	go func() {
+		defer wg.Done()
+		if out, err := h.runGtCommand(ctx, 3*time.Second, []string{"hooks", "list"}); err == nil {
+			mu.Lock()
+			parts = append(parts, "hooks:"+out)
+			mu.Unlock()
+		}
+	}()
+
+	// Check mail count
+	go func() {
+		defer wg.Done()
+		if out, err := h.runGtCommand(ctx, 3*time.Second, []string{"mail", "inbox"}); err == nil {
+			mu.Lock()
+			parts = append(parts, "mail:"+out)
+			mu.Unlock()
+		}
+	}()
+
+	wg.Wait()
+
+	if len(parts) == 0 {
+		return ""
+	}
+
+	h256 := sha256.Sum256([]byte(strings.Join(parts, "|")))
+	return fmt.Sprintf("%x", h256[:8])
 }

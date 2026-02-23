@@ -1,7 +1,9 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,11 +17,14 @@ import (
 	"github.com/steveyegge/gastown/internal/crew"
 	"github.com/steveyegge/gastown/internal/daemon"
 	"github.com/steveyegge/gastown/internal/deacon"
+	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/mayor"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/refinery"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/wisp"
@@ -34,8 +39,72 @@ type agentStartResult struct {
 	detail string // Status detail (session name or error)
 }
 
-// maxConcurrentAgentStarts limits parallel agent startups to avoid resource exhaustion.
+// UpOutput represents the JSON output of the up command.
+type UpOutput struct {
+	Success  bool              `json:"success"`
+	Services []ServiceStatus   `json:"services"`
+	Summary  UpSummary         `json:"summary"`
+}
+
+// ServiceStatus represents the status of a single service.
+type ServiceStatus struct {
+	Name    string `json:"name"`
+	Type    string `json:"type"` // daemon, deacon, mayor, witness, refinery, crew, polecat
+	Rig     string `json:"rig,omitempty"`
+	OK      bool   `json:"ok"`
+	Detail  string `json:"detail"`
+}
+
+// UpSummary provides counts for the up command output.
+type UpSummary struct {
+	Total   int `json:"total"`
+	Started int `json:"started"`
+	Failed  int `json:"failed"`
+}
+
+func buildUpSummary(services []ServiceStatus) UpSummary {
+	started := 0
+	failed := 0
+	for _, svc := range services {
+		if svc.OK {
+			started++
+		} else {
+			failed++
+		}
+	}
+	return UpSummary{
+		Total:   len(services),
+		Started: started,
+		Failed:  failed,
+	}
+}
+
+func emitUpJSON(w io.Writer, services []ServiceStatus) error {
+	summary := buildUpSummary(services)
+	output := UpOutput{
+		Success:  summary.Failed == 0,
+		Services: services,
+		Summary:  summary,
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(output); err != nil {
+		return err
+	}
+	if summary.Failed > 0 {
+		return NewSilentExit(1)
+	}
+	return nil
+}
+
+// maxConcurrentAgentStarts limits parallel agent startups to avoid resource
+// exhaustion. Each agent start spawns a tmux session and runs gt prime, so
+// more than ~10 concurrent starts can saturate CPU and cause timeouts.
 const maxConcurrentAgentStarts = 10
+
+// daemonStartupGrace is how long to wait after spawning the daemon process
+// before verifying it started. The daemon needs time to write its PID file.
+const daemonStartupGrace = 300 * time.Millisecond
 
 var upCmd = &cobra.Command{
 	Use:     "up",
@@ -46,6 +115,7 @@ var upCmd = &cobra.Command{
 This is the idempotent "boot" command for Gas Town. It ensures all
 infrastructure agents are running:
 
+  • Dolt       - Shared SQL database server for beads
   • Daemon     - Go background process that pokes agents
   • Deacon     - Health orchestrator (monitors Mayor/Witnesses)
   • Mayor      - Global work coordinator
@@ -67,11 +137,13 @@ aren't already running.`,
 var (
 	upQuiet   bool
 	upRestore bool
+	upJSON    bool
 )
 
 func init() {
-	upCmd.Flags().BoolVarP(&upQuiet, "quiet", "q", false, "Only show errors")
+	upCmd.Flags().BoolVarP(&upQuiet, "quiet", "q", false, "Only show errors (ignored with --json)")
 	upCmd.Flags().BoolVar(&upRestore, "restore", false, "Also restore crew (from settings) and polecats (from hooks)")
+	upCmd.Flags().BoolVar(&upJSON, "json", false, "Output as JSON")
 	rootCmd.AddCommand(upCmd)
 }
 
@@ -82,6 +154,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 	}
 
 	allOK := true
+	var services []ServiceStatus
 
 	// Discover rigs early so we can prefetch while daemon/deacon/mayor start
 	rigs := discoverRigs(townRoot)
@@ -92,9 +165,34 @@ func runUp(cmd *cobra.Command, args []string) error {
 	var deaconResult, mayorResult agentStartResult
 	var prefetchedRigs map[string]*rig.Rig
 	var rigErrors map[string]error
+	var doltOK bool
+	var doltDetail string
+	var doltSkipped bool
 
 	var startupWg sync.WaitGroup
-	startupWg.Add(4)
+	startupWg.Add(5)
+
+	// 0. Dolt server (if configured)
+	go func() {
+		defer startupWg.Done()
+		cfg := doltserver.DefaultConfig(townRoot)
+		if _, err := os.Stat(cfg.DataDir); os.IsNotExist(err) {
+			doltSkipped = true
+			return
+		}
+		running, _, _ := doltserver.IsRunning(townRoot)
+		if running {
+			doltOK = true
+			doltDetail = "already running"
+			return
+		}
+		if err := doltserver.Start(townRoot); err != nil {
+			doltDetail = err.Error()
+		} else {
+			doltOK = true
+			doltDetail = fmt.Sprintf("started (port %d)", doltserver.DefaultPort)
+		}
+	}()
 
 	// 1. Daemon (Go process)
 	go func() {
@@ -147,29 +245,54 @@ func runUp(cmd *cobra.Command, args []string) error {
 
 	startupWg.Wait()
 
-	// Print daemon/deacon/mayor results
+	// Ensure beads metadata points to the Dolt server
+	if !doltSkipped && doltOK {
+		_, _ = doltserver.EnsureAllMetadata(townRoot)
+	}
+
+	// Collect Dolt status (if configured)
+	if !doltSkipped {
+		services = append(services, ServiceStatus{Name: "Dolt", Type: "dolt", OK: doltOK, Detail: doltDetail})
+		if !doltOK {
+			allOK = false
+		}
+	}
+
+	// Collect daemon/deacon/mayor results (always append daemon status)
 	if daemonErr != nil {
-		printStatus("Daemon", false, daemonErr.Error())
+		services = append(services, ServiceStatus{Name: "Daemon", Type: "daemon", OK: false, Detail: daemonErr.Error()})
 		allOK = false
 	} else if daemonPID > 0 {
-		printStatus("Daemon", true, fmt.Sprintf("PID %d", daemonPID))
+		services = append(services, ServiceStatus{Name: "Daemon", Type: "daemon", OK: true, Detail: fmt.Sprintf("PID %d", daemonPID)})
+	} else {
+		services = append(services, ServiceStatus{Name: "Daemon", Type: "daemon", OK: true, Detail: "running (PID unknown)"})
 	}
-	printStatus(deaconResult.name, deaconResult.ok, deaconResult.detail)
+	services = append(services, ServiceStatus{Name: deaconResult.name, Type: constants.RoleDeacon, OK: deaconResult.ok, Detail: deaconResult.detail})
 	if !deaconResult.ok {
 		allOK = false
 	}
-	printStatus(mayorResult.name, mayorResult.ok, mayorResult.detail)
+	services = append(services, ServiceStatus{Name: mayorResult.name, Type: constants.RoleMayor, OK: mayorResult.ok, Detail: mayorResult.detail})
 	if !mayorResult.ok {
 		allOK = false
+	}
+
+	// Ensure Dolt server is fully ready before starting agents that depend on it.
+	// Witnesses and refineries run bd commands on startup (via gt prime → patrol_helpers)
+	// that connect to the Dolt SQL server. Without this gate, they race the server
+	// and get "connection refused" errors. (gt-zou1n)
+	// Only wait if Dolt was actually started (or detected running). If it failed or
+	// was skipped, polling the port would just burn the full timeout. (review finding #1)
+	if !doltSkipped && doltOK {
+		waitForDoltReady(townRoot)
 	}
 
 	// 5 & 6. Witnesses and Refineries (using prefetched rigs)
 	witnessResults, refineryResults := startRigAgentsWithPrefetch(rigs, prefetchedRigs, rigErrors)
 
-	// Print results in order: all witnesses first, then all refineries
+	// Collect results in order: all witnesses first, then all refineries
 	for _, rigName := range rigs {
 		if result, ok := witnessResults[rigName]; ok {
-			printStatus(result.name, result.ok, result.detail)
+			services = append(services, ServiceStatus{Name: result.name, Type: constants.RoleWitness, Rig: rigName, OK: result.ok, Detail: result.detail})
 			if !result.ok {
 				allOK = false
 			}
@@ -177,7 +300,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 	}
 	for _, rigName := range rigs {
 		if result, ok := refineryResults[rigName]; ok {
-			printStatus(result.name, result.ok, result.detail)
+			services = append(services, ServiceStatus{Name: result.name, Type: constants.RoleRefinery, Rig: rigName, OK: result.ok, Detail: result.detail})
 			if !result.ok {
 				allOK = false
 			}
@@ -189,10 +312,22 @@ func runUp(cmd *cobra.Command, args []string) error {
 		for _, rigName := range rigs {
 			crewStarted, crewErrors := startCrewFromSettings(townRoot, rigName)
 			for _, name := range crewStarted {
-				printStatus(fmt.Sprintf("Crew (%s/%s)", rigName, name), true, fmt.Sprintf("gt-%s-crew-%s", rigName, name))
+				services = append(services, ServiceStatus{
+					Name:   fmt.Sprintf("Crew (%s/%s)", rigName, name),
+					Type:   constants.RoleCrew,
+					Rig:    rigName,
+					OK:     true,
+					Detail: session.CrewSessionName(session.PrefixFor(rigName), name),
+				})
 			}
 			for name, err := range crewErrors {
-				printStatus(fmt.Sprintf("Crew (%s/%s)", rigName, name), false, err.Error())
+				services = append(services, ServiceStatus{
+					Name:   fmt.Sprintf("Crew (%s/%s)", rigName, name),
+					Type:   constants.RoleCrew,
+					Rig:    rigName,
+					OK:     false,
+					Detail: err.Error(),
+				})
 				allOK = false
 			}
 		}
@@ -201,25 +336,50 @@ func runUp(cmd *cobra.Command, args []string) error {
 		for _, rigName := range rigs {
 			polecatsStarted, polecatErrors := startPolecatsWithWork(townRoot, rigName)
 			for _, name := range polecatsStarted {
-				printStatus(fmt.Sprintf("Polecat (%s/%s)", rigName, name), true, fmt.Sprintf("gt-%s-polecat-%s", rigName, name))
+				services = append(services, ServiceStatus{
+					Name:   fmt.Sprintf("Polecat (%s/%s)", rigName, name),
+					Type:   constants.RolePolecat,
+					Rig:    rigName,
+					OK:     true,
+					Detail: session.PolecatSessionName(session.PrefixFor(rigName), name),
+				})
 			}
 			for name, err := range polecatErrors {
-				printStatus(fmt.Sprintf("Polecat (%s/%s)", rigName, name), false, err.Error())
+				services = append(services, ServiceStatus{
+					Name:   fmt.Sprintf("Polecat (%s/%s)", rigName, name),
+					Type:   constants.RolePolecat,
+					Rig:    rigName,
+					OK:     false,
+					Detail: err.Error(),
+				})
 				allOK = false
 			}
 		}
 	}
 
-	fmt.Println()
+	// Log boot event for both JSON and text paths
 	if allOK {
-		fmt.Printf("%s All services running\n", style.Bold.Render("✓"))
-		// Log boot event with started services
-		startedServices := []string{"daemon", "deacon", "mayor"}
+		startedServices := []string{"dolt", "daemon", "deacon", "mayor"}
 		for _, rigName := range rigs {
 			startedServices = append(startedServices, fmt.Sprintf("%s/witness", rigName))
 			startedServices = append(startedServices, fmt.Sprintf("%s/refinery", rigName))
 		}
 		_ = events.LogFeed(events.TypeBoot, "gt", events.BootPayload("town", startedServices))
+	}
+
+	// Output JSON or text
+	if upJSON {
+		return emitUpJSON(os.Stdout, services)
+	}
+
+	// Text output
+	for _, svc := range services {
+		printStatus(svc.Name, svc.OK, svc.Detail)
+	}
+
+	fmt.Println()
+	if allOK {
+		fmt.Printf("%s All services running\n", style.Bold.Render("✓"))
 	} else {
 		fmt.Printf("%s Some services failed to start\n", style.Bold.Render("✗"))
 		return fmt.Errorf("not all services started")
@@ -267,7 +427,7 @@ func ensureDaemon(townRoot string) error {
 	}
 
 	// Wait for daemon to initialize
-	time.Sleep(300 * time.Millisecond)
+	time.Sleep(daemonStartupGrace)
 
 	// Verify it started
 	running, _, err = daemon.IsRunning(townRoot)
@@ -705,4 +865,20 @@ func startPolecatsWithWork(townRoot, rigName string) ([]string, map[string]error
 	}
 
 	return started, errors
+}
+
+// doltReadyTimeout is how long gt up waits for the Dolt SQL server to accept
+// connections before proceeding with witness/refinery startup. 10 seconds is
+// generous: doltserver.Start() already retries for 5s, so this covers the case
+// where the daemon (not gt up) started Dolt and it's still initializing.
+const doltReadyTimeout = 10 * time.Second
+
+// waitForDoltReady waits for the Dolt SQL server to be reachable before
+// starting agents that depend on beads database access. If the server is not
+// configured (no server-mode metadata), this is a no-op. If the timeout
+// expires, logs a warning and continues (graceful degradation). (gt-zou1n)
+func waitForDoltReady(townRoot string) {
+	if err := doltserver.WaitForReady(townRoot, doltReadyTimeout); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: %v (agents may see connection errors)\n", err)
+	}
 }

@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"strings"
 	"time"
@@ -95,6 +96,14 @@ func runMoleculeBurn(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("detaching molecule: %w", err)
 	}
+	// Close the molecule root after detach so the audit sees original status.
+	// Without this, the wisp root stays in "hooked" status indefinitely,
+	// causing patrol molecule leaks (issue #1828).
+	rootClosed := true
+	if closeErr := b.ForceCloseWithReason("burned", moleculeID); closeErr != nil {
+		style.PrintWarning("could not close molecule root %s: %v", moleculeID, closeErr)
+		rootClosed = false
+	}
 
 	if moleculeJSON {
 		result := map[string]interface{}{
@@ -102,6 +111,7 @@ func runMoleculeBurn(cmd *cobra.Command, args []string) error {
 			"from":            target,
 			"handoff_id":      handoff.ID,
 			"children_closed": childrenClosed,
+			"root_closed":     rootClosed,
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -119,6 +129,21 @@ func runMoleculeBurn(cmd *cobra.Command, args []string) error {
 
 // runMoleculeSquash squashes the current molecule into a digest.
 func runMoleculeSquash(cmd *cobra.Command, args []string) error {
+	// Parse jitter early so invalid flags fail fast, but defer the sleep
+	// until after workspace/attachment validation so no-op invocations
+	// (wrong directory, no attached molecule) don't wait unnecessarily.
+	var jitterMax time.Duration
+	if moleculeJitter != "" {
+		var err error
+		jitterMax, err = time.ParseDuration(moleculeJitter)
+		if err != nil {
+			return fmt.Errorf("invalid --jitter duration %q: %w", moleculeJitter, err)
+		}
+		if jitterMax < 0 {
+			return fmt.Errorf("--jitter must be non-negative, got %v", jitterMax)
+		}
+	}
+
 	cwd, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("getting current directory: %w", err)
@@ -186,88 +211,131 @@ func runMoleculeSquash(cmd *cobra.Command, args []string) error {
 
 	moleculeID := attachment.AttachedMolecule
 
+	// Apply jitter before acquiring any Dolt locks.
+	// Multiple patrol agents (deacon, witness, refinery) squash concurrently at
+	// cycle end, causing exclusive-lock contention. A random pre-sleep
+	// desynchronizes them without changing semantics.
+	if jitterMax > 0 {
+		//nolint:gosec // weak RNG is fine for jitter
+		sleep := time.Duration(rand.Int63n(int64(jitterMax)))
+		fmt.Fprintf(os.Stderr, "jitter: sleeping %v before squash\n", sleep)
+		select {
+		case <-cmd.Context().Done():
+			return cmd.Context().Err()
+		case <-time.After(sleep):
+		}
+	}
+
 	// Recursively close all descendant step issues before squashing
 	// This prevents orphaned step issues from accumulating (gt-psj76.1)
 	childrenClosed := closeDescendants(b, moleculeID)
 
-	// Get progress info for the digest
-	progress, _ := getMoleculeProgressInfo(b, moleculeID)
+	// Skip digest creation if --no-digest flag is set (gt-t2bjt).
+	// Patrol molecules (deacon, witness, refinery) run frequently and their
+	// digests pollute the database with thousands of low-value beads.
+	if !moleculeNoDigest {
+		// Get progress info for the digest
+		progress, _ := getMoleculeProgressInfo(b, moleculeID)
 
-	// Create a digest issue
-	digestTitle := fmt.Sprintf("Digest: %s", moleculeID)
-	digestDesc := fmt.Sprintf(`Squashed molecule execution.
+		// Create a digest issue
+		digestTitle := fmt.Sprintf("Digest: %s", moleculeID)
+		digestDesc := fmt.Sprintf(`Squashed molecule execution.
 
 molecule: %s
 agent: %s
 squashed_at: %s
 `, moleculeID, target, time.Now().UTC().Format(time.RFC3339))
 
-	if progress != nil {
-		digestDesc += fmt.Sprintf(`
+		if moleculeSummary != "" {
+			digestDesc += fmt.Sprintf("\n## Summary\n%s\n", moleculeSummary)
+		}
+
+		if progress != nil {
+			digestDesc += fmt.Sprintf(`
 ## Execution Summary
 - Steps: %d/%d completed
 - Status: %s
 `, progress.DoneSteps, progress.TotalSteps, func() string {
-			if progress.Complete {
-				return "complete"
-			}
-			return "partial"
-		}())
-	}
+				if progress.Complete {
+					return "complete"
+				}
+				return "partial"
+			}())
+		}
 
-	// Create the digest bead (ephemeral to avoid JSONL pollution)
-	// Per-cycle digests are aggregated daily by 'gt patrol digest'
-	digestIssue, err := b.Create(beads.CreateOptions{
-		Title:       digestTitle,
-		Description: digestDesc,
-		Type:        "task",
-		Priority:    4,       // P4 - backlog priority for digests
-		Actor:       target,
-		Ephemeral:   true,    // Don't export to JSONL - daily aggregation handles permanent record
-	})
-	if err != nil {
-		return fmt.Errorf("creating digest: %w", err)
-	}
+		// Create the digest bead (ephemeral to avoid git pollution)
+		// Per-cycle digests are aggregated daily by 'gt patrol digest'
+		digestIssue, err := b.Create(beads.CreateOptions{
+			Title:       digestTitle,
+			Description: digestDesc,
+			Type:        "task",
+			Priority:    4,       // P4 - backlog priority for digests
+			Actor:       target,
+			Ephemeral:   true,    // Don't export to JSONL - daily aggregation handles permanent record
+		})
+		if err != nil {
+			return fmt.Errorf("creating digest: %w", err)
+		}
 
-	// Add the digest label (non-fatal: digest works without label)
-	_ = b.Update(digestIssue.ID, beads.UpdateOptions{
-		AddLabels: []string{"digest"},
-	})
+		// Add the digest label (non-fatal: digest works without label)
+		_ = b.Update(digestIssue.ID, beads.UpdateOptions{
+			AddLabels: []string{"digest"},
+		})
 
-	// Close the digest immediately
-	closedStatus := "closed"
-	err = b.Update(digestIssue.ID, beads.UpdateOptions{
-		Status: &closedStatus,
-	})
-	if err != nil {
-		style.PrintWarning("Created digest but couldn't close it: %v", err)
+		// Close the digest immediately
+		closedStatus := "closed"
+		err = b.Update(digestIssue.ID, beads.UpdateOptions{
+			Status: &closedStatus,
+		})
+		if err != nil {
+			style.PrintWarning("Created digest but couldn't close it: %v", err)
+		}
 	}
 
 	// Detach the molecule from the handoff bead with audit logging
+	detachReason := "molecule squashed (no digest)"
+	if !moleculeNoDigest {
+		detachReason = "molecule squashed"
+	}
 	_, err = b.DetachMoleculeWithAudit(handoff.ID, beads.DetachOptions{
 		Operation: "squash",
 		Agent:     target,
-		Reason:    fmt.Sprintf("molecule squashed to digest %s", digestIssue.ID),
+		Reason:    detachReason,
 	})
 	if err != nil {
 		return fmt.Errorf("detaching molecule: %w", err)
 	}
 
+	// Close the molecule root after detach so the audit sees original status.
+	// Without this, the wisp root stays in "hooked" status indefinitely,
+	// causing patrol molecule leaks (issue #1828).
+	rootClosed := true
+	if closeErr := b.ForceCloseWithReason("squashed", moleculeID); closeErr != nil {
+		style.PrintWarning("could not close molecule root %s: %v", moleculeID, closeErr)
+		rootClosed = false
+	}
+
 	if moleculeJSON {
 		result := map[string]interface{}{
 			"squashed":        moleculeID,
-			"digest_id":       digestIssue.ID,
 			"from":            target,
 			"handoff_id":      handoff.ID,
 			"children_closed": childrenClosed,
+			"digest_skipped":  moleculeNoDigest,
+			"root_closed":     rootClosed,
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		return enc.Encode(result)
 	}
 
-	fmt.Printf("%s Squashed molecule %s → digest %s\n",
-		style.Bold.Render("📦"), moleculeID, digestIssue.ID)
+	if moleculeNoDigest {
+		fmt.Printf("%s Squashed molecule %s (no digest)\n",
+			style.Bold.Render("📦"), moleculeID)
+	} else {
+		fmt.Printf("%s Squashed molecule %s\n",
+			style.Bold.Render("📦"), moleculeID)
+	}
 	if childrenClosed > 0 {
 		fmt.Printf("  Closed %d step issues\n", childrenClosed)
 	}
@@ -278,6 +346,17 @@ squashed_at: %s
 // closeDescendants recursively closes all descendant issues of a parent.
 // Returns the count of issues closed. Logs warnings on errors but doesn't fail.
 func closeDescendants(b *beads.Beads, parentID string) int {
+	return closeDescendantsImpl(b, parentID, false)
+}
+
+// forceCloseDescendants is like closeDescendants but uses force-close,
+// which succeeds even for beads in invalid states. Use in destructive
+// paths (nuke, burn) where we must clean up regardless.
+func forceCloseDescendants(b *beads.Beads, parentID string) {
+	closeDescendantsImpl(b, parentID, true)
+}
+
+func closeDescendantsImpl(b *beads.Beads, parentID string, force bool) int {
 	children, err := b.List(beads.ListOptions{
 		Parent: parentID,
 		Status: "all",
@@ -294,7 +373,7 @@ func closeDescendants(b *beads.Beads, parentID string) int {
 	// First, recursively close grandchildren
 	totalClosed := 0
 	for _, child := range children {
-		totalClosed += closeDescendants(b, child.ID)
+		totalClosed += closeDescendantsImpl(b, child.ID, force)
 	}
 
 	// Then close direct children
@@ -306,7 +385,13 @@ func closeDescendants(b *beads.Beads, parentID string) int {
 	}
 
 	if len(idsToClose) > 0 {
-		if closeErr := b.Close(idsToClose...); closeErr != nil {
+		var closeErr error
+		if force {
+			closeErr = b.ForceCloseWithReason("burned: force-close descendants", idsToClose...)
+		} else {
+			closeErr = b.Close(idsToClose...)
+		}
+		if closeErr != nil {
 			style.PrintWarning("could not close children of %s: %v", parentID, closeErr)
 		} else {
 			totalClosed += len(idsToClose)

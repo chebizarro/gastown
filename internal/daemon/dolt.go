@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/doltserver"
 )
 
 const doltCmdTimeout = 15 * time.Second
@@ -33,8 +35,14 @@ type DoltServerConfig struct {
 	// Port is the MySQL protocol port (default 3306).
 	Port int `json:"port,omitempty"`
 
-	// Host is the bind address (default 127.0.0.1).
+	// Host is the bind/connect address (default 127.0.0.1).
 	Host string `json:"host,omitempty"`
+
+	// User is the MySQL user name (default root).
+	User string `json:"user,omitempty"`
+
+	// Password is the MySQL password. Empty means no password.
+	Password string `json:"password,omitempty"`
 
 	// DataDir is the directory containing Dolt databases.
 	// Each subdirectory becomes a database.
@@ -76,6 +84,7 @@ func DefaultDoltServerConfig(townRoot string) *DoltServerConfig {
 		Enabled:              false, // Opt-in
 		Port:                 3306,
 		Host:                 "127.0.0.1",
+		User:                 "root",
 		DataDir:              filepath.Join(townRoot, "dolt"),
 		LogFile:              filepath.Join(townRoot, "daemon", "dolt-server.log"),
 		AutoRestart:          true,
@@ -118,9 +127,13 @@ type DoltServerManager struct {
 	escalated       bool          // Whether we've already escalated (avoid spamming)
 	restarting      bool          // Whether a restart is in progress (guards against concurrent restarts)
 
+	// Identity verification state
+	lastIdentityCheck time.Time // Last time we ran the database identity check
+
 	// Test hooks (nil = use real implementations; set only in tests)
 	healthCheckFn      func() error
 	writeProbeCheckFn  func() error
+	identityCheckFn    func() error // nil = use real VerifyServerDataDir
 	startFn            func() error
 	runningFn          func() (int, bool)
 	stopFn             func()
@@ -173,6 +186,55 @@ func (m *DoltServerManager) IsEnabled() bool {
 // IsExternal returns whether the Dolt server is externally managed.
 func (m *DoltServerManager) IsExternal() bool {
 	return m.config != nil && m.config.External
+}
+
+// isRemote returns true when the daemon's Dolt config points to a non-local server.
+func (m *DoltServerManager) isRemote() bool {
+	if m.config == nil {
+		return false
+	}
+	switch strings.ToLower(m.config.Host) {
+	case "", "127.0.0.1", "localhost", "::1", "[::1]":
+		return false
+	}
+	return true
+}
+
+// buildDoltSQLCmd constructs a dolt sql command using daemon config, mirroring
+// the doltserver.buildDoltSQLCmd pattern for local-vs-remote command construction.
+func (m *DoltServerManager) buildDoltSQLCmd(ctx context.Context, args ...string) *exec.Cmd {
+	var fullArgs []string
+	fullArgs = append(fullArgs, "sql")
+
+	if m.isRemote() {
+		host := m.config.Host
+		if host == "" {
+			host = "127.0.0.1"
+		}
+		user := m.config.User
+		if user == "" {
+			user = "root"
+		}
+		fullArgs = append(fullArgs,
+			"--host", host,
+			"--port", strconv.Itoa(m.config.Port),
+			"--user", user,
+			"--no-tls",
+		)
+	}
+
+	fullArgs = append(fullArgs, args...)
+	cmd := exec.CommandContext(ctx, "dolt", fullArgs...)
+
+	if !m.isRemote() {
+		cmd.Dir = m.config.DataDir
+	}
+
+	if m.isRemote() && m.config.Password != "" {
+		cmd.Env = append(os.Environ(), "DOLT_CLI_PASSWORD="+m.config.Password)
+	}
+
+	return cmd
 }
 
 // HealthCheckInterval returns the configured health check interval,
@@ -322,6 +384,26 @@ func (m *DoltServerManager) EnsureRunning() error {
 			m.stopLocked()
 			return m.restartWithBackoff()
 		}
+		// Periodic identity check: verify the server is serving the correct databases.
+		// Runs every 5 minutes (not every health tick) since imposters are rare.
+		const identityCheckInterval = 5 * time.Minute
+		now := m.now()
+		if now.Sub(m.lastIdentityCheck) >= identityCheckInterval {
+			m.lastIdentityCheck = now
+			if err := m.checkDatabaseIdentityLocked(); err != nil {
+				m.logger("Dolt server identity check failed: %v, restarting...", err)
+				m.sendUnhealthyAlert(fmt.Errorf("identity check: %w", err))
+				m.writeUnhealthySignal("imposter_detected", err.Error())
+				m.stopLocked()
+				// Also kill any imposters before restarting
+				if killErr := doltserver.KillImposters(m.townRoot); killErr != nil {
+					m.logger("Warning: failed to kill imposters: %v", killErr)
+				}
+				time.Sleep(500 * time.Millisecond)
+				return m.restartWithBackoff()
+			}
+		}
+
 		// Server is healthy — clear any stale unhealthy signal and reset backoff
 		m.clearUnhealthySignal()
 		m.maybeResetBackoff()
@@ -805,8 +887,7 @@ func (m *DoltServerManager) checkHealthLocked() error {
 	defer cancel()
 
 	start := time.Now()
-	cmd := exec.CommandContext(ctx, "dolt", "sql", "-q", "SELECT 1")
-	cmd.Dir = m.config.DataDir
+	cmd := m.buildDoltSQLCmd(ctx, "-q", "SELECT 1")
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -834,11 +915,10 @@ func (m *DoltServerManager) checkHealthLocked() error {
 func (m *DoltServerManager) checkConnectionCount() {
 	ctx, cancel := context.WithTimeout(context.Background(), doltCmdTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "dolt", "sql",
+	cmd := m.buildDoltSQLCmd(ctx,
 		"-r", "csv",
 		"-q", "SELECT COUNT(*) AS cnt FROM information_schema.PROCESSLIST",
 	)
-	cmd.Dir = m.config.DataDir
 
 	output, err := cmd.Output()
 	if err != nil {
@@ -918,8 +998,7 @@ func (m *DoltServerManager) checkWriteHealthLocked() error {
 		"USE `%s`; CREATE TABLE IF NOT EXISTS `__gt_health_probe` (v INT PRIMARY KEY); REPLACE INTO `__gt_health_probe` VALUES (1); DROP TABLE IF EXISTS `__gt_health_probe`",
 		db,
 	)
-	cmd := exec.CommandContext(ctx, "dolt", "sql", "-q", query)
-	cmd.Dir = m.config.DataDir
+	cmd := m.buildDoltSQLCmd(ctx, "-q", query)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -934,6 +1013,118 @@ func (m *DoltServerManager) checkWriteHealthLocked() error {
 	}
 
 	return nil
+}
+
+// checkDatabaseIdentityLocked verifies the running Dolt server is serving the
+// correct databases from the expected data directory. Detects "imposter" servers
+// where another process (e.g., bd's embedded Dolt) hijacked the port.
+// Must be called with m.mu held.
+func (m *DoltServerManager) checkDatabaseIdentityLocked() error {
+	if m.identityCheckFn != nil {
+		return m.identityCheckFn()
+	}
+
+	// Use the doltserver package's verification which checks --data-dir
+	// on the process command line and falls back to database comparison.
+	legitimate, err := doltserver.VerifyServerDataDir(m.townRoot)
+	if err != nil {
+		return fmt.Errorf("server identity verification failed: %w", err)
+	}
+	if !legitimate {
+		return fmt.Errorf("server is an imposter (wrong data directory)")
+	}
+
+	// Additional check: verify expected databases have data.
+	// If the server is serving from the right dir but databases are empty,
+	// something else is wrong.
+	expectedDBs, fsErr := doltserver.ListDatabases(m.townRoot)
+	if fsErr != nil || len(expectedDBs) == 0 {
+		return nil // Can't verify further without expected databases
+	}
+
+	// Spot-check one database: query for issues or wisps table existence.
+	// Agent beads may be in the wisps table after migration, so check both.
+	db := expectedDBs[0]
+	ctx, cancel := context.WithTimeout(context.Background(), doltCmdTimeout)
+	defer cancel()
+
+	// Try issues table first
+	issueCount := -1
+	query := fmt.Sprintf("SELECT COUNT(*) AS cnt FROM `%s`.`issues`", db)
+	cmd := m.buildDoltSQLCmd(ctx, "-r", "csv", "-q", query)
+	if output, queryErr := cmd.Output(); queryErr == nil {
+		lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+		if len(lines) >= 2 {
+			if c, err := strconv.Atoi(strings.TrimSpace(lines[len(lines)-1])); err == nil {
+				issueCount = c
+			}
+		}
+	}
+
+	// Also try wisps table (may not exist yet)
+	wispCount := -1
+	wispCtx, wispCancel := context.WithTimeout(context.Background(), doltCmdTimeout)
+	defer wispCancel()
+	wispQuery := fmt.Sprintf("SELECT COUNT(*) AS cnt FROM `%s`.`wisps`", db)
+	wispCmd := m.buildDoltSQLCmd(wispCtx, "-r", "csv", "-q", wispQuery)
+	if wispOutput, wispErr := wispCmd.Output(); wispErr == nil {
+		wispLines := strings.Split(strings.TrimSpace(string(wispOutput)), "\n")
+		if len(wispLines) >= 2 {
+			if c, err := strconv.Atoi(strings.TrimSpace(wispLines[len(wispLines)-1])); err == nil {
+				wispCount = c
+			}
+		}
+	}
+
+	// If neither table exists, that's OK (not all DBs have beads)
+	if issueCount < 0 && wispCount < 0 {
+		return nil
+	}
+
+	// Total across both tables
+	totalCount := 0
+	if issueCount > 0 {
+		totalCount += issueCount
+	}
+	if wispCount > 0 {
+		totalCount += wispCount
+	}
+
+	// If we know the filesystem has data but the server returns 0 rows
+	// across both tables, this is suspicious.
+	if totalCount == 0 {
+		dbDir := doltserver.RigDatabaseDir(m.townRoot, db)
+		commitDir := filepath.Join(dbDir, ".dolt", "noms")
+		if info, err := os.Stat(commitDir); err == nil && info.IsDir() {
+			var totalSize int64
+			_ = filepath.Walk(dbDir, func(_ string, info os.FileInfo, err error) error {
+				if err == nil && !info.IsDir() {
+					totalSize += info.Size()
+				}
+				return nil
+			})
+			if totalSize > 1024*1024 { // > 1MB
+				return fmt.Errorf("database %q has %s on disk but 0 rows in server (issues+wisps) — possible imposter",
+					db, formatDiskSize(totalSize))
+			}
+		}
+	}
+
+	return nil
+}
+
+// formatDiskSize returns a human-readable size string.
+func formatDiskSize(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
 // getDatabases returns the list of databases. Uses the test hook if set.
@@ -1011,11 +1202,10 @@ func (m *DoltServerManager) getDoltVersion() (string, error) {
 func (m *DoltServerManager) listDatabases() ([]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), doltCmdTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "dolt", "sql",
+	cmd := m.buildDoltSQLCmd(ctx,
 		"-r", "json",
 		"-q", "SHOW DATABASES",
 	)
-	cmd.Dir = m.config.DataDir
 
 	output, err := cmd.Output()
 	if err != nil {
@@ -1043,7 +1233,7 @@ func (m *DoltServerManager) listDatabases() ([]string, error) {
 
 	var databases []string
 	for _, row := range result.Rows {
-		if row.Database != "" && row.Database != "information_schema" {
+		if row.Database != "" && !doltserver.IsSystemDatabase(row.Database) {
 			databases = append(databases, row.Database)
 		}
 	}

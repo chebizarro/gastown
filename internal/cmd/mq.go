@@ -33,11 +33,12 @@ var (
 	mqRejectStdin  bool // Read reason from stdin
 
 	// List command flags
-	mqListReady  bool
-	mqListStatus string
-	mqListWorker string
-	mqListEpic   string
-	mqListJSON   bool
+	mqListReady   bool
+	mqListStatus  string
+	mqListWorker  string
+	mqListEpic    string
+	mqListJSON    bool
+	mqListVerify  bool
 
 	// Status command flags
 	mqStatusJSON bool
@@ -294,6 +295,7 @@ func init() {
 	mqListCmd.Flags().StringVar(&mqListWorker, "worker", "", "Filter by worker name")
 	mqListCmd.Flags().StringVar(&mqListEpic, "epic", "", "Show MRs targeting integration/<epic>")
 	mqListCmd.Flags().BoolVar(&mqListJSON, "json", false, "Output as JSON")
+	mqListCmd.Flags().BoolVar(&mqListVerify, "verify", false, "Verify branches exist in git (shows MISSING for deleted branches)")
 
 	// Reject flags
 	mqRejectCmd.Flags().StringVarP(&mqRejectReason, "reason", "r", "", "Reason for rejection (required unless --stdin)")
@@ -347,11 +349,19 @@ func findCurrentRig(townRoot string) (string, *rig.Rig, error) {
 
 	// The first component of the relative path should be the rig name
 	parts := strings.Split(relPath, string(filepath.Separator))
-	if len(parts) == 0 || parts[0] == "" || parts[0] == "." {
-		return "", nil, fmt.Errorf("not inside a rig directory")
+	rigName := ""
+	if len(parts) > 0 && parts[0] != "" && parts[0] != "." {
+		rigName = parts[0]
 	}
 
-	rigName := parts[0]
+	// When gt is invoked via shell alias (cd ~/gt && gt), cwd is the town
+	// root and relPath is ".". Fall back to GT_RIG env var.
+	if rigName == "" {
+		rigName = os.Getenv("GT_RIG")
+	}
+	if rigName == "" {
+		return "", nil, fmt.Errorf("not inside a rig directory (and GT_RIG not set)")
+	}
 
 	// Load rig manager and get the rig
 	rigsConfigPath := filepath.Join(townRoot, "mayor", "rigs.json")

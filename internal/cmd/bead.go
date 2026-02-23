@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/style"
 )
 
@@ -16,7 +17,16 @@ var beadCmd = &cobra.Command{
 	Aliases: []string{"bd"},
 	GroupID: GroupWork,
 	Short:   "Bead management utilities",
-	Long:    `Utilities for managing beads across repositories.`,
+	Long: `Utilities for managing beads across repositories.
+
+Provides operations that span multiple beads repositories, such as
+moving beads between repos and viewing beads by ID with automatic
+prefix-based routing.
+
+Subcommands:
+  move    Move a bead from one repository to another
+  show    Show details of a bead (routes by prefix)
+  read    Alias for show`,
 }
 
 var beadMoveCmd = &cobra.Command{
@@ -131,6 +141,11 @@ func runBeadMove(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  Title: %s\n", source.Title)
 	fmt.Printf("  Type: %s\n", source.Type)
 
+	// Guard against flag-like titles propagating during move (gt-e0kx5)
+	if beads.IsFlagLikeTitle(source.Title) {
+		return fmt.Errorf("refusing to move bead: title %q looks like a CLI flag", source.Title)
+	}
+
 	if beadMoveDryRun {
 		fmt.Printf("\nDry run - would:\n")
 		fmt.Printf("  1. Create new bead with prefix %s\n", targetPrefix)
@@ -138,15 +153,18 @@ func runBeadMove(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Build create command for target
-	createArgs := []string{
-		"create",
-		"--prefix", targetPrefix,
-		"--title", source.Title,
+	// Build create command for target.
+	// Skip --prefix for empty or bare "-" (normalization above turns "" into "-").
+	createArgs := []string{"create"}
+	if targetPrefix != "" && targetPrefix != "-" {
+		createArgs = append(createArgs, "--prefix", targetPrefix)
+	}
+	createArgs = append(createArgs,
+		"--title="+source.Title,
 		"--type", source.Type,
 		"--priority", fmt.Sprintf("%d", source.Priority),
 		"--silent", // Only output the ID
-	}
+	)
 
 	if source.Description != "" {
 		createArgs = append(createArgs, "--description", source.Description)

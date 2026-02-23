@@ -82,8 +82,14 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("getting crew worker: %w", err)
 	}
 
-	// Ensure crew workspace is on default branch (persistent roles should not use feature branches)
-	ensureDefaultBranch(worker.ClonePath, fmt.Sprintf("Crew workspace %s/%s", r.Name, name), r.Path)
+	// Reset to default branch if --reset flag is passed; otherwise warn if off-branch
+	if crewReset {
+		if err := ensureDefaultBranch(worker.ClonePath, fmt.Sprintf("Crew workspace %s/%s", r.Name, name), r.Path); err != nil {
+			return fmt.Errorf("resetting to default branch: %w", err)
+		}
+	} else {
+		warnIfNotDefaultBranch(worker.ClonePath, fmt.Sprintf("Crew workspace %s/%s", r.Name, name), r.Path)
+	}
 
 	// If --no-tmux, just print the path
 	if crewNoTmux {
@@ -185,6 +191,9 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 			AgentName:        name,
 			TownRoot:         townRoot,
 			RuntimeConfigDir: claudeConfigDir,
+			Agent:            crewAgentOverride,
+			Topic:            "start",
+			SessionName:      sessionID,
 		})
 		for k, v := range envVars {
 			_ = t.SetEnvironment(sessionID, k, v)
@@ -209,7 +218,7 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 		// Build startup beacon for predecessor discovery via /resume
 		// Use FormatStartupBeacon instead of bare "gt prime" which confuses agents
 		// The SessionStart hook handles context injection (gt prime --hook)
-		address := fmt.Sprintf("%s/crew/%s", r.Name, name)
+		address := session.BeaconRecipient("crew", name, r.Name)
 		beacon := session.FormatStartupBeacon(session.BeaconConfig{
 			Recipient: address,
 			Sender:    "human",
@@ -219,7 +228,15 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 		// Use respawn-pane to replace shell with runtime directly
 		// This gives cleaner lifecycle: runtime exits → session ends (no intermediate shell)
 		// Export GT_ROLE and BD_ACTOR since tmux SetEnvironment only affects new panes
-		startupCmd, err := config.BuildCrewStartupCommandWithAgentOverride(r.Name, name, r.Path, beacon, crewAgentOverride)
+		startupCmd, err := config.BuildStartupCommandFromConfig(config.AgentEnvConfig{
+			Role:        "crew",
+			Rig:         r.Name,
+			AgentName:   name,
+			TownRoot:    townRoot,
+			Prompt:      beacon,
+			Topic:       "start",
+			SessionName: sessionID,
+		}, r.Path, beacon, crewAgentOverride)
 		if err != nil {
 			return fmt.Errorf("building startup command: %w", err)
 		}
@@ -238,14 +255,11 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 		fmt.Printf("%s Created session for %s/%s\n",
 			style.Bold.Render("✓"), r.Name, name)
 	} else {
-		// Session exists - check if runtime is still running
-		// Uses both pane command check and UI marker detection to avoid
-		// restarting when user is in a subshell spawned from the runtime
-		agentCfg, _, err := config.ResolveAgentConfigWithOverride(townRoot, r.Path, crewAgentOverride)
-		if err != nil {
-			return fmt.Errorf("resolving agent: %w", err)
-		}
-		if !t.IsAgentRunning(sessionID, config.ExpectedPaneCommands(agentCfg)...) {
+		// Session exists - check if agent is still alive
+		// Uses descendant process check instead of pane command check,
+		// since crew members launch via bash -c wrappers that cause
+		// false-negative detection with IsAgentRunning (see #1315, #1330).
+		if !t.IsAgentAlive(sessionID) {
 			// Runtime has exited, restart it using respawn-pane
 			fmt.Printf("Runtime exited, restarting...\n")
 
@@ -257,7 +271,7 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 
 			// Build startup beacon for predecessor discovery via /resume
 			// Use FormatStartupBeacon instead of bare "gt prime" which confuses agents
-			address := fmt.Sprintf("%s/crew/%s", r.Name, name)
+			address := session.BeaconRecipient("crew", name, r.Name)
 			beacon := session.FormatStartupBeacon(session.BeaconConfig{
 				Recipient: address,
 				Sender:    "human",
@@ -266,7 +280,15 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 
 			// Use respawn-pane to replace shell with runtime directly
 			// Export GT_ROLE and BD_ACTOR since tmux SetEnvironment only affects new panes
-			startupCmd, err := config.BuildCrewStartupCommandWithAgentOverride(r.Name, name, r.Path, beacon, crewAgentOverride)
+			startupCmd, err := config.BuildStartupCommandFromConfig(config.AgentEnvConfig{
+				Role:        "crew",
+				Rig:         r.Name,
+				AgentName:   name,
+				TownRoot:    townRoot,
+				Prompt:      beacon,
+				Topic:       "restart",
+				SessionName: sessionID,
+			}, r.Path, beacon, crewAgentOverride)
 			if err != nil {
 				return fmt.Errorf("building startup command: %w", err)
 			}
@@ -301,20 +323,23 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 
 	// Check if we're already in the target session
 	if isInTmuxSession(sessionID) {
-		// Check if agent is already running - don't restart if so
+		// Check if agent is already alive - don't restart if so
+		// Uses descendant process check (see #1315, #1330).
+		if t.IsAgentAlive(sessionID) {
+			// Agent is already running, nothing to do
+			fmt.Printf("Already in %s session with agent running.\n", name)
+			return nil
+		}
+
+		// Agent not alive — resolve config to start it
 		agentCfg, _, err := config.ResolveAgentConfigWithOverride(townRoot, r.Path, crewAgentOverride)
 		if err != nil {
 			return fmt.Errorf("resolving agent: %w", err)
 		}
-		if t.IsAgentRunning(sessionID, config.ExpectedPaneCommands(agentCfg)...) {
-			// Agent is already running, nothing to do
-			fmt.Printf("Already in %s session with %s running.\n", name, agentCfg.Command)
-			return nil
-		}
 
 		// We're in the session at a shell prompt - start the agent
 		// Build startup beacon for predecessor discovery via /resume
-		address := fmt.Sprintf("%s/crew/%s", r.Name, name)
+		address := session.BeaconRecipient("crew", name, r.Name)
 		beacon := session.FormatStartupBeacon(session.BeaconConfig{
 			Recipient: address,
 			Sender:    "human",

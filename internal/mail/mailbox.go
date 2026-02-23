@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -105,14 +107,18 @@ func (m *Mailbox) List() ([]*Message, error) {
 
 func (m *Mailbox) listBeads() ([]*Message, error) {
 	// Single query to beads - returns both persistent and wisp messages
-	// Wisps are stored in same DB with wisp=true flag, filtered from JSONL export
+	// Wisps are stored in same DB with wisp=true flag, not synced to git
 	messages, err := m.listFromDir(m.beadsDir)
 	if err != nil {
 		return nil, err
 	}
 
-	// Sort by timestamp (newest first)
+	// Sort by priority (higher first), then timestamp (newest first).
 	sort.Slice(messages, func(i, j int) bool {
+		pi, pj := PriorityToBeads(messages[i].Priority), PriorityToBeads(messages[j].Priority)
+		if pi != pj {
+			return pi < pj // lower beads int = higher priority
+		}
 		return messages[i].Timestamp.After(messages[j].Timestamp)
 	})
 
@@ -122,8 +128,10 @@ func (m *Mailbox) listBeads() ([]*Message, error) {
 // listFromDir queries messages from a beads directory.
 // Returns messages where identity is the assignee OR a CC recipient.
 // Includes both open and hooked messages (hooked = auto-assigned handoff mail).
-// Uses a single bd list call and filters client-side, replacing the previous
-// approach of N parallel queries (2-3 per identity variant).
+//
+// Uses per-identity --assignee queries to push filtering to Dolt, reducing
+// memory footprint under concurrent agent load. A separate CC query fetches
+// messages where this identity is CC'd.
 func (m *Mailbox) listFromDir(beadsDir string) ([]*Message, error) {
 	identities := m.identityVariants()
 
@@ -131,57 +139,82 @@ func (m *Mailbox) listFromDir(beadsDir string) ([]*Message, error) {
 		return nil, fmt.Errorf("ensuring custom types: %w", err)
 	}
 
-	// Single bd query: fetch all messages with gt:message label,
-	// then filter client-side for assignee/CC match. Process-spawn overhead
-	// dominates query time, so 1 broad call beats N narrow calls.
-	// NOTE: Uses --label instead of --type per migration in 221ff022.
-	args := []string{"list",
-		"--label", "gt:message",
-		"--json",
-		"--limit", "0",
-	}
+	// Deduplicate messages across queries (assignee + CC may overlap)
+	seen := make(map[string]bool)
+	messages := make([]*Message, 0)
 
-	ctx, cancel := bdReadCtx()
-	defer cancel()
-	stdout, err := runBdCommand(ctx, args, m.workDir, beadsDir)
-	if err != nil {
-		return nil, err
-	}
-
-	var allMsgs []BeadsMessage
-	if err := json.Unmarshal(stdout, &allMsgs); err != nil {
-		if len(stdout) == 0 || string(stdout) == "null" {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	// Build identity lookup sets for O(1) matching
-	identitySet := make(map[string]bool, len(identities))
-	ccLabelSet := make(map[string]bool, len(identities))
+	// Query 1: assignee match (per identity variant)
 	for _, id := range identities {
-		identitySet[id] = true
-		ccLabelSet["cc:"+id] = true
+		args := []string{"list",
+			"--label", "gt:message",
+			"--assignee", id,
+			"--json",
+			"--limit", "0",
+		}
+
+		ctx, cancel := bdReadCtx()
+		stdout, err := runBdCommand(ctx, args, m.workDir, beadsDir)
+		cancel()
+		if err != nil {
+			return nil, err
+		}
+
+		var msgs []BeadsMessage
+		if err := json.Unmarshal(stdout, &msgs); err != nil {
+			if len(stdout) == 0 || string(stdout) == "null" {
+				continue
+			}
+			return nil, err
+		}
+
+		for i := range msgs {
+			bm := &msgs[i]
+			if seen[bm.ID] {
+				continue
+			}
+			// Assignee match: open or hooked status
+			if bm.Status == "open" || bm.Status == "hooked" {
+				seen[bm.ID] = true
+				messages = append(messages, bm.ToMessage())
+			}
+		}
 	}
 
-	// Filter: assignee match (open/hooked) OR CC match (open only)
-	var messages []*Message
-	for i := range allMsgs {
-		bm := &allMsgs[i]
+	// Query 2: CC match — fetch messages with cc:<identity> label
+	for _, id := range identities {
+		ccLabel := "cc:" + id
+		args := []string{"list",
+			"--label", "gt:message",
+			"--label", ccLabel,
+			"--json",
+			"--limit", "0",
+		}
 
-		// Assignee match: open or hooked status
-		if identitySet[bm.Assignee] && (bm.Status == "open" || bm.Status == "hooked") {
-			messages = append(messages, bm.ToMessage())
+		ctx, cancel := bdReadCtx()
+		stdout, err := runBdCommand(ctx, args, m.workDir, beadsDir)
+		cancel()
+		if err != nil {
+			// CC query failure is non-fatal — assignee messages are primary
 			continue
 		}
 
-		// CC match: open status only
-		if bm.Status == "open" {
-			for _, label := range bm.Labels {
-				if ccLabelSet[label] {
-					messages = append(messages, bm.ToMessage())
-					break
-				}
+		var msgs []BeadsMessage
+		if err := json.Unmarshal(stdout, &msgs); err != nil {
+			if len(stdout) == 0 || string(stdout) == "null" {
+				continue
+			}
+			continue // Non-fatal for CC
+		}
+
+		for i := range msgs {
+			bm := &msgs[i]
+			if seen[bm.ID] {
+				continue
+			}
+			// CC match: open status only
+			if bm.Status == "open" {
+				seen[bm.ID] = true
+				messages = append(messages, bm.ToMessage())
 			}
 		}
 	}
@@ -205,18 +238,17 @@ func (m *Mailbox) identityVariants() []string {
 	return variants
 }
 
-
 func (m *Mailbox) listLegacy() ([]*Message, error) {
 	file, err := os.Open(m.path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return make([]*Message, 0), nil
 		}
 		return nil, err
 	}
 	defer func() { _ = file.Close() }() // non-fatal: OS will close on exit
 
-	var messages []*Message
+	messages := make([]*Message, 0)
 	scanner := bufio.NewScanner(file)
 	lineNum := 0
 	for scanner.Scan() {
@@ -237,8 +269,12 @@ func (m *Mailbox) listLegacy() ([]*Message, error) {
 		return nil, err
 	}
 
-	// Sort by timestamp (newest first)
+	// Sort by priority (higher first), then timestamp (newest first).
 	sort.Slice(messages, func(i, j int) bool {
+		pi, pj := PriorityToBeads(messages[i].Priority), PriorityToBeads(messages[j].Priority)
+		if pi != pj {
+			return pi < pj
+		}
 		return messages[i].Timestamp.After(messages[j].Timestamp)
 	})
 
@@ -252,7 +288,7 @@ func (m *Mailbox) ListUnread() ([]*Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	var unread []*Message
+	unread := make([]*Message, 0)
 	for _, msg := range all {
 		if !msg.Read {
 			unread = append(unread, msg)
@@ -800,8 +836,12 @@ func (m *Mailbox) Search(opts SearchOptions) ([]*Message, error) {
 		}
 	}
 
-	// Sort by timestamp (newest first)
+	// Sort by priority (higher first), then timestamp (newest first).
 	sort.Slice(matches, func(i, j int) bool {
+		pi, pj := PriorityToBeads(matches[i].Priority), PriorityToBeads(matches[j].Priority)
+		if pi != pj {
+			return pi < pj
+		}
 		return matches[i].Timestamp.After(matches[j].Timestamp)
 	})
 
@@ -824,6 +864,64 @@ func (m *Mailbox) Count() (total, unread int, err error) {
 	}
 
 	return total, unread, nil
+}
+
+// AcknowledgeDeliveries marks delivery receipt for unread messages where this
+// mailbox is the primary recipient. This is phase-2 of two-phase delivery
+// tracking (phase-1 is written at send time as delivery:pending).
+// Acks are run concurrently (bounded to 8) to avoid N+1 sequential subprocess
+// spawns on the hot path.
+func (m *Mailbox) AcknowledgeDeliveries(recipientAddress string, messages []*Message) error {
+	if m.legacy || len(messages) == 0 {
+		return nil
+	}
+
+	recipientIdentity := AddressToIdentity(recipientAddress)
+
+	// Collect messages that need acking.
+	var toAck []*Message
+	for _, msg := range messages {
+		if msg == nil || msg.ID == "" {
+			continue
+		}
+		if AddressToIdentity(msg.To) != recipientIdentity {
+			continue
+		}
+		if msg.DeliveryState == "" || msg.DeliveryState == DeliveryStateAcked {
+			continue
+		}
+		toAck = append(toAck, msg)
+	}
+	if len(toAck) == 0 {
+		return nil
+	}
+
+	// Run acks concurrently with bounded parallelism.
+	const maxConcurrentAckOps = 8
+	sem := make(chan struct{}, maxConcurrentAckOps)
+	var mu sync.Mutex
+	var errs []string
+	var wg sync.WaitGroup
+
+	for _, msg := range toAck {
+		wg.Add(1)
+		sem <- struct{}{} // acquire
+		go func(id string) {
+			defer wg.Done()
+			defer func() { <-sem }() // release
+			if err := AcknowledgeDeliveryBead(m.workDir, m.beadsDir, id, recipientIdentity); err != nil {
+				mu.Lock()
+				errs = append(errs, fmt.Sprintf("%s: %v", id, err))
+				mu.Unlock()
+			}
+		}(msg.ID)
+	}
+	wg.Wait()
+
+	if len(errs) > 0 {
+		return fmt.Errorf("acknowledging deliveries failed: %s", strings.Join(errs, "; "))
+	}
+	return nil
 }
 
 // Append adds a message to the mailbox (legacy mode only).

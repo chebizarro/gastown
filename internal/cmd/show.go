@@ -57,6 +57,5 @@ func execBdShow(args []string) error {
 	// argv[0] must be the program name for exec
 	fullArgs := append([]string{"bd", "show"}, args...)
 
-	// Replace process with bd show
 	return syscall.Exec(bdPath, fullArgs, os.Environ())
 }

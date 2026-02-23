@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/formula"
 	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/style"
@@ -18,9 +19,9 @@ import (
 
 // Synthesis command flags
 var (
-	synthesisRig     string
-	synthesisDryRun  bool
-	synthesisForce   bool
+	synthesisRig      string
+	synthesisDryRun   bool
+	synthesisForce    bool
 	synthesisReviewID string
 )
 
@@ -120,7 +121,7 @@ type ConvoyMeta struct {
 	ID          string   `json:"id"`
 	Title       string   `json:"title"`
 	Status      string   `json:"status"`
-	Formula     string   `json:"formula,omitempty"`     // Formula name
+	Formula     string   `json:"formula,omitempty"`      // Formula name
 	FormulaPath string   `json:"formula_path,omitempty"` // Path to formula file
 	ReviewID    string   `json:"review_id,omitempty"`    // Review ID for output paths
 	LegIssues   []string `json:"leg_issues,omitempty"`   // Tracked leg issue IDs
@@ -319,6 +320,33 @@ func runSynthesisClose(cmd *cobra.Command, args []string) error {
 	townBeads, err := getTownBeadsDir()
 	if err != nil {
 		return err
+	}
+
+	// Read convoy to validate lifecycle state before closing
+	showArgs := []string{"show", convoyID, "--json"}
+	showCmd := exec.Command("bd", showArgs...)
+	showCmd.Dir = townBeads
+	var showOut bytes.Buffer
+	showCmd.Stdout = &showOut
+	if err := showCmd.Run(); err != nil {
+		return fmt.Errorf("reading convoy '%s': %w", convoyID, err)
+	}
+	var convoys []struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(showOut.Bytes(), &convoys); err != nil || len(convoys) == 0 {
+		return fmt.Errorf("parsing convoy '%s': invalid response", convoyID)
+	}
+	status := convoys[0].Status
+
+	if err := ensureKnownConvoyStatus(status); err != nil {
+		return fmt.Errorf("convoy '%s' has invalid lifecycle state: %w", convoyID, err)
+	}
+
+	// Idempotent: if already closed, just report it
+	if normalizeConvoyStatus(status) == convoyStatusClosed {
+		fmt.Printf("%s Convoy %s is already closed\n", style.Dim.Render("○"), convoyID)
+		return nil
 	}
 
 	// Close the convoy
@@ -528,6 +556,11 @@ func createSynthesisBead(convoyID string, meta *ConvoyMeta, f *formula.Formula,
 		desc.WriteString(fmt.Sprintf("\n## Output\n\nWrite synthesis to: %s\n", outputPath))
 	}
 
+	// Guard against flag-like synthesis titles (gt-e0kx5)
+	if beads.IsFlagLikeTitle(title) {
+		return "", fmt.Errorf("refusing to create synthesis bead: title %q looks like a CLI flag", title)
+	}
+
 	// Create the bead
 	createArgs := []string{
 		"create",
@@ -557,9 +590,9 @@ func createSynthesisBead(convoyID string, meta *ConvoyMeta, f *formula.Formula,
 		ID string `json:"id"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
-		// Try to extract ID from non-JSON output
+		// Try to extract ID from non-JSON output (bead IDs have format: prefix-id)
 		out := strings.TrimSpace(stdout.String())
-		if strings.HasPrefix(out, "hq-") || strings.HasPrefix(out, "gt-") {
+		if looksLikeIssueID(out) {
 			return out, nil
 		}
 		return "", fmt.Errorf("parsing created bead: %w", err)

@@ -2,11 +2,16 @@ package web
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/session"
 )
 
 func TestValidateCommand(t *testing.T) {
@@ -599,6 +604,93 @@ func TestParseMailInboxText_UnreadMarker(t *testing.T) {
 	}
 }
 
+// --- groupIntoThreads tests ---
+
+func TestGroupIntoThreads_SingleMessages(t *testing.T) {
+	msgs := []MailMessage{
+		{ID: "msg-1", From: "alice", Subject: "Hello", Timestamp: "2026-01-01T10:00:00Z"},
+		{ID: "msg-2", From: "bob", Subject: "World", Timestamp: "2026-01-01T11:00:00Z"},
+	}
+	threads := groupIntoThreads(msgs)
+	if len(threads) != 2 {
+		t.Fatalf("got %d threads, want 2", len(threads))
+	}
+	if threads[0].Count != 1 {
+		t.Errorf("thread 0 count = %d, want 1", threads[0].Count)
+	}
+	if threads[1].Subject != "World" {
+		t.Errorf("thread 1 subject = %q, want %q", threads[1].Subject, "World")
+	}
+}
+
+func TestGroupIntoThreads_ByThreadID(t *testing.T) {
+	msgs := []MailMessage{
+		{ID: "msg-1", From: "alice", Subject: "Status update", ThreadID: "t-001", Timestamp: "2026-01-01T10:00:00Z"},
+		{ID: "msg-2", From: "bob", Subject: "Re: Status update", ThreadID: "t-001", Timestamp: "2026-01-01T11:00:00Z"},
+		{ID: "msg-3", From: "carol", Subject: "Other topic", Timestamp: "2026-01-01T12:00:00Z"},
+	}
+	threads := groupIntoThreads(msgs)
+	if len(threads) != 2 {
+		t.Fatalf("got %d threads, want 2", len(threads))
+	}
+	// First thread should have 2 messages grouped by ThreadID
+	if threads[0].Count != 2 {
+		t.Errorf("thread 0 count = %d, want 2", threads[0].Count)
+	}
+	if threads[0].Subject != "Status update" {
+		t.Errorf("thread 0 subject = %q, want %q", threads[0].Subject, "Status update")
+	}
+	if threads[0].LastMessage.ID != "msg-2" {
+		t.Errorf("thread 0 last message ID = %q, want %q", threads[0].LastMessage.ID, "msg-2")
+	}
+	// Second thread is standalone
+	if threads[1].Count != 1 {
+		t.Errorf("thread 1 count = %d, want 1", threads[1].Count)
+	}
+}
+
+func TestGroupIntoThreads_ByReplyTo(t *testing.T) {
+	msgs := []MailMessage{
+		{ID: "msg-1", From: "alice", Subject: "Question", Timestamp: "2026-01-01T10:00:00Z"},
+		{ID: "msg-2", From: "bob", Subject: "Re: Question", ReplyTo: "msg-1", Timestamp: "2026-01-01T11:00:00Z"},
+	}
+	threads := groupIntoThreads(msgs)
+	if len(threads) != 1 {
+		t.Fatalf("got %d threads, want 1", len(threads))
+	}
+	if threads[0].Count != 2 {
+		t.Errorf("thread count = %d, want 2", threads[0].Count)
+	}
+	if threads[0].Subject != "Question" {
+		t.Errorf("thread subject = %q, want %q", threads[0].Subject, "Question")
+	}
+}
+
+func TestGroupIntoThreads_UnreadCount(t *testing.T) {
+	msgs := []MailMessage{
+		{ID: "msg-1", From: "alice", Subject: "Update", ThreadID: "t-001", Read: true},
+		{ID: "msg-2", From: "bob", Subject: "Re: Update", ThreadID: "t-001", Read: false},
+		{ID: "msg-3", From: "carol", Subject: "Re: Update", ThreadID: "t-001", Read: false},
+	}
+	threads := groupIntoThreads(msgs)
+	if len(threads) != 1 {
+		t.Fatalf("got %d threads, want 1", len(threads))
+	}
+	if threads[0].UnreadCount != 2 {
+		t.Errorf("unread count = %d, want 2", threads[0].UnreadCount)
+	}
+}
+
+func TestGroupIntoThreads_ReSubjectStrip(t *testing.T) {
+	msgs := []MailMessage{
+		{ID: "msg-1", From: "alice", Subject: "Re: Original topic", ThreadID: "t-001"},
+	}
+	threads := groupIntoThreads(msgs)
+	if threads[0].Subject != "Original topic" {
+		t.Errorf("subject = %q, want %q", threads[0].Subject, "Original topic")
+	}
+}
+
 // --- parseIssueShowJSON tests (issue #1228: prefer structured JSON over text parsing) ---
 
 func TestParseIssueShowJSON_ValidOutput(t *testing.T) {
@@ -669,6 +761,310 @@ func TestParseIssueShowJSON_InvalidInputs(t *testing.T) {
 			_, ok := parseIssueShowJSON(tt.input)
 			if ok {
 				t.Errorf("parseIssueShowJSON(%q) returned ok=true, want false", tt.input)
+			}
+		})
+	}
+}
+
+func TestAPIHandler_SSE_ContentType(t *testing.T) {
+	handler := NewAPIHandler(30*time.Second, 60*time.Second)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/events", nil)
+	// Cancel context quickly so the SSE handler returns instead of blocking
+	ctx, cancel := context.WithTimeout(req.Context(), 100*time.Millisecond)
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	contentType := w.Header().Get("Content-Type")
+	if contentType != "text/event-stream" {
+		t.Errorf("GET /api/events Content-Type = %q, want %q", contentType, "text/event-stream")
+	}
+
+	body := w.Body.String()
+	if !strings.Contains(body, "event: connected") {
+		t.Error("SSE response should contain initial 'connected' event")
+	}
+}
+
+// TestOptionsCacheConcurrentAccess verifies that concurrent cache reads and
+// writes don't race. The read lock is held through serialization so a
+// concurrent writer can't replace the cached pointer mid-encode.
+//
+// Regression test for steveyegge/gastown#1230 item 4.
+func TestOptionsCacheConcurrentAccess(t *testing.T) {
+	h := &APIHandler{
+		gtPath:            "echo", // won't actually be called for cache hits
+		workDir:           t.TempDir(),
+		defaultRunTimeout: 5 * time.Second,
+		maxRunTimeout:     10 * time.Second,
+		cmdSem:            make(chan struct{}, maxConcurrentCommands),
+	}
+
+	// Pre-populate cache so reads hit.
+	h.optionsCacheMu.Lock()
+	h.optionsCache = &OptionsResponse{
+		Rigs: []string{"rig-a", "rig-b"},
+		Crew: []string{"alice"},
+	}
+	h.optionsCacheTime = time.Now()
+	h.optionsCacheMu.Unlock()
+
+	const goroutines = 20
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	// Half readers, half writers — run with -race to detect data races.
+	for i := 0; i < goroutines; i++ {
+		if i%2 == 0 {
+			go func() {
+				defer wg.Done()
+				req := httptest.NewRequest(http.MethodGet, "/api/options", nil)
+				w := httptest.NewRecorder()
+				h.handleOptions(w, req)
+				if w.Code != http.StatusOK {
+					t.Errorf("handleOptions returned %d", w.Code)
+				}
+			}()
+		} else {
+			go func(n int) {
+				defer wg.Done()
+				h.optionsCacheMu.Lock()
+				h.optionsCache = &OptionsResponse{
+					Rigs: []string{strings.Repeat("x", n)},
+				}
+				h.optionsCacheTime = time.Now()
+				h.optionsCacheMu.Unlock()
+			}(i)
+		}
+	}
+
+	wg.Wait()
+}
+
+func TestParseConvoyListJSON(t *testing.T) {
+	tests := []struct {
+		name string
+		json string
+		want []string
+	}{
+		{
+			name: "valid JSON with convoys",
+			json: `[{"id":"hq-cv-abc","title":"Deploy widgets"},{"id":"hq-cv-def","title":"Fix bugs"}]`,
+			want: []string{"hq-cv-abc", "hq-cv-def"},
+		},
+		{
+			name: "empty array",
+			json: `[]`,
+			want: []string{},
+		},
+		{
+			name: "invalid JSON",
+			json: `{not valid`,
+			want: nil,
+		},
+		{
+			name: "empty string",
+			json: ``,
+			want: nil,
+		},
+		{
+			name: "skips empty IDs",
+			json: `[{"id":"hq-cv-abc"},{"id":""},{"id":"hq-cv-def"}]`,
+			want: []string{"hq-cv-abc", "hq-cv-def"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseConvoyListJSON(tt.json)
+			if tt.want == nil {
+				if got != nil {
+					t.Errorf("parseConvoyListJSON(%q) = %v, want nil", tt.json, got)
+				}
+				return
+			}
+			if len(got) != len(tt.want) {
+				t.Errorf("parseConvoyListJSON(%q) = %v, want %v", tt.json, got, tt.want)
+				return
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("parseConvoyListJSON(%q)[%d] = %q, want %q", tt.json, i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestRunGtCommandSemaphore verifies that runGtCommand limits concurrent
+// command execution via a semaphore. With a 1-slot semaphore and 3 commands
+// each sleeping 0.1s, total time must be >= 0.25s (serialized), proving the
+// semaphore prevents all 3 from running simultaneously (~0.1s).
+//
+// Regression test for steveyegge/gastown#1230 item 5.
+func TestRunGtCommandSemaphore(t *testing.T) {
+	// Create handler with a 1-slot semaphore — fully serialized execution.
+	h := &APIHandler{
+		gtPath:            "sleep",
+		workDir:           t.TempDir(),
+		defaultRunTimeout: 5 * time.Second,
+		maxRunTimeout:     10 * time.Second,
+		cmdSem:            make(chan struct{}, 1),
+	}
+
+	const numCmds = 3
+	var wg sync.WaitGroup
+	wg.Add(numCmds)
+
+	start := time.Now()
+	for i := 0; i < numCmds; i++ {
+		go func() {
+			defer wg.Done()
+			_, _ = h.runGtCommand(context.Background(), 2*time.Second, []string{"0.1"})
+		}()
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	// With 1-slot semaphore, 3 x 0.1s sleeps must run serially: >= 0.25s.
+	// Without semaphore they'd all run in ~0.1s.
+	if elapsed < 250*time.Millisecond {
+		t.Errorf("elapsed = %v, want >= 250ms (commands should be serialized by semaphore)", elapsed)
+	}
+}
+
+// TestRunGtCommandSemaphoreContextCancel verifies that a cancelled context
+// returns immediately instead of blocking on a full semaphore.
+//
+// Regression test for steveyegge/gastown#1230 item 5.
+func TestRunGtCommandSemaphoreContextCancel(t *testing.T) {
+	h := &APIHandler{
+		gtPath:            "sleep",
+		workDir:           t.TempDir(),
+		defaultRunTimeout: 5 * time.Second,
+		maxRunTimeout:     10 * time.Second,
+		cmdSem:            make(chan struct{}, 1), // 1 slot
+	}
+
+	// Fill the semaphore.
+	h.cmdSem <- struct{}{}
+
+	// Try to run a command with a context that expires quickly.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, err := h.runGtCommand(ctx, 5*time.Second, []string{"10"})
+	if err == nil {
+		t.Fatal("expected error when semaphore full and context cancelled")
+	}
+	if !strings.Contains(err.Error(), "context") {
+		t.Errorf("error = %q, want context-related error", err)
+	}
+
+	// Drain the slot we manually added.
+	<-h.cmdSem
+}
+
+// TestRunGtCommandSemaphoreTimeoutBudget verifies that the timeout parameter
+// bounds total latency including semaphore wait time. A call with a short
+// timeout should fail within that budget even if the semaphore is full.
+//
+// Regression test: timeout context must be created before semaphore acquisition.
+func TestRunGtCommandSemaphoreTimeoutBudget(t *testing.T) {
+	h := &APIHandler{
+		gtPath:            "sleep",
+		workDir:           t.TempDir(),
+		defaultRunTimeout: 5 * time.Second,
+		maxRunTimeout:     10 * time.Second,
+		cmdSem:            make(chan struct{}, 1), // 1 slot
+	}
+
+	// Fill the semaphore so the call must wait.
+	h.cmdSem <- struct{}{}
+
+	start := time.Now()
+	// Use a background context (no external deadline) but a short timeout.
+	// The timeout should bound the semaphore wait.
+	_, err := h.runGtCommand(context.Background(), 200*time.Millisecond, []string{"10"})
+	elapsed := time.Since(start)
+
+	// Drain the slot we manually added.
+	<-h.cmdSem
+
+	if err == nil {
+		t.Fatal("expected error when semaphore full and timeout expires")
+	}
+	if !strings.Contains(err.Error(), "command slot unavailable") {
+		t.Errorf("error = %q, want 'command slot unavailable'", err)
+	}
+	// The call should have returned within the timeout budget (200ms + margin).
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("elapsed = %v, want < 500ms (timeout should bound semaphore wait)", elapsed)
+	}
+}
+
+// TestHandleSessionPreviewPrefixValidation verifies that handleSessionPreview
+// accepts session names with known rig prefixes and rejects invalid prefixes.
+func TestHandleSessionPreviewPrefixValidation(t *testing.T) {
+	originalRegistry := session.DefaultRegistry()
+	t.Cleanup(func() { session.SetDefaultRegistry(originalRegistry) })
+
+	testRegistry := session.NewPrefixRegistry()
+	testRegistry.Register("nx", "nexus")
+	testRegistry.Register("myrig", "myrig-project")
+	session.SetDefaultRegistry(testRegistry)
+
+	h := &APIHandler{
+		gtPath:            "true",
+		workDir:           t.TempDir(),
+		defaultRunTimeout: 1 * time.Second,
+		maxRunTimeout:     2 * time.Second,
+		cmdSem:            make(chan struct{}, 5),
+	}
+
+	tests := []struct {
+		name          string
+		sessionName   string
+		wantRejected  bool
+		wantErrSubstr string
+	}{
+		{"registered prefix nx", "nx-polecat-alpha", false, ""},
+		{"registered prefix myrig", "myrig-crew-bob", false, ""},
+		{"legacy gt- prefix", "gt-polecat-test", false, ""},
+		{"legacy bd- prefix", "bd-some-bead", false, ""},
+		{"hq- prefix", "hq-nonexistent-session", false, ""},
+		{"gthq- prefix", "gthq-deacon", false, ""},
+		{"unknown prefix rejected", "unknown-session-name", true, "must start with a known rig prefix"},
+		{"no prefix rejected", "justsomename", true, "must start with a known rig prefix"},
+		{"invalid characters rejected", "gt-bad_chars!", true, "invalid characters"},
+		{"missing session parameter", "", true, "Missing session parameter"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			url := "/api/session-preview"
+			if tc.sessionName != "" {
+				url += "?session=" + tc.sessionName
+			}
+			req := httptest.NewRequest(http.MethodGet, url, nil)
+			rec := httptest.NewRecorder()
+
+			h.handleSessionPreview(rec, req)
+
+			if tc.wantRejected {
+				if rec.Code != http.StatusBadRequest {
+					t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+				}
+				if !strings.Contains(rec.Body.String(), tc.wantErrSubstr) {
+					t.Errorf("body = %q, want substring %q", rec.Body.String(), tc.wantErrSubstr)
+				}
+			} else {
+				if rec.Code == http.StatusBadRequest && strings.Contains(rec.Body.String(), "prefix") {
+					t.Errorf("valid prefix %q was rejected: %s", tc.sessionName, rec.Body.String())
+				}
 			}
 		})
 	}

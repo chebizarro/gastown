@@ -93,6 +93,36 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("getting current directory: %w", err)
 	}
+
+	// When gt is invoked via shell alias (cd ~/gt && gt), cwd is the town
+	// root, not the polecat's worktree. Reconstruct actual path.
+	if cwd == townRoot {
+		// Gate polecat cwd switch on GT_ROLE: coordinators may have stale GT_POLECAT.
+		isPolecat := false
+		if role := os.Getenv("GT_ROLE"); role != "" {
+			parsedRole, _, _ := parseRoleString(role)
+			isPolecat = parsedRole == RolePolecat
+		} else {
+			isPolecat = os.Getenv("GT_POLECAT") != ""
+		}
+		if polecatName := os.Getenv("GT_POLECAT"); polecatName != "" && rigName != "" && isPolecat {
+			polecatClone := filepath.Join(townRoot, rigName, "polecats", polecatName, rigName)
+			if _, err := os.Stat(polecatClone); err == nil {
+				cwd = polecatClone
+			} else {
+				polecatClone = filepath.Join(townRoot, rigName, "polecats", polecatName)
+				if _, err := os.Stat(filepath.Join(polecatClone, ".git")); err == nil {
+					cwd = polecatClone
+				}
+			}
+		} else if crewName := os.Getenv("GT_CREW"); crewName != "" && rigName != "" {
+			crewClone := filepath.Join(townRoot, rigName, "crew", crewName)
+			if _, err := os.Stat(crewClone); err == nil {
+				cwd = crewClone
+			}
+		}
+	}
+
 	g := git.NewGit(cwd)
 
 	// Get current branch
@@ -185,8 +215,10 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 	existingMR, err := bd.FindMRForBranch(branch)
 	if err != nil {
 		style.PrintWarning("could not check for existing MR: %v", err)
-		// Continue with creation attempt - Create will fail if duplicate
-	} else if existingMR != nil {
+		// FindMRForBranch failed — fall through to create a new MR
+	}
+
+	if existingMR != nil {
 		mrIssue = existingMR
 		fmt.Printf("%s MR already exists (idempotent)\n", style.Bold.Render("✓"))
 	} else {
@@ -203,7 +235,7 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 		}
 
 		// Nudge refinery to pick up the new MR
-		nudgeRefinery(rigName, fmt.Sprintf("MR submitted: %s branch=%s", mrIssue.ID, branch))
+		nudgeRefinery(rigName, "MERGE_READY received - check inbox for pending work")
 	}
 
 	// Success output

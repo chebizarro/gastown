@@ -2,16 +2,21 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/refinery"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/witness"
+	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 // RigDockedLabel is the label set on rig identity beads when docked.
@@ -92,23 +97,16 @@ func runRigDock(cmd *cobra.Command, args []string) error {
 		prefix = r.Config.Prefix
 	}
 
-	// Find the rig identity bead
-	rigBeadID := beads.RigBeadIDWithPrefix(prefix, rigName)
+	// Find or create the rig identity bead (idempotent; handles duplicates
+	// and Dolt query hiccups gracefully — gt-d8681).
 	bd := beads.New(r.BeadsPath())
-
-	// Check if rig bead exists, create if not
-	rigBead, err := bd.Show(rigBeadID)
+	rigBead, err := bd.EnsureRigBead(rigName, &beads.RigFields{
+		Repo:   r.GitURL,
+		Prefix: prefix,
+		State:  beads.RigStateActive,
+	})
 	if err != nil {
-		// Rig identity bead doesn't exist (legacy rig) - create it
-		fmt.Printf("  Creating rig identity bead %s...\n", rigBeadID)
-		rigBead, err = bd.CreateRigBead(rigName, &beads.RigFields{
-			Repo:   r.GitURL,
-			Prefix: prefix,
-			State:  beads.RigStateActive,
-		})
-		if err != nil {
-			return fmt.Errorf("creating rig identity bead: %w", err)
-		}
+		return fmt.Errorf("ensuring rig identity bead: %w", err)
 	}
 
 	// Check if already docked
@@ -126,7 +124,7 @@ func runRigDock(cmd *cobra.Command, args []string) error {
 	t := tmux.NewTmux()
 
 	// Stop witness if running
-	witnessSession := fmt.Sprintf("gt-%s-witness", rigName)
+	witnessSession := session.WitnessSessionName(session.PrefixFor(rigName))
 	witnessRunning, _ := t.HasSession(witnessSession)
 	if witnessRunning {
 		fmt.Printf("  Stopping witness...\n")
@@ -139,7 +137,7 @@ func runRigDock(cmd *cobra.Command, args []string) error {
 	}
 
 	// Stop refinery if running
-	refinerySession := fmt.Sprintf("gt-%s-refinery", rigName)
+	refinerySession := session.RefinerySessionName(session.PrefixFor(rigName))
 	refineryRunning, _ := t.HasSession(refinerySession)
 	if refineryRunning {
 		fmt.Printf("  Stopping refinery...\n")
@@ -164,10 +162,19 @@ func runRigDock(cmd *cobra.Command, args []string) error {
 	}
 
 	// Set docked label on rig identity bead
-	if err := bd.Update(rigBeadID, beads.UpdateOptions{
+	if err := bd.Update(rigBead.ID, beads.UpdateOptions{
 		AddLabels: []string{RigDockedLabel},
 	}); err != nil {
 		return fmt.Errorf("setting docked label: %w", err)
+	}
+
+	// Remove rig from daemon.json patrol config so daemon stops spawning
+	// witness/refinery sessions for this rig on every heartbeat cycle.
+	townRoot, twErr := workspace.FindFromCwdOrError()
+	if twErr == nil {
+		if err := config.RemoveRigFromDaemonPatrols(townRoot, rigName); err != nil {
+			fmt.Printf("  %s Could not update daemon.json patrols: %v\n", style.Warning.Render("!"), err)
+		}
 	}
 
 	// Output
@@ -239,6 +246,15 @@ func runRigUndock(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("removing docked label: %w", err)
 	}
 
+	// Re-add rig to daemon.json patrol config so daemon resumes spawning
+	// witness/refinery sessions for this rig.
+	townRoot, twErr := workspace.FindFromCwdOrError()
+	if twErr == nil {
+		if err := config.AddRigToDaemonPatrols(townRoot, rigName); err != nil {
+			fmt.Printf("  %s Could not update daemon.json patrols: %v\n", style.Warning.Render("!"), err)
+		}
+	}
+
 	fmt.Printf("%s Rig %s undocked\n", style.Success.Render("✓"), rigName)
 	fmt.Printf("  Label removed: %s\n", RigDockedLabel)
 	fmt.Printf("  Daemon can now auto-restart agents\n")
@@ -251,9 +267,9 @@ func runRigUndock(cmd *cobra.Command, args []string) error {
 // on the rig identity bead. This function is exported for use by the daemon.
 func IsRigDocked(townRoot, rigName, prefix string) bool {
 	// Construct the rig beads path
-	rigPath := townRoot + "/" + rigName
-	beadsPath := rigPath + "/mayor/rig"
-	if _, err := exec.Command("test", "-d", beadsPath).CombinedOutput(); err != nil {
+	rigPath := filepath.Join(townRoot, rigName)
+	beadsPath := filepath.Join(rigPath, "mayor", "rig")
+	if _, err := os.Stat(beadsPath); err != nil {
 		beadsPath = rigPath
 	}
 

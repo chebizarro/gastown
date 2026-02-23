@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/activity"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -121,7 +122,7 @@ func NewLiveConvoyFetcher() (*LiveConvoyFetcher, error) {
 // FetchConvoys fetches all open convoys with their activity data.
 func (f *LiveConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
 	// List all open convoy issues
-	stdout, err := f.runBdCmd(f.townRoot, "list", "--label=gt:convoy", "--status=open", "--json")
+	stdout, err := f.runBdCmd(f.townRoot, "list", "--type=convoy", "--status=open", "--json")
 	if err != nil {
 		return nil, fmt.Errorf("listing convoys: %w", err)
 	}
@@ -235,18 +236,6 @@ type trackedIssueInfo struct {
 	UpdatedAt    time.Time // Fallback for activity when no assignee
 }
 
-// extractIssueID strips the external:prefix:id wrapper from bead IDs.
-// bd dep add wraps cross-rig IDs as "external:prefix:id" for routing,
-// but consumers need the raw bead ID for bd show lookups.
-func extractIssueID(id string) string {
-	if strings.HasPrefix(id, "external:") {
-		parts := strings.SplitN(id, ":", 3)
-		if len(parts) == 3 {
-			return parts[2]
-		}
-	}
-	return id
-}
 
 // getTrackedIssues fetches tracked issues for a convoy.
 func (f *LiveConvoyFetcher) getTrackedIssues(convoyID string) ([]trackedIssueInfo, error) {
@@ -266,7 +255,7 @@ func (f *LiveConvoyFetcher) getTrackedIssues(convoyID string) ([]trackedIssueInf
 	// Collect resolved issue IDs, unwrapping external:prefix:id format
 	issueIDs := make([]string, 0, len(deps))
 	for _, dep := range deps {
-		issueIDs = append(issueIDs, extractIssueID(dep.ID))
+		issueIDs = append(issueIDs, beads.ExtractIssueID(dep.ID))
 	}
 
 	// Batch fetch issue details
@@ -412,7 +401,7 @@ func (f *LiveConvoyFetcher) getSessionActivityForAssignee(assignee string) *time
 	polecat := parts[2]
 
 	// Construct session name
-	sessionName := fmt.Sprintf("gt-%s-%s", rig, polecat)
+	sessionName := session.PolecatSessionName(session.PrefixFor(rig), polecat)
 
 	// Query tmux for session activity
 	// Format: session_activity returns unix timestamp
@@ -466,15 +455,12 @@ func (f *LiveConvoyFetcher) getAllPolecatActivity() *time.Time {
 		}
 
 		sessionName := parts[0]
-		// Check if it's a polecat session (gt-{rig}-{polecat}, not gt-{rig}-witness/refinery)
-		// Polecat sessions have exactly 3 parts when split by "-" and the middle part is the rig
-		nameParts := strings.Split(sessionName, "-")
-		if len(nameParts) < 3 || nameParts[0] != "gt" {
+		// Check if it's a polecat or crew session (skip infrastructure roles)
+		identity, err := session.ParseSessionName(sessionName)
+		if err != nil {
 			continue
 		}
-		// Skip witness, refinery, mayor, deacon sessions
-		lastPart := nameParts[len(nameParts)-1]
-		if lastPart == "witness" || lastPart == "refinery" || lastPart == "mayor" || lastPart == "deacon" {
+		if identity.Role != session.RolePolecat && identity.Role != session.RoleCrew {
 			continue
 		}
 
@@ -734,17 +720,13 @@ func (f *LiveConvoyFetcher) FetchWorkers() ([]WorkerRow, error) {
 		sessionName := parts[0]
 
 		// Filter for gt-<rig>-<polecat> pattern
-		if !strings.HasPrefix(sessionName, "gt-") {
+		// Parse session name using canonical parser
+		identity, err := session.ParseSessionName(sessionName)
+		if err != nil {
 			continue
 		}
 
-		// Parse session name: gt-roxas-dag -> rig=roxas, worker=dag
-		nameParts := strings.SplitN(sessionName, "-", 3)
-		if len(nameParts) != 3 {
-			continue
-		}
-		rig := nameParts[1]
-		workerName := nameParts[2]
+		rig := identity.Rig
 
 		// Skip rigs not registered in this workspace
 		if !registeredRigs[rig] {
@@ -752,13 +734,15 @@ func (f *LiveConvoyFetcher) FetchWorkers() ([]WorkerRow, error) {
 		}
 
 		// Skip non-worker sessions (witness, mayor, deacon, boot)
-		if workerName == "witness" || workerName == "mayor" || workerName == "deacon" || workerName == "boot" {
+		switch identity.Role {
+		case session.RoleMayor, session.RoleDeacon, session.RoleWitness:
 			continue
 		}
 
-		// Determine agent type: refinery is its own permanent role, others are polecats (ephemeral sessions)
-		agentType := "polecat"
-		if workerName == "refinery" {
+		// Determine agent type and worker name
+		workerName := identity.Name
+		agentType := "polecat" // Default for ephemeral sessions (polecats, crew)
+		if identity.Role == session.RoleRefinery {
 			agentType = "refinery"
 		}
 
@@ -954,7 +938,7 @@ func (f *LiveConvoyFetcher) FetchMail() ([]MailRow, error) {
 		if m.CreatedAt != "" {
 			if t, err := time.Parse(time.RFC3339, m.CreatedAt); err == nil {
 				timestamp = t
-				age = formatMailAge(time.Since(t))
+				age = formatTimestamp(t)
 				sortKey = t.Unix()
 			}
 		}
@@ -1020,6 +1004,15 @@ func formatMailAge(d time.Duration) string {
 		return fmt.Sprintf("%dh ago", int(d.Hours()))
 	}
 	return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+}
+
+// formatTimestamp formats a time as "Jan 26, 3:45 PM" (or "Jan 26 2006, 3:45 PM" if different year).
+func formatTimestamp(t time.Time) string {
+	now := time.Now()
+	if t.Year() != now.Year() {
+		return t.Format("Jan 2 2006, 3:04 PM")
+	}
+	return t.Format("Jan 2, 3:04 PM")
 }
 
 // formatAgentAddress shortens agent addresses for display.
@@ -1151,7 +1144,7 @@ func (f *LiveConvoyFetcher) FetchDogs() ([]DogRow, error) {
 			Name:       state.Name,
 			State:      state.State,
 			Work:       state.Work,
-			LastActive: formatMailAge(time.Since(state.LastActive)),
+			LastActive: formatTimestamp(state.LastActive),
 			RigCount:   len(state.Worktrees),
 		})
 	}
@@ -1206,7 +1199,7 @@ func (f *LiveConvoyFetcher) FetchEscalations() ([]EscalationRow, error) {
 		// Calculate age
 		if issue.CreatedAt != "" {
 			if t, err := time.Parse(time.RFC3339, issue.CreatedAt); err == nil {
-				row.Age = formatMailAge(time.Since(t))
+				row.Age = formatTimestamp(t)
 			}
 		}
 
@@ -1242,7 +1235,7 @@ func (f *LiveConvoyFetcher) FetchHealth() (*HealthRow, error) {
 			row.UnhealthyAgents = hb.UnhealthyAgents
 			if !hb.LastHeartbeat.IsZero() {
 				age := time.Since(hb.LastHeartbeat)
-				row.DeaconHeartbeat = formatMailAge(age)
+				row.DeaconHeartbeat = formatTimestamp(hb.LastHeartbeat)
 				row.HeartbeatFresh = age < f.heartbeatFreshThreshold
 			} else {
 				row.DeaconHeartbeat = "no timestamp"
@@ -1339,8 +1332,8 @@ func (f *LiveConvoyFetcher) FetchSessions() ([]SessionRow, error) {
 		parts := strings.SplitN(line, ":", 2)
 		name := parts[0]
 
-		// Only include gt-* sessions
-		if !strings.HasPrefix(name, "gt-") {
+		// Only include Gas Town sessions
+		if !session.IsKnownSession(name) {
 			continue
 		}
 
@@ -1352,38 +1345,15 @@ func (f *LiveConvoyFetcher) FetchSessions() ([]SessionRow, error) {
 		// Parse activity timestamp
 		if len(parts) > 1 {
 			if ts, ok := parseActivityTimestamp(parts[1]); ok && ts > 0 {
-				age := time.Since(time.Unix(ts, 0))
-				row.Activity = formatMailAge(age)
+				row.Activity = formatTimestamp(time.Unix(ts, 0))
 			}
 		}
 
-		// Detect role from session name pattern: gt-<rig>-<role>[-<name>]
-		// Examples: gt-gastown-witness, gt-gastown-nux, gt-deacon
-		nameParts := strings.Split(strings.TrimPrefix(name, "gt-"), "-")
-		if len(nameParts) >= 1 {
-			// Check for special roles
-			if nameParts[0] == "deacon" {
-				row.Role = "deacon"
-			} else if len(nameParts) >= 2 {
-				row.Rig = nameParts[0]
-				role := nameParts[1]
-
-				switch role {
-				case "witness":
-					row.Role = "witness"
-				case "refinery":
-					row.Role = "refinery"
-				default:
-					// Assume it's a polecat name
-					row.Role = "polecat"
-					row.Worker = role
-				}
-
-				// Check if there's a worker name after the role (for crew)
-				if len(nameParts) >= 3 && (role == "crew") {
-					row.Worker = nameParts[2]
-				}
-			}
+		// Detect role from session name using canonical parser
+		if identity, err := session.ParseSessionName(name); err == nil {
+			row.Rig = identity.Rig
+			row.Role = string(identity.Role)
+			row.Worker = identity.Name
 		}
 
 		rows = append(rows, row)
@@ -1436,7 +1406,7 @@ func (f *LiveConvoyFetcher) FetchHooks() ([]HookRow, error) {
 		if bead.UpdatedAt != "" {
 			if t, err := time.Parse(time.RFC3339, bead.UpdatedAt); err == nil {
 				age := time.Since(t)
-				row.Age = formatMailAge(age)
+				row.Age = formatTimestamp(t)
 				row.IsStale = age > time.Hour // Stale if hooked > 1 hour
 			}
 		}
@@ -1482,7 +1452,7 @@ func (f *LiveConvoyFetcher) FetchMayor() (*MayorStatus, error) {
 			if len(parts) == 2 {
 				if activityTs, ok := parseActivityTimestamp(parts[1]); ok {
 					age := time.Since(time.Unix(activityTs, 0))
-					status.LastActivity = formatMailAge(age)
+					status.LastActivity = formatTimestamp(time.Unix(activityTs, 0))
 					status.IsActive = age < f.mayorActiveThreshold
 				}
 			}
@@ -1588,7 +1558,7 @@ func (f *LiveConvoyFetcher) FetchIssues() ([]IssueRow, error) {
 		// Calculate age
 		if bead.CreatedAt != "" {
 			if t, err := time.Parse(time.RFC3339, bead.CreatedAt); err == nil {
-				row.Age = formatMailAge(time.Since(t))
+				row.Age = formatTimestamp(t)
 			}
 		}
 
@@ -1628,10 +1598,10 @@ func (f *LiveConvoyFetcher) FetchActivity() ([]ActivityRow, error) {
 		return nil, nil
 	}
 
-	// Take last 20 events (most recent)
+	// Take last 50 events for richer timeline
 	start := 0
-	if len(lines) > 20 {
-		start = len(lines) - 20
+	if len(lines) > 50 {
+		start = len(lines) - 50
 	}
 
 	var rows []ActivityRow
@@ -1658,14 +1628,17 @@ func (f *LiveConvoyFetcher) FetchActivity() ([]ActivityRow, error) {
 		}
 
 		row := ActivityRow{
-			Type:  event.Type,
-			Actor: formatAgentAddress(event.Actor),
-			Icon:  eventIcon(event.Type),
+			Type:         event.Type,
+			Category:     eventCategory(event.Type),
+			Actor:        formatAgentAddress(event.Actor),
+			Rig:          extractRig(event.Actor),
+			Icon:         eventIcon(event.Type),
+			RawTimestamp: event.Timestamp,
 		}
 
 		// Calculate time ago
 		if t, err := time.Parse(time.RFC3339, event.Timestamp); err == nil {
-			row.Time = formatMailAge(time.Since(t))
+			row.Time = formatTimestamp(t)
 		}
 
 		// Generate human-readable summary
@@ -1675,6 +1648,34 @@ func (f *LiveConvoyFetcher) FetchActivity() ([]ActivityRow, error) {
 	}
 
 	return rows, nil
+}
+
+// eventCategory classifies an event type into a filter category.
+func eventCategory(eventType string) string {
+	switch eventType {
+	case "spawn", "kill", "session_start", "session_end", "session_death", "mass_death", "nudge", "handoff":
+		return "agent"
+	case "sling", "hook", "unhook", "done", "merge_started", "merged", "merge_failed":
+		return "work"
+	case "mail", "escalation_sent", "escalation_acked", "escalation_closed":
+		return "comms"
+	case "boot", "halt", "patrol_started", "patrol_complete":
+		return "system"
+	default:
+		return "system"
+	}
+}
+
+// extractRig extracts the rig name from an actor address like "gastown/polecats/nux".
+func extractRig(actor string) string {
+	if actor == "" {
+		return ""
+	}
+	parts := strings.SplitN(actor, "/", 2)
+	if len(parts) > 0 {
+		return parts[0]
+	}
+	return ""
 }
 
 // eventIcon returns an emoji for an event type.

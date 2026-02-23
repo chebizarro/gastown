@@ -2,6 +2,8 @@ package session
 
 import (
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/config"
 )
 
 func TestStartSession_RequiresSessionID(t *testing.T) {
@@ -112,6 +114,85 @@ func TestKillExistingSession_NoSession(t *testing.T) {
 	// by verifying it's callable. Full integration tests need a real tmux.
 	// This test verifies the function signature and basic flow.
 	t.Skip("requires tmux for integration testing")
+}
+
+func TestMapKeysSorted(t *testing.T) {
+	got := mapKeysSorted(map[string]string{
+		"GT_SESSION": "1",
+		"GT_ROLE":    "polecat",
+		"GT_RIG":     "alpha",
+	})
+
+	want := []string{"GT_RIG", "GT_ROLE", "GT_SESSION"}
+	if len(got) != len(want) {
+		t.Fatalf("mapKeysSorted() length = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("mapKeysSorted()[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestMergeRuntimeLivenessEnv_SetsResolvedAgentAndProcessNames(t *testing.T) {
+	env := map[string]string{
+		"GT_ROLE": "polecat",
+	}
+	rc := &config.RuntimeConfig{
+		Command:       "claude",
+		ResolvedAgent: "claude",
+	}
+
+	got := MergeRuntimeLivenessEnv(env, rc)
+
+	if got["GT_AGENT"] != "claude" {
+		t.Fatalf("GT_AGENT = %q, want %q", got["GT_AGENT"], "claude")
+	}
+	if got["GT_PROCESS_NAMES"] != "node,claude" {
+		t.Fatalf("GT_PROCESS_NAMES = %q, want %q", got["GT_PROCESS_NAMES"], "node,claude")
+	}
+}
+
+func TestMergeRuntimeLivenessEnv_RespectsExistingValues(t *testing.T) {
+	env := map[string]string{
+		"GT_AGENT":         "explicit-agent",
+		"GT_PROCESS_NAMES": "custom-bin,custom-agent",
+	}
+	rc := &config.RuntimeConfig{
+		Command:       "bun",
+		ResolvedAgent: "wen",
+	}
+
+	got := MergeRuntimeLivenessEnv(env, rc)
+
+	if got["GT_AGENT"] != "explicit-agent" {
+		t.Fatalf("GT_AGENT = %q, want %q", got["GT_AGENT"], "explicit-agent")
+	}
+	if got["GT_PROCESS_NAMES"] != "custom-bin,custom-agent" {
+		t.Fatalf("GT_PROCESS_NAMES = %q, want %q", got["GT_PROCESS_NAMES"], "custom-bin,custom-agent")
+	}
+}
+
+func TestMergeRuntimeLivenessEnv_UsesEffectiveAgentForProcessNames(t *testing.T) {
+	// When AgentOverride sets GT_AGENT to a different agent than
+	// runtimeConfig.ResolvedAgent, process names must be resolved from
+	// the effective agent (GT_AGENT), not the workspace-default resolved agent.
+	env := map[string]string{
+		"GT_AGENT": "codex", // set by AgentEnv from AgentOverride
+	}
+	rc := &config.RuntimeConfig{
+		Command:       "claude",
+		ResolvedAgent: "claude", // workspace default, NOT the override
+	}
+
+	got := MergeRuntimeLivenessEnv(env, rc)
+
+	if got["GT_AGENT"] != "codex" {
+		t.Fatalf("GT_AGENT = %q, want %q", got["GT_AGENT"], "codex")
+	}
+	if got["GT_PROCESS_NAMES"] != "codex" {
+		t.Fatalf("GT_PROCESS_NAMES = %q, want %q (should resolve from effective agent, not runtimeConfig)", got["GT_PROCESS_NAMES"], "codex")
+	}
 }
 
 func contains(s, substr string) bool {
