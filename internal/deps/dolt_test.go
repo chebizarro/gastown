@@ -9,6 +9,9 @@ func TestParseDoltVersion(t *testing.T) {
 	}{
 		{"dolt version 1.82.4", "1.82.4"},
 		{"dolt version 1.82.4\n", "1.82.4"},
+		{"dolt version 1.84.0", "1.84.0"},
+		{"dolt version 2.0.3", "2.0.3"},
+		{"dolt version 1.84.0\nWarning: you are on an old version of Dolt. The newest version is 2.0.3.", "1.84.0"},
 		{"dolt version 1.0.0", "1.0.0"},
 		{"dolt version 10.20.30", "10.20.30"},
 		{"some other output", ""},

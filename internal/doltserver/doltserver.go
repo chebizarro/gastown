@@ -276,6 +276,16 @@ type Config struct {
 	// Default is "warning" to suppress connection open/close noise. Override with
 	// GT_DOLT_LOGLEVEL=info (or debug) for diagnostics.
 	LogLevel string
+
+	// EventScheduler controls Dolt's MySQL event scheduler in managed config.
+	// Default is OFF for Gas Town: background SQL events are not part of normal
+	// beads operation and add hidden work during outage recovery.
+	EventScheduler string
+
+	// DoltStatsEnabled controls the dolt_stats_enabled system variable in managed
+	// config. Default is "0" to avoid background stats workers during high-churn
+	// agent workloads. Set to "omit" to leave the variable out of config.yaml.
+	DoltStatsEnabled string
 }
 
 // DefaultConfig returns the default Dolt server configuration.
@@ -296,18 +306,20 @@ type Config struct {
 func DefaultConfig(townRoot string) *Config {
 	daemonDir := filepath.Join(townRoot, "daemon")
 	config := &Config{
-		TownRoot:       townRoot,
-		Port:           DefaultPort,
-		User:           DefaultUser,
-		DataDir:        filepath.Join(townRoot, ".dolt-data"),
-		LogFile:        filepath.Join(daemonDir, "dolt.log"),
-		PidFile:        filepath.Join(daemonDir, "dolt.pid"),
-		MaxConnections: DefaultMaxConnections,
-		ReadTimeoutMs:  DefaultReadTimeoutMs,
-		WriteTimeoutMs: DefaultWriteTimeoutMs,
-		WaitTimeoutSec: DefaultWaitTimeoutSec,
-		TimeZone:       DefaultTimeZone,
-		LogLevel:       "warning",
+		TownRoot:         townRoot,
+		Port:             DefaultPort,
+		User:             DefaultUser,
+		DataDir:          filepath.Join(townRoot, ".dolt-data"),
+		LogFile:          filepath.Join(daemonDir, "dolt.log"),
+		PidFile:          filepath.Join(daemonDir, "dolt.pid"),
+		MaxConnections:   DefaultMaxConnections,
+		ReadTimeoutMs:    DefaultReadTimeoutMs,
+		WriteTimeoutMs:   DefaultWriteTimeoutMs,
+		WaitTimeoutSec:   DefaultWaitTimeoutSec,
+		TimeZone:         DefaultTimeZone,
+		LogLevel:         "warning",
+		EventScheduler:   "OFF",
+		DoltStatsEnabled: "0",
 	}
 
 	// Optional override for the idle-session timeout. Negative values disable
@@ -332,14 +344,25 @@ func DefaultConfig(townRoot string) *Config {
 		config.Host = h
 	}
 
-	// Port precedence: config.yaml > env var > default
+	// Port precedence: config.yaml > env var > daemon.json > default
 	// config.yaml takes precedence to prevent stale env var pollution
-	if port := readPortFromConfigYAML(townRoot); port > 0 {
+	portFromConfig := false
+	if os.Getenv("GT_DOLT_IGNORE_CONFIG") == "1" {
+		// Emergency recovery hatch: ignore a bad managed config and use env/daemon
+		// fallbacks below. Does not delete or modify the config file.
+	} else if port := readPortFromConfigYAML(townRoot); port > 0 {
 		config.Port = port
+		portFromConfig = true
 	} else if p := os.Getenv("GT_DOLT_PORT"); p != "" {
 		if port, err := strconv.Atoi(p); err == nil {
 			config.Port = port
 		}
+	}
+	if scheduler, ok := os.LookupEnv("GT_DOLT_EVENT_SCHEDULER"); ok {
+		config.EventScheduler = scheduler
+	}
+	if stats, ok := os.LookupEnv("GT_DOLT_STATS_ENABLED"); ok {
+		config.DoltStatsEnabled = stats
 	}
 
 	if u := os.Getenv("GT_DOLT_USER"); u != "" {
@@ -367,7 +390,7 @@ func DefaultConfig(townRoot string) *Config {
 	// when the town uses a custom port (e.g. GT_DOLT_PORT=3308).
 	// We cannot import the daemon package here (circular: daemon→doltserver),
 	// so we parse the minimal JSON structure directly.
-	if os.Getenv("GT_DOLT_PORT") == "" && townRoot != "" {
+	if !portFromConfig && os.Getenv("GT_DOLT_PORT") == "" && townRoot != "" {
 		daemonJSONPath := filepath.Join(townRoot, "mayor", "daemon.json")
 		if data, err := os.ReadFile(daemonJSONPath); err == nil {
 			var daemonEnv struct {
@@ -1430,6 +1453,18 @@ func writeServerConfig(config *Config, configPath string) error {
 	if config.MaxConnections > 0 {
 		maxConnLine = fmt.Sprintf("\n  max_connections: %d", config.MaxConnections)
 	}
+	eventSchedulerLine := "  event_scheduler: \"OFF\"\n"
+	if strings.EqualFold(config.EventScheduler, "omit") {
+		eventSchedulerLine = ""
+	} else if strings.TrimSpace(config.EventScheduler) != "" {
+		eventSchedulerLine = fmt.Sprintf("  event_scheduler: %q\n", strings.ToUpper(strings.TrimSpace(config.EventScheduler)))
+	}
+	systemVariablesBlock := "\nsystem_variables:\n  dolt_stats_enabled: 0\n"
+	if strings.EqualFold(config.DoltStatsEnabled, "omit") {
+		systemVariablesBlock = ""
+	} else if strings.TrimSpace(config.DoltStatsEnabled) != "" {
+		systemVariablesBlock = fmt.Sprintf("\nsystem_variables:\n  dolt_stats_enabled: %s\n", strings.TrimSpace(config.DoltStatsEnabled))
+	}
 
 	content := fmt.Sprintf(`# Dolt SQL server configuration — managed by Gas Town (gt dolt start)
 # Do not edit manually; changes are overwritten on each server start.
@@ -1445,14 +1480,10 @@ data_dir: "%s"
 
 behavior:
   dolt_transaction_commit: false
-  event_scheduler: "OFF"
-  auto_gc_behavior:
+%s  auto_gc_behavior:
     enable: false
     archive_level: 0
-
-system_variables:
-  dolt_stats_enabled: 0
-`,
+%s`,
 		config.LogLevel,
 		config.Port,
 		hostLine,
@@ -1460,6 +1491,8 @@ system_variables:
 		readTimeoutLine,
 		writeTimeoutLine,
 		filepath.ToSlash(config.DataDir),
+		eventSchedulerLine,
+		systemVariablesBlock,
 	)
 
 	return os.WriteFile(configPath, []byte(content), 0600)

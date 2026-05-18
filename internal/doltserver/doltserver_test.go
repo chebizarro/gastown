@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // =============================================================================
@@ -4090,6 +4092,64 @@ func TestWriteServerConfig_Defaults(t *testing.T) {
 			t.Errorf("config missing %q\nfull content:\n%s", want, content)
 		}
 	}
+
+	var parsed struct {
+		LogLevel string `yaml:"log_level"`
+		Listener struct {
+			Port               int `yaml:"port"`
+			MaxConnections     int `yaml:"max_connections"`
+			ReadTimeoutMillis  int `yaml:"read_timeout_millis"`
+			WriteTimeoutMillis int `yaml:"write_timeout_millis"`
+		} `yaml:"listener"`
+		DataDir  string `yaml:"data_dir"`
+		Behavior struct {
+			DoltTransactionCommit bool    `yaml:"dolt_transaction_commit"`
+			EventScheduler        *string `yaml:"event_scheduler"`
+			AutoGCBehavior        struct {
+				Enable       bool `yaml:"enable"`
+				ArchiveLevel int  `yaml:"archive_level"`
+			} `yaml:"auto_gc_behavior"`
+		} `yaml:"behavior"`
+		SystemVariables struct {
+			DoltStatsEnabled *int `yaml:"dolt_stats_enabled"`
+		} `yaml:"system_variables"`
+	}
+	if err := yaml.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("generated config is invalid YAML: %v\n%s", err, content)
+	}
+	if parsed.LogLevel != "warning" {
+		t.Errorf("log_level = %q, want warning", parsed.LogLevel)
+	}
+	if parsed.Listener.Port != 3307 {
+		t.Errorf("listener.port = %d, want 3307", parsed.Listener.Port)
+	}
+	if parsed.Listener.MaxConnections != 1000 {
+		t.Errorf("listener.max_connections = %d, want 1000", parsed.Listener.MaxConnections)
+	}
+	if parsed.Listener.ReadTimeoutMillis != DefaultReadTimeoutMs {
+		t.Errorf("listener.read_timeout_millis = %d, want %d", parsed.Listener.ReadTimeoutMillis, DefaultReadTimeoutMs)
+	}
+	if parsed.Listener.WriteTimeoutMillis != DefaultWriteTimeoutMs {
+		t.Errorf("listener.write_timeout_millis = %d, want %d", parsed.Listener.WriteTimeoutMillis, DefaultWriteTimeoutMs)
+	}
+	if parsed.DataDir != dir {
+		t.Errorf("data_dir = %q, want %q", parsed.DataDir, dir)
+	}
+	if parsed.Behavior.DoltTransactionCommit {
+		t.Error("behavior.dolt_transaction_commit = true, want false")
+	}
+	if parsed.Behavior.EventScheduler == nil || *parsed.Behavior.EventScheduler != "OFF" {
+		t.Fatalf("behavior.event_scheduler = %v, want OFF", parsed.Behavior.EventScheduler)
+	}
+	if parsed.Behavior.AutoGCBehavior.Enable {
+		t.Error("behavior.auto_gc_behavior.enable = true, want false")
+	}
+	if parsed.Behavior.AutoGCBehavior.ArchiveLevel != 0 {
+		t.Errorf("behavior.auto_gc_behavior.archive_level = %d, want 0", parsed.Behavior.AutoGCBehavior.ArchiveLevel)
+	}
+	if parsed.SystemVariables.DoltStatsEnabled == nil || *parsed.SystemVariables.DoltStatsEnabled != 0 {
+		t.Fatalf("system_variables.dolt_stats_enabled = %v, want 0", parsed.SystemVariables.DoltStatsEnabled)
+	}
 }
 
 func TestWriteServerConfig_NoHost(t *testing.T) {
@@ -4151,6 +4211,33 @@ func TestWriteServerConfig_ZeroTimeoutsOmitted(t *testing.T) {
 	}
 	if strings.Contains(content, "write_timeout_millis") {
 		t.Error("zero WriteTimeoutMs should not write write_timeout_millis")
+	}
+}
+
+func TestWriteServerConfig_StatsAndSchedulerCanBeOmitted(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+
+	config := &Config{
+		Port:             3307,
+		DataDir:          dir,
+		DoltStatsEnabled: "omit",
+		EventScheduler:   "omit",
+	}
+	if err := writeServerConfig(config, configPath); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+	if strings.Contains(content, "dolt_stats_enabled") {
+		t.Fatalf("dolt_stats_enabled should be omitted:\n%s", content)
+	}
+	if strings.Contains(content, "event_scheduler") {
+		t.Fatalf("event_scheduler should be omitted:\n%s", content)
 	}
 }
 
