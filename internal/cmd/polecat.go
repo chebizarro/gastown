@@ -1452,6 +1452,10 @@ func hasSubmittableWorkForRecovery(worktreePath string, targetRefs []string, git
 	return gitErr != nil || (gitState != nil && gitState.UnpushedCommits > 0)
 }
 
+func isRecoveryBaseBranch(branch string) bool {
+	return branch == "main" || branch == "master" || strings.HasPrefix(branch, "integration/")
+}
+
 func recoveryTargetRefs(bd *beads.Beads, issueID, activeMR, branch string) []string {
 	var refs []string
 	appendMRTarget := func(issue *beads.Issue) {
