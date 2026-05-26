@@ -1225,6 +1225,10 @@ func isHookedAgentDead(assignee string) bool {
 // Fails fast on configuration/initialization errors (gt-2ra).
 // See: https://github.com/steveyegge/gastown/issues/148
 func hookBeadWithRetry(beadID, targetAgent, hookDir string) error {
+	return hookBeadWithRetryWithTownRoot(beadID, targetAgent, hookDir, "")
+}
+
+func hookBeadWithRetryWithTownRoot(beadID, targetAgent, hookDir, townRoot string) error {
 	const maxRetries = 10
 	const baseBackoff = 500 * time.Millisecond
 	const maxBackoff = 30 * time.Second
@@ -1258,7 +1262,7 @@ func hookBeadWithRetry(beadID, targetAgent, hookDir string) error {
 			break
 		}
 
-		verifyInfo, verifyErr := getBeadInfo(beadID)
+		verifyInfo, verifyErr := getBeadInfoFromTownRoot(townRoot, beadID)
 		if verifyErr != nil {
 			lastErr = fmt.Errorf("verifying hook: %w", verifyErr)
 			if attempt < maxRetries {
