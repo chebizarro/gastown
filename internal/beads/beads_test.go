@@ -1531,6 +1531,7 @@ It spans multiple lines.`,
 				Description: `branch: polecat/Nux/gt-old
 target: develop
 source_issue: gt-old
+commit_sha: oldsha
 worker: Nux
 
 Some existing prose content.`,
@@ -1539,12 +1540,14 @@ Some existing prose content.`,
 				Branch:      "polecat/Nux/gt-new",
 				Target:      "main",
 				SourceIssue: "gt-new",
+				CommitSHA:   "newsha",
 				Worker:      "Nux",
 				MergeCommit: "abc123",
 			},
 			want: `branch: polecat/Nux/gt-new
 target: main
 source_issue: gt-new
+commit_sha: newsha
 worker: Nux
 merge_commit: abc123
 

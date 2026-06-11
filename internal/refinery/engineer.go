@@ -1563,7 +1563,7 @@ func (e *Engineer) recordConflictTaskOnMR(mr *MRInfo, taskID string, retryCount 
 // belongs to that MR/source issue; this avoids unblocking stale duplicate MRs.
 // All operations are best-effort; failures are logged and don't affect the merge.
 func (e *Engineer) closeSupersededConflictArtifacts(merged *MRInfo) {
-	e.closeConflictTaskIfOpen(merged.ConflictTaskID, merged.ID, merged.ID, merged.SourceIssue)
+	e.closeConflictTaskIfOpen(conflictTaskIDForMR(merged), merged.ID, merged.ID, merged.SourceIssue)
 
 	if merged.SourceIssue == "" {
 		return
@@ -1577,7 +1577,7 @@ func (e *Engineer) closeSupersededConflictArtifacts(merged *MRInfo) {
 		if other.ID == merged.ID || other.SourceIssue != merged.SourceIssue {
 			continue
 		}
-		if !e.closeConflictTaskIfOpen(other.ConflictTaskID, other.ID, merged.ID, merged.SourceIssue) {
+		if !e.closeConflictTaskIfOpen(conflictTaskIDForMR(other), other.ID, merged.ID, merged.SourceIssue) {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Note: open MR %s shares source issue %s just merged via %s, but had no verified conflict task to close\n",
 				other.ID, merged.SourceIssue, merged.ID)
 			continue
@@ -1589,6 +1589,16 @@ func (e *Engineer) closeSupersededConflictArtifacts(merged *MRInfo) {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Closed superseded MR %s: %s\n", other.ID, reason)
 		}
 	}
+}
+
+func conflictTaskIDForMR(mr *MRInfo) string {
+	if mr == nil {
+		return ""
+	}
+	if mr.ConflictTaskID != "" {
+		return mr.ConflictTaskID
+	}
+	return mr.BlockedBy
 }
 
 // closeConflictTaskIfOpen closes a conflict-resolution task if it is still open.
