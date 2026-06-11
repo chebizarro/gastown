@@ -4,11 +4,25 @@ import (
 	"bytes"
 	"encoding/json"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/witness"
 )
+
+type progressDiagnostics struct {
+	bytes.Buffer
+	sawProgress chan struct{}
+	once        sync.Once
+}
+
+func (d *progressDiagnostics) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), "still running") {
+		d.once.Do(func() { close(d.sawProgress) })
+	}
+	return d.Buffer.Write(p)
+}
 
 func TestPatrolScanOutputJSON(t *testing.T) {
 	output := PatrolScanOutput{
@@ -111,9 +125,18 @@ func TestRunPatrolScanPhaseEmitsProgressDiagnostics(t *testing.T) {
 	patrolScanProgressInterval = 10 * time.Millisecond
 	defer func() { patrolScanProgressInterval = oldInterval }()
 
-	var diagnostics bytes.Buffer
-	got := runPatrolScanPhase(&diagnostics, "slow phase", func() string {
-		time.Sleep(25 * time.Millisecond)
+	diagnostics := &progressDiagnostics{sawProgress: make(chan struct{})}
+	release := make(chan struct{})
+	go func() {
+		select {
+		case <-diagnostics.sawProgress:
+		case <-time.After(time.Second):
+		}
+		close(release)
+	}()
+
+	got := runPatrolScanPhase(diagnostics, "slow phase", func() string {
+		<-release
 		return "ok"
 	})
 
@@ -122,6 +145,11 @@ func TestRunPatrolScanPhaseEmitsProgressDiagnostics(t *testing.T) {
 	}
 
 	output := diagnostics.String()
+	select {
+	case <-diagnostics.sawProgress:
+	default:
+		t.Fatalf("diagnostics %q never emitted progress", output)
+	}
 	for _, want := range []string{
 		"gt patrol scan: starting slow phase",
 		"gt patrol scan: still running slow phase after",
