@@ -319,3 +319,102 @@ func TestAttachmentFormulaVarsPrefersAttachedVars(t *testing.T) {
 		t.Fatalf("attachmentFormulaVars() = %#v, want %#v", got, want)
 	}
 }
+
+func TestApplyFormulaVarsUsesWorkflowBareSyntax(t *testing.T) {
+	t.Parallel()
+
+	got := applyFormulaVars("bd show {{issue}}\nkeep {{.issue}}", map[string]string{"issue": "gt-123"})
+	want := "bd show gt-123\nkeep {{.issue}}"
+	if got != want {
+		t.Fatalf("applyFormulaVars() = %q, want %q", got, want)
+	}
+}
+
+func TestRenderTemplateUsesGoDotSyntax(t *testing.T) {
+	t.Parallel()
+
+	ctx := map[string]interface{}{"issue": "gt-123"}
+	got, err := renderTemplate("bd show {{.issue}}", ctx)
+	if err != nil {
+		t.Fatalf("renderTemplate() dotted syntax error: %v", err)
+	}
+	if got != "bd show gt-123" {
+		t.Fatalf("renderTemplate() = %q, want %q", got, "bd show gt-123")
+	}
+
+	if _, err := renderTemplate("bd show {{issue}}", ctx); err == nil {
+		t.Fatal("renderTemplate() with bare syntax succeeded; want Go template error")
+	}
+}
+
+func TestDesignFormulaOutputUsesReviewID(t *testing.T) {
+	t.Parallel()
+
+	content, err := formula.GetEmbeddedFormulaContent("design")
+	if err != nil {
+		t.Fatalf("GetEmbeddedFormulaContent(design): %v", err)
+	}
+	f, err := formula.Parse(content)
+	if err != nil {
+		t.Fatalf("Parse(design): %v", err)
+	}
+	if f.Output == nil {
+		t.Fatal("design formula missing output config")
+	}
+
+	got, err := renderTemplate(f.Output.Directory, map[string]interface{}{"review_id": "abc123"})
+	if err != nil {
+		t.Fatalf("render output directory: %v", err)
+	}
+	if got != ".designs/abc123" {
+		t.Fatalf("output directory = %q, want %q", got, ".designs/abc123")
+	}
+}
+
+func TestFormulaRunExamplesUseSetVars(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{"design", "mol-idea-to-plan"} {
+		name := name
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			content, err := formula.GetEmbeddedFormulaContent(name)
+			if err != nil {
+				t.Fatalf("GetEmbeddedFormulaContent(%s): %v", name, err)
+			}
+			text := string(content)
+			for _, bad := range []string{"--problem=", "--context=", "--plan="} {
+				if strings.Contains(text, bad) {
+					t.Fatalf("%s still contains invalid gt formula run flag %q", name, bad)
+				}
+			}
+		})
+	}
+
+	idea, err := formula.GetEmbeddedFormulaContent("mol-idea-to-plan")
+	if err != nil {
+		t.Fatalf("GetEmbeddedFormulaContent(mol-idea-to-plan): %v", err)
+	}
+	ideaText := string(idea)
+	if strings.Contains(ideaText, "<design-id>") {
+		t.Fatal("mol-idea-to-plan still references stale <design-id> output paths")
+	}
+	for _, want := range []string{
+		"--set problem=\"{{problem}}\"",
+		"--set context=\"See .prd-reviews/{{review_id}}/prd-draft.md. {{context}}\"",
+		"--set context=\"PRD with clarifications: .prd-reviews/{{review_id}}/prd-draft.md. {{context}}\"",
+	} {
+		if !strings.Contains(ideaText, want) {
+			t.Fatalf("mol-idea-to-plan missing %q", want)
+		}
+	}
+
+	design, err := formula.GetEmbeddedFormulaContent("design")
+	if err != nil {
+		t.Fatalf("GetEmbeddedFormulaContent(design): %v", err)
+	}
+	if !strings.Contains(string(design), "gt formula run design --set problem=") {
+		t.Fatal("design usage examples do not mention --set problem=")
+	}
+}
