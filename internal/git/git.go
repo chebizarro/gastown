@@ -2751,7 +2751,9 @@ func (g *Git) branchPreservationStatus(localBranch, remote string, targets []str
 			lastErr = err
 			continue
 		}
-		candidate.Evidence = "comparison_ref"
+		if candidate.Evidence == "" {
+			candidate.Evidence = "comparison_ref"
+		}
 		if candidate.Preserved {
 			return candidate, nil
 		}
@@ -2808,6 +2810,12 @@ func (g *Git) preservationAgainstRef(ref string) (BranchPreservationStatus, erro
 	status := BranchPreservationStatus{ComparisonBase: ref}
 	if contains, err := g.refContainsHead(ref); err == nil && contains {
 		status.Preserved = true
+		status.Evidence = "ancestor"
+		return status, nil
+	}
+	if preserved, err := g.mergeTreeNoopAgainstRef(ref); err == nil && preserved {
+		status.Preserved = true
+		status.Evidence = "merge_tree_noop"
 		return status, nil
 	}
 	out, err := g.Cherry(ref, "HEAD")
@@ -2817,6 +2825,18 @@ func (g *Git) preservationAgainstRef(ref string) (BranchPreservationStatus, erro
 	status.UnpreservedPatchCount = CountCherryUnmergedCommits(out)
 	status.Preserved = status.UnpreservedPatchCount == 0
 	return status, nil
+}
+
+func (g *Git) mergeTreeNoopAgainstRef(ref string) (bool, error) {
+	refTree, err := g.run("rev-parse", ref+"^{tree}")
+	if err != nil {
+		return false, err
+	}
+	mergedTree, err := g.run("merge-tree", "--write-tree", ref, "HEAD")
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(mergedTree) == strings.TrimSpace(refTree), nil
 }
 
 // CountCherryUnmergedCommits counts `git cherry` lines whose patches are not

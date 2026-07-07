@@ -3293,6 +3293,87 @@ func TestUnpushedCommitsPrefersExactRemoteBranchOverUpstream(t *testing.T) {
 	}
 }
 
+func TestBranchTargetStatusPreservesSquashMergedAdvancedTarget(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	if err := exec.Command("git", "-C", localDir, "merge-tree", "--write-tree", "HEAD", "HEAD").Run(); err != nil {
+		t.Skipf("git merge-tree --write-tree unsupported: %v", err)
+	}
+	g := NewGit(localDir)
+	branch := "polecat/squash-preserved"
+
+	if err := g.CreateBranch(branch); err != nil {
+		t.Fatalf("CreateBranch: %v", err)
+	}
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, "feature.txt"), []byte("one\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := g.Add("feature.txt"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := g.Commit("checkpoint one"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, "feature.txt"), []byte("one\ntwo\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := g.Add("feature.txt"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := g.Commit("checkpoint two"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	if err := g.Checkout(mainBranch); err != nil {
+		t.Fatalf("Checkout main: %v", err)
+	}
+	runGit(t, localDir, "merge", "--squash", branch)
+	runGit(t, localDir, "commit", "-m", "squash polecat work")
+	if err := os.WriteFile(filepath.Join(localDir, "advance.txt"), []byte("target advanced\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := g.Add("advance.txt"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := g.Commit("advance target"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	runGit(t, localDir, "push", "origin", mainBranch)
+
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout branch: %v", err)
+	}
+	status, err := g.BranchTargetStatus(branch, "origin", []string{"origin/" + mainBranch})
+	if err != nil {
+		t.Fatalf("BranchTargetStatus: %v", err)
+	}
+	if !status.Preserved || status.UnpreservedPatchCount != 0 {
+		t.Fatalf("BranchTargetStatus = %+v, want squash-preserved target", status)
+	}
+	if status.Evidence != "merge_tree_noop" {
+		t.Fatalf("Evidence = %q, want merge_tree_noop", status.Evidence)
+	}
+
+	if err := os.WriteFile(filepath.Join(localDir, "feature.txt"), []byte("one\ntwo\nthree\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := g.Add("feature.txt"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := g.Commit("extra local work"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	status, err = g.BranchTargetStatus(branch, "origin", []string{"origin/" + mainBranch})
+	if err != nil {
+		t.Fatalf("BranchTargetStatus after extra work: %v", err)
+	}
+	if status.Preserved || status.UnpreservedPatchCount == 0 {
+		t.Fatalf("BranchTargetStatus after extra work = %+v, want unpreserved work", status)
+	}
+}
+
 // TestBranchPushedToRemote_NoPushURL verifies baseline behavior: when fetch and
 // push URLs are the same, BranchPushedToRemote works normally.
 func TestBranchPushedToRemote_NoPushURL(t *testing.T) {

@@ -1066,7 +1066,7 @@ func slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType string) 
 		}
 	}
 	input.MQCheckRequired = input.Branch != ""
-	input.HasSubmittableWork = witnessHasSubmittableWork(clonePath)
+	input.HasSubmittableWork = witnessHasSubmittableWork(clonePath, targetRefs)
 	input.AssignedBeadTerminal = witnessIssueTerminal(rigBeads, issueID)
 	if polecat.CanIgnoreStaleCleanupStatus(input.CleanupStatus, input.AssignedBeadTerminal || sourceTerminal || hookTerminal, hookSafe, activeMRSafe, gitSafe) {
 		input.IgnoreCleanupStatus = true
@@ -1192,53 +1192,11 @@ func witnessMQNotRequiredSource(bd *beads.Beads, issueID string) bool {
 	return attachment.NoMerge || attachment.ReviewOnly || strings.EqualFold(strings.TrimSpace(attachment.MergeStrategy), "local")
 }
 
-func witnessHasSubmittableWork(worktreePath string) bool {
-	ref, err := witnessWorkstateComparisonRef(worktreePath)
-	if err != nil {
-		return false
-	}
-	count, err := witnessCountPatchUniqueCommits(worktreePath, ref)
-	return err == nil && count > 0
-}
-
-func witnessWorkstateComparisonRef(worktreePath string) (string, error) {
-	upstreamCmd := exec.Command("git", "rev-parse", "--abbrev-ref", "@{u}")
-	upstreamCmd.Dir = worktreePath
-	if output, err := upstreamCmd.Output(); err == nil {
-		upstream := strings.TrimSpace(string(output))
-		upstreamBranch := strings.TrimPrefix(upstream, "origin/")
-		if upstream != "" && witnessIsWorkstateRecoveryBaseBranch(upstreamBranch) {
-			return upstream, nil
-		}
-	}
-	for _, ref := range []string{"origin/main", "origin/master"} {
-		verifyCmd := exec.Command("git", "rev-parse", "--verify", "--quiet", ref)
-		verifyCmd.Dir = worktreePath
-		if err := verifyCmd.Run(); err == nil {
-			return ref, nil
-		}
-	}
-	return "", fmt.Errorf("no recovery base ref")
-}
-
-func witnessIsWorkstateRecoveryBaseBranch(branch string) bool {
-	return branch == "main" || branch == "master" || strings.HasPrefix(branch, "integration/")
-}
-
-func witnessCountPatchUniqueCommits(worktreePath, baseRef string) (int, error) {
-	cherryCmd := exec.Command("git", "cherry", baseRef, "HEAD")
-	cherryCmd.Dir = worktreePath
-	output, err := cherryCmd.Output()
-	if err != nil {
-		return 0, err
-	}
-	count := 0
-	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "+") {
-			count++
-		}
-	}
-	return count, nil
+func witnessHasSubmittableWork(worktreePath string, targetRefs []string) bool {
+	g := git.NewGit(worktreePath)
+	branch, _ := g.CurrentBranch()
+	status, err := g.BranchTargetStatus(branch, "origin", targetRefs)
+	return err == nil && status.UnpreservedPatchCount > 0
 }
 
 // RecoveryPayload contains data for RECOVERY_NEEDED escalation.
