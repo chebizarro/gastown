@@ -955,6 +955,9 @@ func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
 	if opts.Ephemeral {
 		return b.listEphemeral(opts)
 	}
+	if err := b.syncNostrigLedgerIfEnabled(); err != nil {
+		return nil, err
+	}
 
 	args := []string{"list", "--json"}
 
@@ -1322,6 +1325,9 @@ func (b *Beads) Ready() ([]*Issue, error) {
 	if b.store != nil {
 		return b.storeReady()
 	}
+	if err := b.syncNostrigLedgerIfEnabled(); err != nil {
+		return nil, err
+	}
 
 	out, err := b.run("ready", "--json")
 	if err != nil {
@@ -1347,6 +1353,9 @@ func (b *Beads) ReadyForMol(moleculeID string) ([]*Issue, error) {
 			Limit:    100,
 		})
 	}
+	if err := b.syncNostrigLedgerIfEnabled(); err != nil {
+		return nil, err
+	}
 
 	out, err := b.run("ready", "--mol", moleculeID, "--json", "-n", "100")
 	if err != nil {
@@ -1370,6 +1379,9 @@ func (b *Beads) ReadyWithType(issueType string) ([]*Issue, error) {
 			Labels: []string{"gt:" + issueType},
 			Limit:  100,
 		})
+	}
+	if err := b.syncNostrigLedgerIfEnabled(); err != nil {
+		return nil, err
 	}
 
 	out, err := b.run("ready", "--json", "--label", "gt:"+issueType, "-n", "100")
@@ -1400,6 +1412,9 @@ func (b *Beads) Show(id string) (*Issue, error) {
 
 	if b.store != nil {
 		return b.storeShow(id)
+	}
+	if err := b.syncNostrigLedgerIfEnabled(); err != nil {
+		return nil, err
 	}
 
 	out, err := b.run("show", id, "--json")
@@ -1836,8 +1851,10 @@ func (b *Beads) Update(id string, opts UpdateOptions) error {
 		}
 	}
 
-	_, err := b.run(args...)
-	return err
+	if _, err := b.run(args...); err != nil {
+		return err
+	}
+	return b.publishNostrigUpdateIfEnabled(id, opts)
 }
 
 func (b *Beads) deleteBead(id string) error {
@@ -1864,8 +1881,15 @@ func (b *Beads) Close(ids ...string) error {
 		args = append(args, "--session="+sessionID)
 	}
 
-	_, err := b.run(args...)
-	return err
+	if _, err := b.run(args...); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err := b.publishNostrigStatusIfEnabled(id, "closed"); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // CloseWithReason closes one or more issues with a reason.
@@ -1888,8 +1912,15 @@ func (b *Beads) CloseWithReason(reason string, ids ...string) error {
 		args = append(args, "--session="+sessionID)
 	}
 
-	_, err := b.run(args...)
-	return err
+	if _, err := b.run(args...); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err := b.publishNostrigStatusIfEnabled(id, "closed"); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ForceCloseWithReason closes one or more issues with --force, bypassing
@@ -1917,8 +1948,15 @@ func (b *Beads) ForceCloseWithReason(reason string, ids ...string) error {
 		args = append(args, "--session="+sessionID)
 	}
 
-	_, err := b.run(args...)
-	return err
+	if _, err := b.run(args...); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err := b.publishNostrigStatusIfEnabled(id, "closed"); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Release moves an in_progress issue back to open status.
@@ -1951,8 +1989,12 @@ func (b *Beads) ReleaseWithReason(id, reason string) error {
 		args = append(args, "--notes=Released: "+reason)
 	}
 
-	_, err := b.run(args...)
-	return err
+	if _, err := b.run(args...); err != nil {
+		return err
+	}
+	open := "open"
+	empty := ""
+	return b.publishNostrigUpdateIfEnabled(id, UpdateOptions{Status: &open, Assignee: &empty})
 }
 
 // AddDependency adds a dependency: issue depends on dependsOn.
