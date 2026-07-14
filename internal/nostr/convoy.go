@@ -14,7 +14,7 @@ type ConvoyStateContent struct {
 	Schema        string               `json:"schema"` // "gt/convoy_state@1"
 	ID            string               `json:"id"`
 	Title         string               `json:"title"`
-	Status        string               `json:"status"` // open|landed|cancelled
+	Status        string               `json:"status"` // open|landed|canceled
 	CreatedAt     string               `json:"created_at"`
 	CreatedBy     string               `json:"created_by"`
 	TrackedIssues []ConvoyTrackedIssue `json:"tracked_issues"`

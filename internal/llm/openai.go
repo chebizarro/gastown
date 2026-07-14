@@ -93,7 +93,7 @@ func (c *OpenAIClient) Chat(ctx context.Context, req *ChatRequest) (*ChatRespons
 	if err != nil {
 		return nil, fmt.Errorf("HTTP request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		errBody, _ := io.ReadAll(resp.Body)
@@ -182,7 +182,7 @@ func (c *OpenAIClient) Ping(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("endpoint unreachable: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("endpoint returned status %d", resp.StatusCode)
@@ -270,7 +270,7 @@ func convertTools(tools []ToolDef) []map[string]interface{} {
 			"function": map[string]interface{}{
 				"name":        t.Name,
 				"description": t.Description,
-				"parameters":  json.RawMessage(t.Parameters),
+				"parameters":  t.Parameters,
 			},
 		})
 	}

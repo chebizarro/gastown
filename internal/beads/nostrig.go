@@ -62,7 +62,7 @@ func (b *Beads) syncNostrigLedgerIfEnabled() error {
 	lock.Lock()
 	defer lock.Unlock()
 
-	_, err = b.runNostrig(args...)
+	err = b.runNostrig(args...)
 	return err
 }
 
@@ -117,7 +117,7 @@ func (b *Beads) publishNostrigUpdateIfEnabled(id string, opts UpdateOptions) err
 	if len(args) == 0 || !nostrigUpdateHasField(args) {
 		return nil
 	}
-	_, err := b.runNostrig(args...)
+	err := b.runNostrig(args...)
 	return err
 }
 
@@ -161,7 +161,7 @@ func nostrigUpdateHasField(args []string) bool {
 	return false
 }
 
-func (b *Beads) runNostrig(args ...string) ([]byte, error) {
+func (b *Beads) runNostrig(args ...string) error {
 	bin := strings.TrimSpace(os.Getenv("GT_NOSTRIG_BIN"))
 	if bin == "" {
 		bin = "nostrig"
@@ -179,11 +179,11 @@ func (b *Beads) runNostrig(args ...string) ([]byte, error) {
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		if strings.TrimSpace(stderr.String()) != "" {
-			return nil, fmt.Errorf("nostrig %s: %s", strings.Join(args, " "), strings.TrimSpace(stderr.String()))
+			return fmt.Errorf("nostrig %s: %s", strings.Join(args, " "), strings.TrimSpace(stderr.String()))
 		}
-		return nil, fmt.Errorf("nostrig %s: %w", strings.Join(args, " "), err)
+		return fmt.Errorf("nostrig %s: %w", strings.Join(args, " "), err)
 	}
-	return stdout.Bytes(), nil
+	return nil
 }
 
 func telemetryEnvForNostrig() []string {

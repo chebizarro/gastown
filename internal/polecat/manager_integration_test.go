@@ -23,7 +23,7 @@ func initBeadsDBWithPrefix(t *testing.T, dir, prefix string) {
 	t.Helper()
 	testutil.RequireDoltContainer(t)
 
-	args := []string{"init", "--quiet", "--prefix", prefix, "--server-port", testutil.DoltContainerPort()}
+	args := []string{"init", "--quiet", "--prefix", prefix, "--server", "--external", "--server-port", testutil.DoltContainerPort()}
 	cmd := exec.Command("bd", args...)
 	cmd.Dir = dir
 	if output, err := cmd.CombinedOutput(); err != nil {

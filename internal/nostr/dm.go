@@ -158,7 +158,7 @@ func (l *DMListener) Stop() {
 }
 
 // processEvent handles an incoming DM event.
-func (l *DMListener) processEvent(ctx context.Context, event *nostr.Event) {
+func (l *DMListener) processEvent(_ context.Context, event *nostr.Event) {
 	switch event.Kind {
 	case 1059:
 		// NIP-17 gift wrap — need to unwrap

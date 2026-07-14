@@ -195,10 +195,10 @@ func (p *RelayPool) Close() {
 	p.closed = true
 
 	for _, relay := range p.writeRelays {
-		relay.Close()
+		_ = relay.Close()
 	}
 	for _, relay := range p.readRelays {
-		relay.Close()
+		_ = relay.Close()
 	}
 
 	p.writeRelays = nil

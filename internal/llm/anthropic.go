@@ -119,7 +119,7 @@ func (c *AnthropicClient) Chat(ctx context.Context, req *ChatRequest) (*ChatResp
 	if err != nil {
 		return nil, fmt.Errorf("HTTP request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		errBody, _ := io.ReadAll(resp.Body)

@@ -117,7 +117,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 	go func() {
 		<-ctx.Done()
-		s.Stop()
+		_ = s.Stop()
 	}()
 
 	if err := s.httpServer.ListenAndServe(); err != http.ErrServerClosed {
@@ -161,7 +161,7 @@ func (s *Server) handleToolsList(w http.ResponseWriter, r *http.Request) {
 		tools = append(tools, map[string]interface{}{
 			"name":        t.Name,
 			"description": t.Description,
-			"inputSchema": json.RawMessage(t.InputSchema),
+			"inputSchema": t.InputSchema,
 		})
 	}
 
@@ -170,7 +170,7 @@ func (s *Server) handleToolsList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 type toolCallRequest struct {
@@ -210,7 +210,7 @@ func (s *Server) handleToolsCall(w http.ResponseWriter, r *http.Request) {
 			IsError: true,
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 		return
 	}
 
@@ -229,7 +229,7 @@ func (s *Server) handleToolsCall(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -245,7 +245,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {

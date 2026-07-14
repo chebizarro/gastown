@@ -140,7 +140,7 @@ func NewAgentLoop(client llm.Client, executor *Executor, cfg *AgentLoopConfig) *
 	}
 }
 
-// Start begins the agent loop. It runs until stopped or the context is cancelled.
+// Start begins the agent loop. It runs until stopped or the context is canceled.
 // The loop:
 // 1. Waits for work (via AssignWork or initial gt_prime)
 // 2. Enters the think-act-observe cycle
@@ -170,7 +170,7 @@ func (l *AgentLoop) Start(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("[agentloop] Context cancelled, stopping")
+			log.Printf("[agentloop] Context canceled, stopping")
 			return ctx.Err()
 
 		case <-idleTimer.C:

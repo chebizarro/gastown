@@ -23,11 +23,11 @@ type SunsetFlags struct {
 // All default to true (local paths enabled) for backward compatibility.
 func LoadSunsetFlags() SunsetFlags {
 	return SunsetFlags{
-		EventsLocal: envBool("GT_EVENTS_LOCAL", true),
-		FeedCurator: envBool("GT_FEED_CURATOR", true),
-		ConvoyLocal: envBool("GT_CONVOY_LOCAL", true),
-		MailLocal:   envBool("GT_MAIL_LOCAL", true),
-		NudgeLocal:  envBool("GT_NUDGE_LOCAL", true),
+		EventsLocal: envBool("GT_EVENTS_LOCAL"),
+		FeedCurator: envBool("GT_FEED_CURATOR"),
+		ConvoyLocal: envBool("GT_CONVOY_LOCAL"),
+		MailLocal:   envBool("GT_MAIL_LOCAL"),
+		NudgeLocal:  envBool("GT_NUDGE_LOCAL"),
 	}
 }
 
@@ -188,27 +188,27 @@ func FormatHealthStatus(h *HealthStatus) string {
 
 // IsEventsLocalEnabled returns true if local event file writing is enabled.
 func IsEventsLocalEnabled() bool {
-	return envBool("GT_EVENTS_LOCAL", true)
+	return envBool("GT_EVENTS_LOCAL")
 }
 
 // IsFeedCuratorEnabled returns true if the feed curator daemon should run.
 func IsFeedCuratorEnabled() bool {
-	return envBool("GT_FEED_CURATOR", true)
+	return envBool("GT_FEED_CURATOR")
 }
 
 // IsConvoyLocalEnabled returns true if convoy checks should use local bd dep list.
 func IsConvoyLocalEnabled() bool {
-	return envBool("GT_CONVOY_LOCAL", true)
+	return envBool("GT_CONVOY_LOCAL")
 }
 
 // IsMailLocalEnabled returns true if beads-native mail routing is enabled.
 func IsMailLocalEnabled() bool {
-	return envBool("GT_MAIL_LOCAL", true)
+	return envBool("GT_MAIL_LOCAL")
 }
 
 // IsNudgeLocalEnabled returns true if tmux nudge (local) is enabled.
 func IsNudgeLocalEnabled() bool {
-	return envBool("GT_NUDGE_LOCAL", true)
+	return envBool("GT_NUDGE_LOCAL")
 }
 
 // --- Helpers ---
@@ -220,10 +220,11 @@ func sunsetLabel(localEnabled bool) string {
 	return "OFF (Nostr-only)"
 }
 
-func envBool(key string, defaultVal bool) bool {
+// envBool reads a boolean env var, defaulting to true when unset.
+func envBool(key string) bool {
 	v := os.Getenv(key)
 	if v == "" {
-		return defaultVal
+		return true
 	}
 	switch strings.ToLower(v) {
 	case "0", "false", "no", "off":
@@ -231,6 +232,6 @@ func envBool(key string, defaultVal bool) bool {
 	case "1", "true", "yes", "on":
 		return true
 	default:
-		return defaultVal
+		return true
 	}
 }

@@ -238,7 +238,7 @@ func (s *Spool) ArchiveOld(maxAge time.Duration) (archived int, err error) {
 
 	for _, entry := range old {
 		data, _ := json.Marshal(entry)
-		archiveFile.Write(append(data, '\n'))
+		_, _ = archiveFile.Write(append(data, '\n'))
 	}
 
 	// Rewrite active spool
@@ -312,7 +312,7 @@ func (s *Spool) writeAllLocked(entries []SpoolEntry) error {
 		if err != nil {
 			continue
 		}
-		f.Write(append(data, '\n'))
+		_, _ = f.Write(append(data, '\n'))
 	}
 
 	return nil
