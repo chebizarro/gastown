@@ -79,7 +79,7 @@ func (u *BlobUploader) uploadToServer(ctx context.Context, server string, data [
 	if err != nil {
 		return nil, fmt.Errorf("uploading to %s: %w", server, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(resp.Body)
@@ -118,7 +118,7 @@ func (u *BlobUploader) Check(ctx context.Context, hashHex string) (string, error
 		if err != nil {
 			continue
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 
 		if resp.StatusCode == http.StatusOK {
 			return url, nil

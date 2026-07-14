@@ -55,7 +55,7 @@ func (d *Discovery) Probe(ctx context.Context, host string, port int) (*ServiceI
 	if err != nil {
 		return nil, fmt.Errorf("probing %s: %w", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)

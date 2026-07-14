@@ -294,7 +294,11 @@ func runPrimeCompactResume(ctx RoleContext) {
 	// the formula checklist and forgotten that gt done is required to submit work.
 	// Without this, polecats finish implementation and sit at the prompt forever.
 	if ctx.Role == RolePolecat {
-		fmt.Printf("\n**IMPORTANT**: When all work is complete (code committed, tests pass), run `%s done` to submit to the merge queue.\n", cli.Name())
+		if _, isForkRig, _ := roleRigContext(ctx); isForkRig {
+			fmt.Printf("\n**IMPORTANT**: This is a fork-backed rig. Do not submit to the Refinery merge queue; complete the PR/no-merge workflow your assignment specifies.\n")
+		} else {
+			fmt.Printf("\n**IMPORTANT**: When all work is complete (code committed, tests pass), run `%s done` to submit to the merge queue.\n", cli.Name())
+		}
 	}
 }
 
@@ -850,29 +854,10 @@ func findAgentWorkOnce(ctx RoleContext, agentID string) (*beads.Issue, error) {
 		}
 	}
 
-	// Fallback: query by assignee
-	hookedBeads, err := b.List(beads.ListOptions{
-		Status:   beads.StatusHooked,
-		Assignee: agentID,
-		Priority: -1,
-	})
+	// Fallback: query by assignee.
+	hookedBeads, err := listAssignedActiveWork(b, agentID)
 	if err != nil {
-		return nil, fmt.Errorf("querying hooked beads: %w", err)
-	}
-
-	// Fall back to in_progress beads (session interrupted before completion)
-	if len(hookedBeads) == 0 {
-		inProgressBeads, err := b.List(beads.ListOptions{
-			Status:   "in_progress",
-			Assignee: agentID,
-			Priority: -1,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("querying in-progress beads: %w", err)
-		}
-		if len(inProgressBeads) > 0 {
-			hookedBeads = inProgressBeads
-		}
+		return nil, fmt.Errorf("querying active work: %w", err)
 	}
 
 	// Town-level fallback: rig-level agents (polecats, crew) may have hooked
@@ -880,18 +865,8 @@ func findAgentWorkOnce(ctx RoleContext, agentID string) (*beads.Issue, error) {
 	// Matches the fallback in molecule_status.go and unsling.go. (gt-dtq7)
 	if len(hookedBeads) == 0 && !isTownLevelRole(agentID) && ctx.TownRoot != "" {
 		townB := beads.New(filepath.Join(ctx.TownRoot, ".beads"))
-		if townHooked, err := townB.List(beads.ListOptions{
-			Status:   beads.StatusHooked,
-			Assignee: agentID,
-			Priority: -1,
-		}); err == nil && len(townHooked) > 0 {
-			hookedBeads = townHooked
-		} else if townIP, err := townB.List(beads.ListOptions{
-			Status:   "in_progress",
-			Assignee: agentID,
-			Priority: -1,
-		}); err == nil && len(townIP) > 0 {
-			hookedBeads = townIP
+		if townWork, err := listAssignedActiveWork(townB, agentID); err == nil && len(townWork) > 0 {
+			hookedBeads = townWork
 		}
 		// Town-level fallback errors are non-fatal — rig-level query succeeded
 	}
@@ -922,6 +897,7 @@ func rigBeadsRoot(ctx RoleContext) string {
 // outputAutonomousDirective displays the AUTONOMOUS WORK MODE header and instructions.
 func outputAutonomousDirective(ctx RoleContext, hookedBead *beads.Issue, hasMolecule bool) {
 	roleAnnounce := buildRoleAnnouncement(ctx)
+	_, isForkRig, _ := roleRigContext(ctx)
 
 	fmt.Println()
 	fmt.Printf("%s\n\n", style.Bold.Render("## 🚨 AUTONOMOUS WORK MODE 🚨"))
@@ -950,8 +926,13 @@ func outputAutonomousDirective(ctx RoleContext, hookedBead *beads.Issue, hasMole
 	// Without it, work lands but sessions accumulate and the merge queue stalls.
 	if ctx.Role == RolePolecat {
 		fmt.Println()
-		fmt.Printf("**⚠️ MANDATORY: When all work is committed, run `%s done` to submit and exit.**\n", cli.Name())
-		fmt.Printf("Do NOT stop at the prompt. Do NOT push to main directly. `%s done` is your final action.\n", cli.Name())
+		if isForkRig {
+			fmt.Println("**⚠️ FORK-BACKED RIG: do not submit to the Refinery merge queue.**")
+			fmt.Println("Push branches to the fork remote and use a GitHub PR/no-merge workflow against upstream unless the assignment explicitly says otherwise.")
+		} else {
+			fmt.Printf("**⚠️ MANDATORY: When all work is committed, run `%s done` to submit and exit.**\n", cli.Name())
+			fmt.Printf("Do NOT stop at the prompt. Do NOT push to main directly. `%s done` is your final action.\n", cli.Name())
+		}
 	}
 
 	fmt.Println()
@@ -964,8 +945,13 @@ func outputAutonomousDirective(ctx RoleContext, hookedBead *beads.Issue, hasMole
 		fmt.Println("- Skip molecule steps or work on the base bead directly")
 	}
 	if ctx.Role == RolePolecat {
-		fmt.Printf("- Sit idle after committing (run `%s done`)\n", cli.Name())
-		fmt.Println("- Push directly to main (use the merge queue)")
+		if isForkRig {
+			fmt.Println("- Use the Refinery/MQ for upstream changes in this fork-backed rig")
+			fmt.Println("- Push directly to upstream main")
+		} else {
+			fmt.Printf("- Sit idle after committing (run `%s done`)\n", cli.Name())
+			fmt.Println("- Push directly to main (use the merge queue)")
+		}
 	}
 	fmt.Println()
 }
@@ -1018,6 +1004,12 @@ func outputMoleculeWorkflow(ctx RoleContext, attachment *beads.AttachmentFields)
 
 	// Show inline formula steps from the embedded binary (root-only: no child wisps to query).
 	if attachment.AttachedFormula != "" {
+		if _, isForkRig, _ := roleRigContext(ctx); isForkRig && ctx.Role == RolePolecat {
+			fmt.Printf("%s\n", style.Bold.Render("FORK-BACKED RIG OVERRIDE"))
+			fmt.Printf("Formula %q is attached, but its embedded polecat checklist is not rendered because it contains local Refinery/MQ completion steps.\n", attachment.AttachedFormula)
+			fmt.Println("Use the hooked bead and assignment-specific GitHub PR/no-merge workflow as the source of truth for completion.")
+			return nil
+		}
 		showFormulaStepsFull(attachment.AttachedFormula, ctx.TownRoot, ctx.Rig, attachmentFormulaVars(attachment))
 		fmt.Println()
 		fmt.Printf("%s\n", style.Bold.Render("Work through ALL steps above, including submit and cleanup."))
@@ -1311,12 +1303,30 @@ func ensureBeadsRedirect(ctx RoleContext) {
 		if _, statErr := os.Stat(redirectPath); statErr == nil {
 			return
 		}
-	} else if data, readErr := os.ReadFile(redirectPath); readErr == nil && strings.TrimSpace(string(data)) == expected {
+	} else if data, readErr := os.ReadFile(redirectPath); readErr == nil && strings.TrimSpace(string(data)) == expected && !worktreeBeadsNeedsCleanup(ctx.WorkDir) {
 		return
 	}
 
 	// Use shared helper - silently ignore errors during prime
 	_ = beads.SetupRedirect(ctx.TownRoot, ctx.WorkDir)
+}
+
+func worktreeBeadsNeedsCleanup(workDir string) bool {
+	beadsDir := filepath.Join(workDir, ".beads")
+	if info, err := os.Lstat(beadsDir); err == nil {
+		if !info.IsDir() {
+			return true
+		}
+	} else {
+		return false
+	}
+
+	for _, name := range []string{"metadata.json", "config.yaml"} {
+		if _, err := os.Lstat(filepath.Join(beadsDir, name)); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // injectWorkContext extracts the current work context (rig, bead, molecule) from the

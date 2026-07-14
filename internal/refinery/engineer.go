@@ -211,6 +211,9 @@ type MRInfo struct {
 	Title           string     // MR title
 	Priority        int        // Priority (lower = higher priority)
 	AgentBead       string     // Agent bead ID that created this MR
+	CommitSHA       string     // Source branch tip submitted to the queue
+	PRURL           string     // Recorded pull request URL, if available
+	PRNumber        int        // Recorded pull request number, if available
 	RetryCount      int        // Conflict retry count
 	ConflictTaskID  string     // Open conflict-resolution task for this MR (if any)
 	ConvoyID        string     // Parent convoy ID if part of a convoy
@@ -785,40 +788,40 @@ func (e *Engineer) doMergePR(ctx context.Context, mr *MRInfo) ProcessResult {
 	}
 
 	// Step PR.1: Find the PR for this branch
-	prNumber, err := e.prProvider.FindPRNumber(branch)
+	pr, err := e.prProvider.FindPullRequest(branch, mr.PRURL, mr.PRNumber, mr.CommitSHA)
 	if err != nil {
 		return ProcessResult{
 			Success: false,
 			Error:   fmt.Sprintf("failed to find PR for branch %s: %v", branch, err),
 		}
 	}
-	if prNumber == 0 {
+	if pr == nil {
 		return ProcessResult{
 			Success: false,
 			Error:   fmt.Sprintf("no open PR found for branch %s — merge_strategy=pr requires a PR", branch),
 		}
 	}
-	_, _ = fmt.Fprintf(e.output, "[Engineer] Found PR #%d for branch %s\n", prNumber, branch)
+	_, _ = fmt.Fprintf(e.output, "[Engineer] Found PR #%d for branch %s\n", pr.Number, branch)
 
 	// Step PR.2: Check approval status if require_review is enabled
 	requireReview := e.config.RequireReview != nil && *e.config.RequireReview
 	if requireReview {
-		approved, err := e.prProvider.IsPRApproved(prNumber)
+		approved, err := e.prProvider.IsPRApproved(pr)
 		if err != nil {
 			return ProcessResult{
 				Success: false,
-				Error:   fmt.Sprintf("failed to check PR #%d approval status: %v", prNumber, err),
+				Error:   fmt.Sprintf("failed to check PR #%d approval status: %v", pr.Number, err),
 			}
 		}
 		if !approved {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d awaiting human approval — deferring merge\n", prNumber)
+			_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d awaiting human approval — deferring merge\n", pr.Number)
 			return ProcessResult{
 				Success:       false,
 				NeedsApproval: true,
-				Error:         fmt.Sprintf("PR #%d requires approving review before merge", prNumber),
+				Error:         fmt.Sprintf("PR #%d requires approving review before merge", pr.Number),
 			}
 		}
-		_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d has approving review\n", prNumber)
+		_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d has approving review\n", pr.Number)
 	}
 
 	if eligibility := e.recheckMRStillMergeable(mr, target); !eligibility.Success {
@@ -826,12 +829,12 @@ func (e *Engineer) doMergePR(ctx context.Context, mr *MRInfo) ProcessResult {
 	}
 
 	// Step PR.3: Merge via VCS provider API using squash merge
-	_, _ = fmt.Fprintf(e.output, "[Engineer] Merging PR #%d via %s API (squash)...\n", prNumber, provider)
-	mergeCommit, err := e.prProvider.MergePR(prNumber, "squash")
+	_, _ = fmt.Fprintf(e.output, "[Engineer] Merging PR #%d via %s API (squash)...\n", pr.Number, provider)
+	mergeCommit, err := e.prProvider.MergePR(pr, "squash")
 	if err != nil {
 		return ProcessResult{
 			Success: false,
-			Error:   fmt.Sprintf("PR merge failed for PR #%d: %v", prNumber, err),
+			Error:   fmt.Sprintf("PR merge failed for PR #%d: %v", pr.Number, err),
 		}
 	}
 
@@ -854,7 +857,7 @@ func (e *Engineer) doMergePR(ctx context.Context, mr *MRInfo) ProcessResult {
 		}
 	}
 
-	_, _ = fmt.Fprintf(e.output, "[Engineer] Successfully merged PR #%d: %s\n", prNumber, shortSHA(mergeCommit))
+	_, _ = fmt.Fprintf(e.output, "[Engineer] Successfully merged PR #%d: %s\n", pr.Number, shortSHA(mergeCommit))
 	return ProcessResult{
 		Success:     true,
 		MergeCommit: mergeCommit,
@@ -1348,6 +1351,13 @@ func (e *Engineer) ProcessMRInfo(ctx context.Context, mr *MRInfo) ProcessResult 
 
 // HandleMRInfoSuccess handles a successful merge from MRInfo.
 func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
+	workBeadID := resolveMergedWorkBead(e.beads.ForAgentBead(), mergedWorkBeadCloseRequest{
+		MRID:        mr.ID,
+		Branch:      mr.Branch,
+		SourceIssue: mr.SourceIssue,
+		AgentBead:   mr.AgentBead,
+	})
+
 	// Release merge slot if this was a conflict resolution
 	// The slot is held while conflict resolution is in progress
 	holder := e.rig.Name + "/refinery"
@@ -1361,64 +1371,24 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 
 	// Update and close the MR bead
 	if mr.ID != "" {
-		// Fetch the MR bead to update its fields
-		mrBead, err := e.beads.Show(mr.ID)
-		if err != nil {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to fetch MR bead %s: %v\n", mr.ID, err)
-		} else {
-			// Update MR with merge_commit SHA and close_reason
-			mrFields := beads.ParseMRFields(mrBead)
-			if mrFields == nil {
-				mrFields = &beads.MRFields{}
-			}
-			mrFields.MergeCommit = result.MergeCommit
-			mrFields.CloseReason = "merged"
-			newDesc := beads.SetMRFields(mrBead, mrFields)
-			if err := e.beads.Update(mr.ID, beads.UpdateOptions{Description: &newDesc}); err != nil {
-				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to update MR %s with merge commit: %v\n", mr.ID, err)
-			}
-		}
-
-		// Close MR bead with reason 'merged'
-		if err := e.beads.CloseWithReason("merged", mr.ID); err != nil {
+		if err := e.closeMRWithReason(mr, string(CloseReasonMerged), result.MergeCommit); err != nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to close MR %s: %v\n", mr.ID, err)
-		} else {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] Closed MR bead: %s\n", mr.ID)
 		}
 	}
 
-	// 1. Close source issue with reference to MR.
-	// Use ForceCloseWithReason to bypass dependency checks — the source issue
-	// may have an attached molecule (wisp) whose open steps would block a
-	// normal close. This matches how gt done handles closures.
-	if mr.SourceIssue != "" {
-		closeReason := fmt.Sprintf("Merged in %s", mr.ID)
-		if result.MergeCommit != "" {
-			closeReason = fmt.Sprintf("%s\ntarget_branch: %s\ncommit_sha: %s", closeReason, mr.Target, result.MergeCommit)
-		}
-		if err := e.beads.ForceCloseWithReason(closeReason, mr.SourceIssue); err != nil {
-			// Check if already closed (by polecat's gt done) — that's fine
-			if issue, showErr := e.beads.Show(mr.SourceIssue); showErr == nil && beads.IssueStatus(issue.Status).IsTerminal() {
-				_, _ = fmt.Fprintf(e.output, "[Engineer] Source issue already closed: %s\n", mr.SourceIssue)
-			} else {
-				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to close source issue %s: %v\n", mr.SourceIssue, err)
-			}
-		} else {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] Closed source issue: %s\n", mr.SourceIssue)
-		}
-	}
+	// 1. Close source issue with reference to MR. Resolve before MR close clears
+	// active_mr, then close after the real merge success has been recorded.
+	closeMergedWorkBead(e.beads, nil, e.output, mergedWorkBeadCloseRequest{
+		MRID:        mr.ID,
+		Target:      mr.Target,
+		SourceIssue: workBeadID,
+		MergeCommit: result.MergeCommit,
+	})
 
 	// 1.2. Close conflict-resolution tasks that this land has made moot (hq-jnap).
 	// Conflict beads otherwise outlive the successful re-land of their content
 	// and rot as open issues (re-dlcs/re-4i3b/re-gcii pattern).
 	e.closeSupersededConflictArtifacts(mr)
-
-	// 1.5. Clear agent bead's active_mr reference (traceability cleanup)
-	if mr.AgentBead != "" {
-		if err := e.clearAgentActiveMR(mr.AgentBead); err != nil {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to clear agent bead %s active_mr: %v\n", mr.AgentBead, err)
-		}
-	}
 
 	// 2. Delete source branch (local and remote).
 	// Polecat branches (polecat/*) are always cleaned up — they are ephemeral
@@ -1439,7 +1409,7 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 		// be closed via gh pr merge (showing "merged"), not via branch deletion
 		// (which shows "closed" and destroys the PR audit trail).
 		if isPolecat {
-			if e.git.HasOpenPR(mr.Branch) {
+			if e.git.HasOpenPullRequest(git.PullRequestRef{URL: mr.PRURL, Number: mr.PRNumber, Branch: mr.Branch, HeadSHA: mr.CommitSHA}) {
 				_, _ = fmt.Fprintf(e.output, "[Engineer] Skipping remote branch delete for %s: open PR exists (gas-fk4)\n", mr.Branch)
 			} else if err := e.git.DeleteRemoteBranch("origin", mr.Branch); err != nil {
 				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to delete remote branch %s: %v\n", mr.Branch, err)
@@ -1467,10 +1437,6 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 
 	// 5. Log success
 	_, _ = fmt.Fprintf(e.output, "[Engineer] ✓ Merged: %s (commit: %s)\n", mr.ID, result.MergeCommit)
-}
-
-func (e *Engineer) clearAgentActiveMR(agentBeadID string) error {
-	return e.beads.ForAgentBead().UpdateAgentActiveMR(agentBeadID, "")
 }
 
 // HandleMRInfoFailure handles a failed merge from MRInfo.
@@ -1600,42 +1566,43 @@ func (e *Engineer) closeIneligibleMR(mr *MRInfo, reason string) error {
 	return e.closeMRWithReason(mr, "rejected: "+reason)
 }
 
-func (e *Engineer) closeMRWithReason(mr *MRInfo, closeReason string) error {
+func (e *Engineer) closeMRWithReason(mr *MRInfo, closeReason string, mergeCommit ...string) error {
 	if mr == nil || strings.TrimSpace(mr.ID) == "" {
 		return nil
 	}
-	issue, err := e.beads.Show(mr.ID)
+	var commit string
+	if len(mergeCommit) > 0 {
+		commit = mergeCommit[0]
+	}
+	result, err := closeTerminalMR(e.beads, mr.ID, terminalMRCloseOptions{
+		Reason:        closeReason,
+		MergeCommit:   commit,
+		AgentBeadHint: mr.AgentBead,
+		MissingOK:     true,
+	})
 	if err != nil {
-		if !errors.Is(err, beads.ErrNotFound) {
-			return fmt.Errorf("fetch MR for close: %w", err)
-		}
-		return nil
+		return err
 	}
-	if issue == nil || beads.IssueStatus(issue.Status) != beads.StatusOpen {
-		return nil
+	if result.Closed {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Closed MR bead: %s (%s)\n", mr.ID, closeReason)
 	}
-
-	fields := beads.ParseMRFields(issue)
-	if fields == nil {
-		fields = &beads.MRFields{}
+	if result.AgentActiveMRClearErr != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to clear agent bead %s active_mr: %v\n", result.AgentBead, result.AgentActiveMRClearErr)
 	}
-	fields.CloseReason = normalizedMRCloseReason(closeReason)
-	newDesc := beads.SetMRFields(issue, fields)
-	if err := e.beads.Update(mr.ID, beads.UpdateOptions{Description: &newDesc}); err != nil {
-		return fmt.Errorf("record MR close reason: %w", err)
-	}
-
-	if err := e.beads.CloseWithReason(closeReason, mr.ID); err != nil {
-		return fmt.Errorf("close MR: %w", err)
-	}
-	_, _ = fmt.Fprintf(e.output, "[Engineer] Closed MR bead: %s (%s)\n", mr.ID, closeReason)
 	return nil
 }
 
 func normalizedMRCloseReason(closeReason string) string {
 	closeReason = strings.TrimSpace(closeReason)
-	if strings.HasPrefix(strings.ToLower(closeReason), "rejected:") {
+	lower := strings.ToLower(closeReason)
+	if strings.HasPrefix(lower, "rejected:") {
 		return string(CloseReasonRejected)
+	}
+	if strings.HasPrefix(lower, "superseded") {
+		return string(CloseReasonSuperseded)
+	}
+	if strings.HasPrefix(lower, "conflict") {
+		return string(CloseReasonConflict)
 	}
 	return closeReason
 }
@@ -1817,7 +1784,7 @@ func (e *Engineer) closeSupersededConflictArtifacts(merged *MRInfo) {
 			continue
 		}
 		reason := fmt.Sprintf("superseded by %s", merged.ID)
-		if err := e.beads.CloseWithReason(reason, other.ID); err != nil {
+		if err := e.closeMRWithReason(other, reason); err != nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to close superseded MR %s: %v\n", other.ID, err)
 		} else {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Closed superseded MR %s: %s\n", other.ID, reason)
@@ -1931,6 +1898,9 @@ func issueToMRInfo(issue *beads.Issue, fields *beads.MRFields) *MRInfo {
 		Title:           issue.Title,
 		Priority:        issue.Priority,
 		AgentBead:       fields.AgentBead,
+		CommitSHA:       fields.CommitSHA,
+		PRURL:           fields.PRURL,
+		PRNumber:        fields.PRNumber,
 		RetryCount:      fields.RetryCount,
 		ConflictTaskID:  fields.ConflictTaskID,
 		ConvoyID:        fields.ConvoyID,
@@ -2441,7 +2411,9 @@ func (e *Engineer) notifyConvoyCompletion(townRoot, convoyID, title, description
 	for _, addr := range fields.NotificationAddresses() {
 		mailCmd := exec.Command("gt", "mail", "send", addr,
 			"-s", fmt.Sprintf("🚚 Convoy landed: %s", title),
-			"-m", fmt.Sprintf("Convoy %s has completed.\n\nAll tracked issues are now closed.\n\nClosed by: %s/refinery", convoyID, e.rig.Name))
+			"-m", fmt.Sprintf("Convoy %s has completed.\n\nAll tracked issues are now closed.\n\nClosed by: %s/refinery", convoyID, e.rig.Name),
+			"--from", "convoy/"+convoyID,
+			"--no-notify")
 		util.SetDetachedProcessGroup(mailCmd)
 		mailCmd.Dir = townRoot
 		if err := mailCmd.Run(); err != nil {

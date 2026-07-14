@@ -187,6 +187,7 @@ type Issue struct {
 	UpdatedAt   string   `json:"updated_at"`
 	ClosedAt    string   `json:"closed_at,omitempty"`
 	Parent      string   `json:"parent,omitempty"`
+	ExternalRef string   `json:"external_ref,omitempty"`
 	Assignee    string   `json:"assignee,omitempty"`
 	Children    []string `json:"children,omitempty"`
 	DependsOn   []string `json:"depends_on,omitempty"`
@@ -296,11 +297,58 @@ type IssueDep struct {
 	CloseReason    string `json:"close_reason,omitempty"`
 }
 
+// UnmarshalJSON accepts both bd dependency relation field names. Some lower-level
+// dependency output uses "type" for the relation, while issue details also have
+// an issue_type field that must remain distinct.
+func (d *IssueDep) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		ID             string `json:"id"`
+		Title          string `json:"title"`
+		Status         string `json:"status"`
+		Priority       int    `json:"priority"`
+		Type           string `json:"issue_type"`
+		DependencyType string `json:"dependency_type,omitempty"`
+		RelationType   string `json:"type"`
+		CloseReason    string `json:"close_reason,omitempty"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	d.ID = raw.ID
+	d.Title = raw.Title
+	d.Status = raw.Status
+	d.Priority = raw.Priority
+	d.Type = raw.Type
+	d.DependencyType = raw.DependencyType
+	d.CloseReason = raw.CloseReason
+	if strings.TrimSpace(d.DependencyType) == "" {
+		d.DependencyType = knownDependencyRelation(raw.RelationType)
+	}
+	return nil
+}
+
 var blockingDependencyTypes = map[string]bool{
 	"blocks":             true,
 	"conditional-blocks": true,
 	"waits-for":          true,
 	"merge-blocks":       true,
+}
+
+var nonblockingDependencyTypes = map[string]bool{
+	"tracks":          true,
+	"parent-child":    true,
+	"related":         true,
+	"discovered-from": true,
+	"thread":          true,
+}
+
+func knownDependencyRelation(depType string) string {
+	depType = strings.ToLower(strings.TrimSpace(depType))
+	if blockingDependencyTypes[depType] || nonblockingDependencyTypes[depType] {
+		return depType
+	}
+	return ""
 }
 
 // HasUnresolvedBlockers reports whether an issue has any unresolved blocking
@@ -949,7 +997,7 @@ func stripEnvPrefixes(environ []string, prefixes ...string) []string {
 // wisps table (where ephemeral issues live in beads v0.59+). Without this,
 // "bd list" only searches the issues table and misses wisps entirely.
 func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
-	if b.store != nil && !opts.Ephemeral {
+	if b.store != nil {
 		return b.storeList(opts)
 	}
 	if opts.Ephemeral {
@@ -958,7 +1006,10 @@ func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
 	if err := b.syncNostrigLedgerIfEnabled(); err != nil {
 		return nil, err
 	}
+	return b.listIssues(opts)
+}
 
+func (b *Beads) listIssues(opts ListOptions) ([]*Issue, error) {
 	args := []string{"list", "--json"}
 
 	if opts.Status != "" {
@@ -1006,6 +1057,61 @@ func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
 		return nil, fmt.Errorf("parsing bd list output: %w", err)
 	}
 
+	return issues, nil
+}
+
+// ListIssueStatuses returns durable issues matching any of the supplied
+// statuses with one bd query. Summary paths use this to avoid multiplying bd
+// subprocesses by status and polecat count.
+func (b *Beads) ListIssueStatuses(statuses ...IssueStatus) ([]*Issue, error) {
+	if len(statuses) == 0 {
+		return nil, nil
+	}
+	unique := make([]IssueStatus, 0, len(statuses))
+	seen := make(map[IssueStatus]bool, len(statuses))
+	for _, status := range statuses {
+		if status == "" || seen[status] {
+			continue
+		}
+		seen[status] = true
+		unique = append(unique, status)
+	}
+	if len(unique) == 0 {
+		return nil, nil
+	}
+
+	if b.store != nil {
+		var all []*Issue
+		for _, status := range unique {
+			issues, err := b.storeList(ListOptions{Status: string(status), Priority: -1})
+			if err != nil {
+				return nil, err
+			}
+			all = append(all, issues...)
+		}
+		return all, nil
+	}
+
+	statusClauses := make([]string, 0, len(unique))
+	for _, status := range unique {
+		statusClauses = append(statusClauses, "status="+quoteBDQueryValue(string(status)))
+	}
+	expr := "ephemeral=false AND (" + strings.Join(statusClauses, " OR ") + ")"
+	out, err := b.run("query", "--json", expr, "--all", "--limit=0")
+	if err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	if !isJSONBytes(out) {
+		return nil, fmt.Errorf("bd query returned non-JSON output")
+	}
+
+	var issues []*Issue
+	if err := json.Unmarshal(out, &issues); err != nil {
+		return nil, fmt.Errorf("parsing bd query output: %w", err)
+	}
 	return issues, nil
 }
 

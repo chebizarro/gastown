@@ -192,7 +192,7 @@ bd update gt-rig-myrig --labels="polecat_branch_template:adam/{year}/{month}/{de
 **Default Behavior (backward compatible):**
 
 When `polecat_branch_template` is empty or not set:
-- With issue: `polecat/{name}/{issue}@{timestamp}`
+- With issue: `polecat/{name}/{issue}+{timestamp}`
 - Without issue: `polecat/{name}-{timestamp}`
 
 **Example Configurations:**
@@ -260,8 +260,8 @@ with = "macro-formula"
 ```
 1. Work through formula checklist (shown inline by gt prime)
 2. Submit to merge queue via gt done
-3. gt done nukes sandbox and exits
-4. Witness removes worktree + branch
+3. gt done preserves branch/MR metadata and exits the session
+4. Witness/refinery cleanup handles any retired sandbox state
 ```
 
 ### Session Cycling

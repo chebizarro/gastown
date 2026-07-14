@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -21,6 +22,78 @@ import (
 	"github.com/steveyegge/gastown/internal/testutil"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
+
+func TestHasSubmittableWorkForWorkstateUsesBranchTargetStatus(t *testing.T) {
+	repo := setupManagerSquashPreservedRepo(t)
+	if got := hasSubmittableWorkForWorkstate(repo, []string{"integration/test"}); got {
+		t.Fatal("squash-preserved branch should not require MQ submission through manager workstate helper")
+	}
+
+	managerWriteFile(t, filepath.Join(repo, "feature.txt"), "one\ntwo\nthree\n")
+	runManagerGit(t, repo, "add", "feature.txt")
+	runManagerGit(t, repo, "commit", "-m", "extra local work")
+	if got := hasSubmittableWorkForWorkstate(repo, []string{"integration/test"}); !got {
+		t.Fatal("new local work after squash preservation should still require MQ submission")
+	}
+}
+
+func setupManagerSquashPreservedRepo(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	repo := filepath.Join(root, "repo")
+	runManagerGit(t, root, "init", "--bare", remote)
+	if err := os.MkdirAll(repo, 0755); err != nil {
+		t.Fatal(err)
+	}
+	runManagerGit(t, repo, "init")
+	runManagerGit(t, repo, "config", "user.email", "test@example.com")
+	runManagerGit(t, repo, "config", "user.name", "Test User")
+	managerWriteFile(t, filepath.Join(repo, "README.md"), "base\n")
+	runManagerGit(t, repo, "add", "README.md")
+	runManagerGit(t, repo, "commit", "-m", "base")
+	runManagerGit(t, repo, "branch", "-M", "main")
+	runManagerGit(t, repo, "remote", "add", "origin", remote)
+	runManagerGit(t, repo, "push", "-u", "origin", "main")
+	runManagerGit(t, repo, "switch", "-c", "integration/test")
+	runManagerGit(t, repo, "push", "-u", "origin", "integration/test")
+	if err := exec.Command("git", "-C", repo, "merge-tree", "--write-tree", "HEAD", "HEAD").Run(); err != nil {
+		t.Skipf("git merge-tree --write-tree unsupported: %v", err)
+	}
+
+	runManagerGit(t, repo, "switch", "-c", "polecat/squash")
+	managerWriteFile(t, filepath.Join(repo, "feature.txt"), "one\n")
+	runManagerGit(t, repo, "add", "feature.txt")
+	runManagerGit(t, repo, "commit", "-m", "checkpoint one")
+	managerWriteFile(t, filepath.Join(repo, "feature.txt"), "one\ntwo\n")
+	runManagerGit(t, repo, "add", "feature.txt")
+	runManagerGit(t, repo, "commit", "-m", "checkpoint two")
+	runManagerGit(t, repo, "switch", "integration/test")
+	runManagerGit(t, repo, "merge", "--squash", "polecat/squash")
+	runManagerGit(t, repo, "commit", "-m", "squash polecat work")
+	managerWriteFile(t, filepath.Join(repo, "target.txt"), "target advanced\n")
+	runManagerGit(t, repo, "add", "target.txt")
+	runManagerGit(t, repo, "commit", "-m", "advance target")
+	runManagerGit(t, repo, "push", "origin", "integration/test")
+	runManagerGit(t, repo, "switch", "polecat/squash")
+	return repo
+}
+
+func managerWriteFile(t *testing.T, path, data string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func runManagerGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
+	}
+}
 
 // installMockBd places a fake bd binary in PATH that handles the commands
 // needed by AddWithOptions (init, create, show, config, update, slot, etc.).
@@ -53,8 +126,8 @@ switch ($cmd) {
     exit 0
   }
   'show' {
-    Write-Error '{"error":"not found"}'
-    exit 1
+			Write-Output '[{"id":"gt-gastown-polecat-toast","title":"agent","issue_type":"agent","description":"agent\n\nrole_type: polecat\nagent_state: idle\nhook_bead: null\ncleanup_status: clean\nactive_mr: null\nbranch: polecat/toast/gt-work@abc123","status":"open","created_at":"2025-01-01T00:00:00Z"}]'
+			exit 0
   }
   default { exit 0 }
 }
@@ -103,7 +176,7 @@ case "$cmd" in
       id="$arg"
       break
     done
-    printf '[{"id":"%s","title":"agent","issue_type":"agent","description":"agent\\n\\nrole_type: polecat\\nagent_state: idle\\nhook_bead: null\\ncleanup_status: clean"}]\n' "$id"
+    printf '[{"id":"%s","title":"agent","issue_type":"agent","description":"agent\\n\\nrole_type: polecat\\nagent_state: idle\\nhook_bead: null\\ncleanup_status: clean\\nactive_mr: null\\nbranch: polecat/toast/gt-work@abc123"}]\n' "$id"
     exit 0
     ;;
   *)
@@ -114,6 +187,37 @@ esac
 		if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
 			t.Fatalf("write mock bd: %v", err)
 		}
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func installEmptyMockBd(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mock for bd")
+	}
+
+	binDir := t.TempDir()
+	script := `#!/bin/sh
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    --*) ;;
+    *) cmd="$arg"; break ;;
+  esac
+done
+case "$cmd" in
+  show|list)
+    printf '[]\n'
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+		t.Fatalf("write mock bd: %v", err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
@@ -197,6 +301,56 @@ func createStalePolecatCommit(t *testing.T, repoPath, startPoint, branchName str
 		t.Fatalf("resolve stale branch commit: %v", err)
 	}
 	return sha
+}
+
+func TestManagerGetMapsDoneAgentStateFromBead(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script bd stub not supported on Windows")
+	}
+
+	binDir := t.TempDir()
+	bdScript := `#!/bin/sh
+cmd=""
+for arg in "$@"; do
+  case "$arg" in --*) ;; *) cmd="$arg"; break ;; esac
+done
+case "$cmd" in
+  list)
+    echo '[]'
+    ;;
+  show)
+    printf '%s\n' '[{"id":"gt-testrig-polecat-toast","title":"agent","issue_type":"agent","status":"open","description":"agent\n\nrole_type: polecat\nrig: testrig\nagent_state: done\nhook_bead: null\ncleanup_status: clean"}]'
+    ;;
+  config|update|slot)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(bdScript), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	if err := os.MkdirAll(filepath.Join(rigPath, "polecats", "toast", "testrig"), 0755); err != nil {
+		t.Fatalf("mkdir polecat path: %v", err)
+	}
+
+	mgr := NewManager(&rig.Rig{Name: "testrig", Path: rigPath}, git.NewGit(rigPath), nil)
+	p, err := mgr.Get("toast")
+	if err != nil {
+		t.Fatalf("mgr.Get(toast): %v", err)
+	}
+	if p.State != StateDone {
+		t.Fatalf("polecat state = %q, want %q", p.State, StateDone)
+	}
+	if p.Issue != "" {
+		t.Fatalf("polecat issue = %q, want empty", p.Issue)
+	}
 }
 
 func TestStateIsWorking(t *testing.T) {
@@ -1097,7 +1251,7 @@ func TestBuildBranchName(t *testing.T) {
 			name:     "default_with_issue",
 			template: "", // Empty template = default behavior
 			issue:    "gt-123",
-			want:     "polecat/alpha/gt-123@", // timestamp suffix varies
+			want:     "polecat/alpha/gt-123+", // timestamp suffix varies
 		},
 		{
 			name:     "default_without_issue",
@@ -1174,6 +1328,44 @@ func TestBuildBranchName(t *testing.T) {
 	}
 }
 
+func TestBuildBranchName_ClaudeActionCompatible(t *testing.T) {
+	tmpDir := t.TempDir()
+	gitCmd := exec.Command("git", "init")
+	gitCmd.Dir = tmpDir
+	if err := gitCmd.Run(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+
+	r := &rig.Rig{Name: "test-rig", Path: tmpDir}
+	g := git.NewGit(tmpDir)
+	m := NewManager(r, g, nil)
+
+	validator := regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9/_.#+,-]*$`)
+	cases := []struct {
+		name    string
+		polecat string
+		issue   string
+	}{
+		{name: "simple issue", polecat: "mutant", issue: "gt-abc"},
+		{name: "dotted subtask", polecat: "raider", issue: "gt-4kp9.5.5.1"},
+		{name: "hq prefix", polecat: "pipboy", issue: "hq-571c"},
+		{name: "no issue", polecat: "ghoul", issue: ""},
+		{name: "long polecat name", polecat: "thunderchief", issue: "gt-jns7.1"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := m.buildBranchName(c.polecat, c.issue)
+			if strings.Contains(got, "@") {
+				t.Fatalf("buildBranchName(%q, %q) = %q contains @", c.polecat, c.issue, got)
+			}
+			if !validator.MatchString(got) {
+				t.Fatalf("buildBranchName(%q, %q) = %q rejected by claude-code-action head-ref validator", c.polecat, c.issue, got)
+			}
+		})
+	}
+}
+
 func TestAddWithOptions_NoPrimeMDCreatedLocally(t *testing.T) {
 	// This test verifies that ProvisionPrimeMDForWorktree does NOT create
 	// a local .beads/PRIME.md in the worktree when there's no tracked one.
@@ -1218,8 +1410,8 @@ func TestAddWithOptions_NoPrimeMDCreatedLocally(t *testing.T) {
 		}
 	} else {
 		installMockBd(t)
-		// Write the custom-types sentinel so EnsureCustomTypes is a no-op.
-		_ = os.WriteFile(filepath.Join(mayorBeads, ".gt-types-configured"), []byte("v1\n"), 0644)
+		// Write the type-config sentinel so EnsureCustomTypes is a no-op.
+		_ = os.WriteFile(filepath.Join(mayorBeads, ".gt-types-configured"), []byte(beads.TypeConfigSentinelValue()+"\n"), 0644)
 	}
 
 	// Initialize git repo in mayor/rig WITHOUT any .beads/PRIME.md
@@ -1479,7 +1671,7 @@ func TestReuseIdlePolecat_UsesCanonicalOriginDefaultBranch(t *testing.T) {
 
 // TestAddWithOptions_ResumeBranch verifies gh#3602: when ResumeBranch is set,
 // AddWithOptions checks out the named existing branch instead of creating a
-// fresh polecat/<name>/<bead>@<ts> branch. This lets `gt sling --branch/--pr`
+// fresh polecat/<name>/<bead>+<ts> branch. This lets `gt sling --branch/--pr`
 // resume work on an existing PR branch without creating duplicates.
 func TestAddWithOptions_ResumeBranch(t *testing.T) {
 	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
@@ -1568,8 +1760,8 @@ func TestAddWithOptions_NoFilesAddedToRepo(t *testing.T) {
 		}
 	} else {
 		installMockBd(t)
-		// Write the custom-types sentinel so EnsureCustomTypes is a no-op.
-		_ = os.WriteFile(filepath.Join(mayorBeads, ".gt-types-configured"), []byte("v1\n"), 0644)
+		// Write the type-config sentinel so EnsureCustomTypes is a no-op.
+		_ = os.WriteFile(filepath.Join(mayorBeads, ".gt-types-configured"), []byte(beads.TypeConfigSentinelValue()+"\n"), 0644)
 	}
 
 	// Initialize a CLEAN git repo with known files only
@@ -1714,8 +1906,8 @@ func TestAddWithOptions_SettingsInstalledInPolecatsDir(t *testing.T) {
 		}
 	} else {
 		installMockBd(t)
-		// Write the custom-types sentinel so EnsureCustomTypes is a no-op.
-		_ = os.WriteFile(filepath.Join(mayorBeads, ".gt-types-configured"), []byte("v1\n"), 0644)
+		// Write the type-config sentinel so EnsureCustomTypes is a no-op.
+		_ = os.WriteFile(filepath.Join(mayorBeads, ".gt-types-configured"), []byte(beads.TypeConfigSentinelValue()+"\n"), 0644)
 	}
 
 	// Initialize a git repo
@@ -1926,6 +2118,98 @@ func TestStalePendingMarkerIsCleanedUp(t *testing.T) {
 	}
 }
 
+func TestCleanupOrphanPolecatStatePreservesUnverifiedBrokenPolecat(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	r := &rig.Rig{Name: "myrig", Path: tmpDir}
+	m := NewManager(r, nil, nil)
+
+	polecatDir := filepath.Join(tmpDir, "polecats", "furiosa")
+	clonePath := filepath.Join(polecatDir, r.Name)
+	if err := os.MkdirAll(clonePath, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	m.cleanupOrphanPolecatState()
+
+	if _, err := os.Stat(polecatDir); err != nil {
+		t.Fatalf("broken named polecat dir was removed without safety proof: %v", err)
+	}
+}
+
+func TestCleanupOrphanPolecatStatePreservesOldLayoutWorktree(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed")
+	}
+	installEmptyMockBd(t)
+
+	tmpDir := t.TempDir()
+	r := &rig.Rig{Name: "myrig", Path: tmpDir}
+	m := NewManager(r, nil, tmux.NewTmux())
+
+	polecatDir := filepath.Join(tmpDir, "polecats", "furiosa")
+	if err := os.MkdirAll(polecatDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(polecatDir, ".git"), []byte("gitdir: /tmp/nonexistent-for-layout-test\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(polecatDir, "sentinel.txt")
+	if err := os.WriteFile(sentinel, []byte("old layout worktree\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m.cleanupOrphanPolecatState()
+
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("old-layout worktree was removed by orphan cleanup: %v", err)
+	}
+}
+
+func TestReclaimBrokenIdlePolecatRemovesCleanStructuralFailure(t *testing.T) {
+	mgr, _ := setupCanonicalBranchManagerTest(t)
+	mgr.tmux = tmux.NewTmux()
+	if !mgr.tmux.IsAvailable() {
+		t.Skip("tmux is required to prove no live polecat session")
+	}
+
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	if err := os.Remove(filepath.Join(p.ClonePath, ".git")); err != nil {
+		t.Fatalf("break worktree .git: %v", err)
+	}
+
+	if err := mgr.ReclaimBrokenIdlePolecat("toast"); err != nil {
+		t.Fatalf("ReclaimBrokenIdlePolecat: %v", err)
+	}
+	if _, err := os.Stat(mgr.polecatDir("toast")); !os.IsNotExist(err) {
+		t.Fatalf("polecat dir still exists after reclaim, stat err=%v", err)
+	}
+}
+
+func TestReclaimBrokenIdlePolecatFailsClosedWithoutSessionEvidence(t *testing.T) {
+	mgr, _ := setupCanonicalBranchManagerTest(t)
+
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	if err := os.Remove(filepath.Join(p.ClonePath, ".git")); err != nil {
+		t.Fatalf("break worktree .git: %v", err)
+	}
+
+	err = mgr.ReclaimBrokenIdlePolecat("toast")
+	if err == nil || !strings.Contains(err.Error(), "session_state=unverified") {
+		t.Fatalf("ReclaimBrokenIdlePolecat error = %v, want session evidence blocker", err)
+	}
+	if _, statErr := os.Stat(mgr.polecatDir("toast")); statErr != nil {
+		t.Fatalf("polecat dir should be preserved after blocked reclaim: %v", statErr)
+	}
+}
+
 // TestAddWithOptions_RollbackReleasesName verifies that when AddWithOptions fails,
 // the allocated name is released back to the pool and the polecat directory is cleaned up.
 // Regression test for gt-2vs22: cleanupOnError previously only removed the directory,
@@ -2116,8 +2400,8 @@ esac
 	if err := os.WriteFile(filepath.Join(rigBeads, "redirect"), []byte("mayor/rig/.beads\n"), 0644); err != nil {
 		t.Fatalf("write redirect: %v", err)
 	}
-	// Write custom-types sentinel so EnsureCustomTypes is a no-op
-	_ = os.WriteFile(filepath.Join(mayorBeads, ".gt-types-configured"), []byte("v1\n"), 0644)
+	// Write type-config sentinel so EnsureCustomTypes is a no-op
+	_ = os.WriteFile(filepath.Join(mayorBeads, ".gt-types-configured"), []byte(beads.TypeConfigSentinelValue()+"\n"), 0644)
 
 	r := &rig.Rig{
 		Name: "rig",
@@ -2201,7 +2485,7 @@ func TestManagerAgentLifecycleUsesTownBeadsDir(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("write routes: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(townBeadsDir, ".gt-types-configured"), []byte("v1\n"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(townBeadsDir, ".gt-types-configured"), []byte(beads.TypeConfigSentinelValue()+"\n"), 0644); err != nil {
 		t.Fatalf("write types sentinel: %v", err)
 	}
 

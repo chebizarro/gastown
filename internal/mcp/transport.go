@@ -74,7 +74,7 @@ func (t *SSETransport) Connect(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("connecting to MCP server: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -96,7 +96,7 @@ func (t *SSETransport) ListTools(ctx context.Context) ([]ToolRegistration, error
 	if err != nil {
 		return nil, fmt.Errorf("listing tools: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -134,7 +134,7 @@ func (t *SSETransport) CallTool(ctx context.Context, name string, args json.RawM
 	if err != nil {
 		return "", fmt.Errorf("calling tool: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
