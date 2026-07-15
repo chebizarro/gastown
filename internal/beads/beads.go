@@ -1927,6 +1927,7 @@ func (b *Beads) Update(id string, opts UpdateOptions) error {
 	}
 
 	args := []string{"update", id}
+	var stdinData []byte
 
 	if opts.Title != nil {
 		args = append(args, "--title="+*opts.Title)
@@ -1938,7 +1939,12 @@ func (b *Beads) Update(id string, opts UpdateOptions) error {
 		args = append(args, fmt.Sprintf("--priority=%d", *opts.Priority))
 	}
 	if opts.Description != nil {
-		args = append(args, "--description="+*opts.Description)
+		args = append(args, "--body-file=-")
+		stdinData = []byte(*opts.Description)
+		if *opts.Description == "" {
+			args = append(args, "--allow-empty-description")
+			stdinData = []byte{}
+		}
 	}
 	if opts.Assignee != nil {
 		args = append(args, "--assignee="+*opts.Assignee)
@@ -1957,7 +1963,7 @@ func (b *Beads) Update(id string, opts UpdateOptions) error {
 		}
 	}
 
-	if _, err := b.run(args...); err != nil {
+	if _, err := b.runWithStdin(stdinData, args...); err != nil {
 		return err
 	}
 	return b.publishNostrigUpdateIfEnabled(id, opts)
