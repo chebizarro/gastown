@@ -41,6 +41,8 @@ services:
   deacon:
     build:
       context: .
+      additional_contexts:
+        cascadia-go: ../cascadia-go
       dockerfile: Dockerfile
       args:
         VERSION: ${GT_VERSION:-dev}

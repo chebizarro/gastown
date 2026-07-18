@@ -1,12 +1,13 @@
 # syntax=docker/dockerfile:1.7
 
-FROM golang:1.25-bookworm AS builder
+FROM golang:1.26.2-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   build-essential pkg-config git ca-certificates \
   libicu-dev \
   && rm -rf /var/lib/apt/lists/*
 
+COPY --from=cascadia-go . /cascadia-go
 WORKDIR /src
 
 COPY go.mod go.sum ./
@@ -34,7 +35,7 @@ RUN go build -trimpath -o /out/gt \
 RUN GOBIN=/out go install github.com/steveyegge/beads/cmd/bd@latest
 
 
-FROM debian:bookworm-slim AS runtime
+FROM node:22-bookworm-slim AS runtime
 
 ARG CLAUDE_CODE_VERSION=latest
 ARG DOLT_VERSION=latest
@@ -53,7 +54,7 @@ ARG TARGETARCH
 # - gosu: drop privileges after fixing bind-mount ownership
 # - procps: deacon/agentloop process health checks
 RUN apt-get update && apt-get install -y --no-install-recommends \
-  ca-certificates git bash grep tmux curl libicu72 nodejs npm gosu procps \
+  ca-certificates git bash grep tmux curl libicu72 gosu procps \
   && npm install --global "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
   && case "${TARGETARCH}" in \
        amd64|arm64) dolt_arch="${TARGETARCH}" ;; \
