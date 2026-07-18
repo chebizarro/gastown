@@ -26,6 +26,26 @@ services:
       # Development defaults
       GT_NOSTR_ENABLED: "1"
       GT_LOG_LEVEL: debug
+      GT_NOSTR_WRITE_RELAYS: ws://relay:7000
+      GT_NOSTR_READ_RELAYS: ws://relay:7000
+      GT_NOSTR_BLOSSOM_SERVERS: http://blossom:3000
+
+  agentloop:
+    environment:
+      GT_NOSTR_WRITE_RELAYS: ws://relay:7000
+      GT_NOSTR_READ_RELAYS: ws://relay:7000
+      GT_NOSTR_BLOSSOM_SERVERS: http://blossom:3000
+
+  mcp:
+    environment:
+      GT_NOSTR_WRITE_RELAYS: ws://relay:7000
+      GT_NOSTR_READ_RELAYS: ws://relay:7000
+      GT_NOSTR_BLOSSOM_SERVERS: http://blossom:3000
+
+  flotilla:
+    environment:
+      VITE_FORCE_RELAYS: ws://relay:7000
+      VITE_DEFAULT_BLOSSOM: http://blossom:3000
 
   relay:
     # In dev, expose relay on a predictable port

@@ -12,6 +12,8 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 )
 
+var relayConnect = nostr.RelayConnect
+
 // RelayPool manages connections to read and write relays.
 // It handles auto-reconnection and health monitoring.
 type RelayPool struct {
@@ -27,13 +29,13 @@ type RelayPool struct {
 // It connects to all configured read and write relays.
 func NewRelayPool(ctx context.Context, cfg *config.NostrConfig) (*RelayPool, error) {
 	p := &RelayPool{
-		readURLs:  cfg.ReadRelays,
-		writeURLs: cfg.WriteRelays,
+		readURLs:  append([]string(nil), cfg.ReadRelays...),
+		writeURLs: append([]string(nil), cfg.WriteRelays...),
 	}
 
 	// Connect to write relays (required)
 	for _, url := range cfg.WriteRelays {
-		relay, err := nostr.RelayConnect(ctx, url, nostr.RelayOptions{})
+		relay, err := relayConnect(ctx, url, nostr.RelayOptions{})
 		if err != nil {
 			log.Printf("[nostr] warning: failed to connect to write relay %s: %v", url, err)
 			continue
@@ -43,7 +45,7 @@ func NewRelayPool(ctx context.Context, cfg *config.NostrConfig) (*RelayPool, err
 
 	// Connect to read relays (optional)
 	for _, url := range cfg.ReadRelays {
-		relay, err := nostr.RelayConnect(ctx, url, nostr.RelayOptions{})
+		relay, err := relayConnect(ctx, url, nostr.RelayOptions{})
 		if err != nil {
 			log.Printf("[nostr] warning: failed to connect to read relay %s: %v", url, err)
 			continue
@@ -120,31 +122,44 @@ func (p *RelayPool) Reconnect(ctx context.Context) {
 		return
 	}
 
-	// Reconnect write relays
-	for i, relay := range p.writeRelays {
-		if !relay.IsConnected() {
-			log.Printf("[nostr] reconnecting write relay %s", relay.URL)
-			newRelay, err := nostr.RelayConnect(ctx, relay.URL, nostr.RelayOptions{})
-			if err != nil {
-				log.Printf("[nostr] reconnect failed for %s: %v", relay.URL, err)
-				continue
-			}
-			p.writeRelays[i] = newRelay
+	// Iterate configured URLs rather than only the successfully connected relay
+	// slices. This also retries URLs that failed during NewRelayPool.
+	p.writeRelays = reconnectConfiguredRelays(ctx, "write", p.writeURLs, p.writeRelays)
+	p.readRelays = reconnectConfiguredRelays(ctx, "read", p.readURLs, p.readRelays)
+}
+
+func reconnectConfiguredRelays(ctx context.Context, relayType string, urls []string, relays []*nostr.Relay) []*nostr.Relay {
+	indices := make(map[string]int, len(relays))
+	for i, relay := range relays {
+		if relay != nil {
+			indices[relay.URL] = i
 		}
 	}
 
-	// Reconnect read relays
-	for i, relay := range p.readRelays {
-		if !relay.IsConnected() {
-			log.Printf("[nostr] reconnecting read relay %s", relay.URL)
-			newRelay, err := nostr.RelayConnect(ctx, relay.URL, nostr.RelayOptions{})
-			if err != nil {
-				log.Printf("[nostr] reconnect failed for %s: %v", relay.URL, err)
-				continue
+	for _, url := range urls {
+		if i, ok := indices[url]; ok && relays[i] != nil && relays[i].IsConnected() {
+			continue
+		}
+
+		log.Printf("[nostr] reconnecting %s relay %s", relayType, url)
+		newRelay, err := relayConnect(ctx, url, nostr.RelayOptions{})
+		if err != nil {
+			log.Printf("[nostr] reconnect failed for %s: %v", url, err)
+			continue
+		}
+
+		if i, ok := indices[url]; ok {
+			if relays[i] != nil {
+				_ = relays[i].Close()
 			}
-			p.readRelays[i] = newRelay
+			relays[i] = newRelay
+		} else {
+			indices[url] = len(relays)
+			relays = append(relays, newRelay)
 		}
 	}
+
+	return relays
 }
 
 // ConnectedWriteRelays returns the number of currently connected write relays.
@@ -163,7 +178,9 @@ func (p *RelayPool) ConnectedWriteRelays() int {
 
 // WriteRelayURLs returns the configured write relay URLs.
 func (p *RelayPool) WriteRelayURLs() []string {
-	return p.writeURLs
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return append([]string(nil), p.writeURLs...)
 }
 
 // HealthCheck logs the current connection status of all relays.

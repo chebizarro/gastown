@@ -37,6 +37,18 @@ func NewPublisher(ctx context.Context, cfg *config.NostrConfig, signer Signer, r
 	}, nil
 }
 
+// WithSigner returns a publisher view that signs with signer while sharing the
+// relay pool and spool. This lets role identities remain distinct without
+// opening duplicate relay connections or racing separate spool locks over the
+// same file.
+func (p *Publisher) WithSigner(signer Signer) *Publisher {
+	return &Publisher{
+		signer: signer,
+		pool:   p.pool,
+		spool:  p.spool,
+	}
+}
+
 // Publish signs and broadcasts a regular (non-replaceable) event.
 // If all relays fail, the event is spooled locally for later drain.
 // Returns an error only if both publishing and spooling fail.

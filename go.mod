@@ -3,7 +3,7 @@ module github.com/steveyegge/gastown
 go 1.26.2
 
 require (
-	fiatjaf.com/nostr v0.0.0-20260211144128-7a4b71b39b12
+	fiatjaf.com/nostr v0.0.0-20260611214214-c4534c716026
 	github.com/BurntSushi/toml v1.6.0
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
@@ -47,6 +47,7 @@ require (
 	cloud.google.com/go/storage v1.50.0 // indirect
 	dario.cat/mergo v1.0.2 // indirect
 	filippo.io/edwards25519 v1.1.1 // indirect
+	git.sharegap.net/cascadia/cascadia-go v0.0.0
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.21.0 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.13.1 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/internal v1.11.2 // indirect
@@ -270,3 +271,5 @@ require (
 	gopkg.in/src-d/go-errors.v1 v1.0.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
+
+replace git.sharegap.net/cascadia/cascadia-go => ../cascadia-go

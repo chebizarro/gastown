@@ -1718,7 +1718,6 @@ type NostrConfig struct {
 	ReadRelays     []string                  `json:"read_relays,omitempty"`     // relays to subscribe for events
 	WriteRelays    []string                  `json:"write_relays,omitempty"`    // relays to publish events to
 	BlossomServers []string                  `json:"blossom_servers,omitempty"` // Blossom blob storage servers
-	DMRelays       []string                  `json:"dm_relays,omitempty"`       // dedicated relays for NIP-17 DMs
 	Identities     map[string]*NostrIdentity `json:"identities,omitempty"`      // role → identity mapping
 	Defaults       *NostrDefaults            `json:"defaults,omitempty"`        // timing and behavior defaults
 }
@@ -1752,19 +1751,15 @@ type AgentProfile struct {
 
 // NostrDefaults represents timing and behavior defaults for Nostr operations.
 type NostrDefaults struct {
-	HeartbeatIntervalSec       int `json:"heartbeat_interval_seconds,omitempty"`         // default: 60
-	SpoolDrainIntervalSec      int `json:"spool_drain_interval_seconds,omitempty"`       // default: 30
-	ConvoyRecomputeIntervalSec int `json:"convoy_recompute_interval_seconds,omitempty"`  // default: 300
-	IssueMirrorPollIntervalSec int `json:"issue_mirror_poll_interval_seconds,omitempty"` // default: 120
+	HeartbeatIntervalSec  int `json:"heartbeat_interval_seconds,omitempty"`   // default: 60
+	SpoolDrainIntervalSec int `json:"spool_drain_interval_seconds,omitempty"` // default: 30
 }
 
 // DefaultNostrDefaults returns NostrDefaults with sensible defaults.
 func DefaultNostrDefaults() *NostrDefaults {
 	return &NostrDefaults{
-		HeartbeatIntervalSec:       60,
-		SpoolDrainIntervalSec:      30,
-		ConvoyRecomputeIntervalSec: 300,
-		IssueMirrorPollIntervalSec: 120,
+		HeartbeatIntervalSec:  60,
+		SpoolDrainIntervalSec: 30,
 	}
 }
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 # Ensure the workspace directories exist and are writable.
 # Bind-mounted host directories may be owned by the host user,
@@ -7,6 +7,10 @@ set -e
 
 GT_RIG="${GT_RIG:-gastown}"
 GT_ROOT="/gt/${GT_RIG}"
+
+if [ "$(id -u)" -ne 0 ]; then
+  exec gt "$@"
+fi
 
 # Create required subdirectories if they don't exist
 mkdir -p \
@@ -22,7 +26,12 @@ if [ ! -f "${GT_ROOT}/mayor/town.json" ]; then
   "type": "town-settings",
   "version": 1,
   "town_name": "${GT_RIG}",
-  "default_agent": "claude"
+  "default_agent": "claude-cli",
+  "role_agents": {
+    "deacon": "claude-cli",
+    "witness": "claude-cli",
+    "refinery": "claude-cli"
+  }
 }
 EOF
 fi
@@ -33,6 +42,16 @@ if [ ! -f "${GT_ROOT}/settings/agents.json" ]; then
 {
   "version": 1,
   "agents": {
+    "claude-cli": {
+      "name": "claude-cli",
+      "provider_type": "cli",
+      "command": "claude",
+      "args": ["--dangerously-skip-permissions"],
+      "process_names": ["claude"],
+      "prompt_mode": "arg",
+      "ready_delay_ms": 5000,
+      "instructions_file": "CLAUDE.md"
+    },
     "claude-api": {
       "name": "claude-api",
       "provider_type": "api",
@@ -48,5 +67,8 @@ if [ ! -f "${GT_ROOT}/settings/agents.json" ]; then
 EOF
 fi
 
-# Hand off to gt with whatever args were passed (e.g., "daemon run")
-exec gt "$@"
+# Bind mounts are initialized as root, then all runtime work runs as UID 10001.
+chown -R gastown:gastown "${GT_ROOT}"
+
+# Hand off to gt with whatever args were passed (e.g., "daemon run").
+exec gosu gastown gt "$@"

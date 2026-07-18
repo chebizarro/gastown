@@ -5830,7 +5830,6 @@ func TestNostrConfigRoundTrip(t *testing.T) {
 		ReadRelays:     []string{"wss://relay1.example.com", "wss://relay2.example.com"},
 		WriteRelays:    []string{"wss://relay1.example.com"},
 		BlossomServers: []string{"https://blossom.example.com"},
-		DMRelays:       []string{"wss://dm.example.com"},
 		Identities: map[string]*NostrIdentity{
 			"deacon": {
 				Pubkey: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",

@@ -12,6 +12,14 @@ import (
 	"time"
 )
 
+// BlobReference identifies content stored on a Blossom server.
+type BlobReference struct {
+	Type   string `json:"type"`
+	URL    string `json:"url"`
+	SHA256 string `json:"sha256"`
+	Size   int    `json:"size"`
+}
+
 // BlobUploader handles uploading blobs to Blossom servers.
 // Blossom is a content-addressed blob storage protocol complementary to Nostr.
 // See: https://github.com/hzrd149/blossom

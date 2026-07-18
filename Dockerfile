@@ -36,6 +36,10 @@ RUN GOBIN=/out go install github.com/steveyegge/beads/cmd/bd@latest
 
 FROM debian:bookworm-slim AS runtime
 
+ARG CLAUDE_CODE_VERSION=latest
+ARG DOLT_VERSION=latest
+ARG TARGETARCH
+
 # Runtime tool deps required by agentloop.Executor:
 # - git: git_* tools
 # - bash: shell_exec
@@ -45,9 +49,25 @@ FROM debian:bookworm-slim AS runtime
 # - ca-certificates: WSS/HTTPS (relays, bunker, Blossom)
 # - curl: health checks
 # - tmux: used by other GT paths; harmless in API-mode deployments
+# - nodejs/npm: Claude Code CLI runtime
+# - gosu: drop privileges after fixing bind-mount ownership
+# - procps: deacon/agentloop process health checks
 RUN apt-get update && apt-get install -y --no-install-recommends \
-  ca-certificates git bash grep tmux curl libicu72 \
-  && rm -rf /var/lib/apt/lists/*
+  ca-certificates git bash grep tmux curl libicu72 nodejs npm gosu procps \
+  && npm install --global "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+  && case "${TARGETARCH}" in \
+       amd64|arm64) dolt_arch="${TARGETARCH}" ;; \
+       *) echo "unsupported Dolt architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+     esac \
+  && if [ "${DOLT_VERSION}" = "latest" ]; then \
+       dolt_url="https://github.com/dolthub/dolt/releases/latest/download/dolt-linux-${dolt_arch}.tar.gz"; \
+     else \
+       dolt_url="https://github.com/dolthub/dolt/releases/download/v${DOLT_VERSION}/dolt-linux-${dolt_arch}.tar.gz"; \
+     fi \
+  && curl -fsSL "${dolt_url}" -o /tmp/dolt.tar.gz \
+  && tar -xzf /tmp/dolt.tar.gz -C /tmp \
+  && install -m 0755 "/tmp/dolt-linux-${dolt_arch}/bin/dolt" /usr/local/bin/dolt \
+  && rm -rf /tmp/dolt.tar.gz "/tmp/dolt-linux-${dolt_arch}" /root/.npm /var/lib/apt/lists/*
 
 RUN useradd -m -u 10001 -s /bin/bash gastown
 
@@ -55,13 +75,14 @@ COPY --from=builder /out/gt /usr/local/bin/gt
 COPY --from=builder /out/bd /usr/local/bin/bd
 
 # Pre-create the default workspace root
-RUN mkdir -p /gt
+RUN mkdir -p /gt && chown gastown:gastown /gt
 
 COPY --chmod=755 scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 WORKDIR /gt
 
-# Run as root so the entrypoint can fix bind-mount permissions,
-# then exec gt (which doesn't need root — it just writes to /gt).
-# For hardened deployments, use --user in docker-compose.yml instead.
+ENV HOME=/home/gastown
+
+# Start as root only so the entrypoint can fix bind-mount permissions. It
+# drops to the gastown user before starting gt.
 ENTRYPOINT ["docker-entrypoint.sh"]

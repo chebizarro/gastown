@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"log"
 	"os"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/config"
 	gtnostr "github.com/steveyegge/gastown/internal/nostr"
@@ -15,88 +17,219 @@ import (
 // We use the local type for internal extraction then convert for publishing.
 type correlations = gtnostr.Correlations
 
-// Global publisher singleton for Nostr event publishing.
-var (
-	globalPublisher *gtnostr.Publisher
-	publisherOnce   sync.Once
-	publisherErr    error
+const (
+	publisherInitialBackoff = time.Second
+	publisherMaxBackoff     = time.Minute
 )
 
-// getPublisher returns the global Nostr publisher, initializing it on first call.
-// Returns nil if Nostr is not enabled or initialization fails.
-func getPublisher() *gtnostr.Publisher {
-	publisherOnce.Do(func() {
-		if !config.IsNostrEnabled() {
-			return
-		}
-
-		// Load config from GT_NOSTR_CONFIG env or default path
-		cfgPath := os.Getenv("GT_NOSTR_CONFIG")
-		if cfgPath == "" {
-			townRoot := os.Getenv("GT_TOWN_ROOT")
-			if townRoot == "" {
-				townRoot = "."
-			}
-			cfgPath = config.NostrConfigPath(townRoot)
-		}
-		cfg, err := config.LoadNostrConfig(cfgPath)
-		if err != nil {
-			log.Printf("[events/nostr] Failed to load nostr config: %v", err)
-			publisherErr = err
-			return
-		}
-
-		if !cfg.Enabled {
-			return
-		}
-
-		// For the deacon identity, look up in config
-		deaconID, ok := cfg.Identities["deacon"]
-		if !ok {
-			log.Printf("[events/nostr] No deacon identity configured, Nostr publishing disabled")
-			return
-		}
-
-		// Create signer from deacon identity
-		signer, err := gtnostr.NewNIP46Signer(context.Background(), deaconID.Signer.Bunker)
-		if err != nil {
-			log.Printf("[events/nostr] Failed to create signer: %v", err)
-			publisherErr = err
-			return
-		}
-
-		// Determine runtime dir for spool
-		runtimeDir := os.Getenv("GT_TOWN_ROOT")
-		if runtimeDir == "" {
-			runtimeDir = "."
-		}
-
-		publisher, err := gtnostr.NewPublisher(context.Background(), cfg, signer, runtimeDir)
-		if err != nil {
-			log.Printf("[events/nostr] Failed to create publisher: %v", err)
-			publisherErr = err
-			return
-		}
-
-		globalPublisher = publisher
-	})
-
-	return globalPublisher
+type publisherRetryState struct {
+	nextAttempt time.Time
+	delay       time.Duration
 }
 
-// publishToNostr converts an Event to a kind 30315 Nostr event and publishes it.
-// This is called asynchronously from write() and should never block.
-func publishToNostr(event Event) {
-	publisher := getPublisher()
-	if publisher == nil {
-		return
+func (r *publisherRetryState) ready(now time.Time) bool {
+	return r.nextAttempt.IsZero() || !now.Before(r.nextAttempt)
+}
+
+func (r *publisherRetryState) fail(now time.Time) {
+	if r.delay == 0 {
+		r.delay = publisherInitialBackoff
+	} else {
+		r.delay *= 2
+		if r.delay > publisherMaxBackoff {
+			r.delay = publisherMaxBackoff
+		}
+	}
+	r.nextAttempt = now.Add(r.delay)
+}
+
+func (r *publisherRetryState) reset() {
+	r.nextAttempt = time.Time{}
+	r.delay = 0
+}
+
+type publisherSlot struct {
+	publisher *gtnostr.Publisher
+	retry     publisherRetryState
+}
+
+var (
+	publisherMu           sync.Mutex
+	publisherConfig       *config.NostrConfig
+	publisherConfigLoaded bool
+	publisherConfigRetry  publisherRetryState
+	publisherBase         *gtnostr.Publisher
+	publisherSlots        = make(map[string]*publisherSlot)
+	publisherDrainCancels []context.CancelFunc
+
+	publisherNow        = time.Now
+	loadPublisherConfig = config.LoadNostrConfig
+	newPublisherSigner  = func(ctx context.Context, bunker string) (gtnostr.Signer, error) {
+		return gtnostr.NewNIP46Signer(ctx, bunker)
+	}
+	newEventsPublisher = func(ctx context.Context, cfg *config.NostrConfig, signer gtnostr.Signer, runtimeDir string) (*gtnostr.Publisher, error) {
+		return gtnostr.NewPublisher(ctx, cfg, signer, runtimeDir)
+	}
+)
+
+// getPublisher returns the publisher for a role. Initialization failures are
+// retried with bounded exponential backoff instead of disabling Nostr for the
+// lifetime of the process.
+func getPublisher(role string) *gtnostr.Publisher {
+	publisherMu.Lock()
+	defer publisherMu.Unlock()
+
+	now := publisherNow()
+	if !publisherConfigLoaded {
+		if !publisherConfigRetry.ready(now) {
+			return nil
+		}
+
+		cfg, err := loadPublisherConfig(nostrConfigPath())
+		if err != nil {
+			publisherConfigRetry.fail(now)
+			log.Printf("[events/nostr] Failed to load nostr config (retry in %s): %v", publisherConfigRetry.delay, err)
+			return nil
+		}
+
+		// Environment is the final configuration layer for the runtime-wired
+		// events path (including relay and default bunker overrides).
+		config.ApplyNostrEnvOverrides(cfg)
+		publisherConfig = cfg
+		publisherConfigLoaded = true
+		publisherConfigRetry.reset()
 	}
 
+	if publisherConfig == nil || !publisherConfig.Enabled {
+		return nil
+	}
+
+	identityKey, identity := resolvePublisherIdentity(publisherConfig, role)
+	if identity == nil {
+		log.Printf("[events/nostr] No identity configured for role %q and no deacon fallback", role)
+		return nil
+	}
+
+	slot := publisherSlots[identityKey]
+	if slot == nil {
+		slot = &publisherSlot{}
+		publisherSlots[identityKey] = slot
+	}
+	if slot.publisher != nil {
+		return slot.publisher
+	}
+	if !slot.retry.ready(now) {
+		return nil
+	}
+
+	signer, err := newPublisherSigner(context.Background(), identity.Signer.Bunker)
+	if err != nil {
+		slot.retry.fail(now)
+		log.Printf("[events/nostr] Failed to create %s signer (retry in %s): %v", identityKey, slot.retry.delay, err)
+		return nil
+	}
+
+	var publisher *gtnostr.Publisher
+	if publisherBase == nil {
+		publisher, err = newEventsPublisher(context.Background(), publisherConfig, signer, nostrRuntimeDir())
+		if err != nil {
+			_ = signer.Close()
+			slot.retry.fail(now)
+			log.Printf("[events/nostr] Failed to create %s publisher (retry in %s): %v", identityKey, slot.retry.delay, err)
+			return nil
+		}
+		publisherBase = publisher
+		publisherDrainCancels = append(publisherDrainCancels, startPublisherMaintenance(publisher, spoolDrainInterval(publisherConfig)))
+	} else {
+		publisher = publisherBase.WithSigner(signer)
+	}
+
+	slot.publisher = publisher
+	slot.retry.reset()
+	return publisher
+}
+
+func nostrConfigPath() string {
+	if path := strings.TrimSpace(os.Getenv("GT_NOSTR_CONFIG")); path != "" {
+		return path
+	}
+	return config.NostrConfigPath(nostrRuntimeDir())
+}
+
+func nostrRuntimeDir() string {
+	if townRoot := strings.TrimSpace(os.Getenv("GT_TOWN_ROOT")); townRoot != "" {
+		return townRoot
+	}
+	return "."
+}
+
+func resolvePublisherIdentity(cfg *config.NostrConfig, role string) (string, *config.NostrIdentity) {
+	if cfg == nil {
+		return "", nil
+	}
+	role = strings.TrimSpace(role)
+	if identity := cfg.Identities[role]; role != "" && identity != nil {
+		return role, identity
+	}
+	if identity := cfg.Identities["deacon"]; identity != nil {
+		return "deacon", identity
+	}
+	// ApplyNostrEnvOverrides writes its single-identity settings here. Keep it
+	// after the required deacon fallback so file-configured policy wins.
+	if identity := cfg.Identities["default"]; identity != nil {
+		return "default", identity
+	}
+	return "", nil
+}
+
+func spoolDrainInterval(cfg *config.NostrConfig) time.Duration {
+	seconds := config.DefaultNostrDefaults().SpoolDrainIntervalSec
+	if cfg != nil && cfg.Defaults != nil && cfg.Defaults.SpoolDrainIntervalSec > 0 {
+		seconds = cfg.Defaults.SpoolDrainIntervalSec
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func startPublisherMaintenance(publisher *gtnostr.Publisher, interval time.Duration) context.CancelFunc {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				reconnectCtx, reconnectCancel := context.WithTimeout(ctx, gtnostr.DefaultConnectTimeout)
+				publisher.Pool().Reconnect(reconnectCtx)
+				reconnectCancel()
+
+				drainCtx, drainCancel := context.WithTimeout(ctx, gtnostr.DefaultPublishTimeout)
+				sent, failed, err := publisher.DrainSpool(drainCtx)
+				drainCancel()
+				if err != nil {
+					log.Printf("[events/nostr] Spool drain failed: %v", err)
+				} else if sent > 0 || failed > 0 {
+					log.Printf("[events/nostr] Spool drain: sent=%d failed=%d", sent, failed)
+				}
+			}
+		}
+	}()
+	return cancel
+}
+
+// publishToNostr converts an Event to a canonical NIP-38 status event and publishes it.
+// This is called asynchronously from write() and should never block.
+func publishToNostr(event Event) {
 	// Extract correlation data from the payload
 	correlations := extractCorrelations(event.Type, event.Payload)
 
 	// Parse actor address to extract rig, role, actor components
 	rig, role, actor := parseActor(event.Actor)
+	publisher := getPublisher(role)
+	if publisher == nil {
+		return
+	}
 
 	// Build the Nostr event
 	nostrEvent, err := gtnostr.NewLogStatusEvent(
@@ -116,8 +249,29 @@ func publishToNostr(event Event) {
 	}
 
 	// Publish (async - publisher handles spool fallback)
-	if err := publisher.Publish(context.Background(), nostrEvent); err != nil {
+	if err := publisher.PublishReplaceable(context.Background(), nostrEvent); err != nil {
 		log.Printf("[events/nostr] Publish failed for %s (spooled): %v", event.Type, err)
+	}
+}
+
+// PublishAgentHeartbeat publishes the latest canonical heartbeat for an API
+// agent loop. It is best-effort; callers should invoke it asynchronously.
+func PublishAgentHeartbeat(agentID, rig, role, status string) {
+	publisher := getPublisher(role)
+	if publisher == nil {
+		return
+	}
+
+	event, err := gtnostr.NewAgentHeartbeatEvent(agentID, rig, role, status)
+	if err != nil {
+		log.Printf("[events/nostr] Failed to build heartbeat for %s: %v", agentID, err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), gtnostr.DefaultPublishTimeout)
+	defer cancel()
+	if err := publisher.PublishReplaceable(ctx, event); err != nil {
+		log.Printf("[events/nostr] Heartbeat publish failed for %s: %v", agentID, err)
 	}
 }
 
@@ -247,9 +401,17 @@ func getString(m map[string]interface{}, key string) string {
 	return s
 }
 
-// ResetPublisherForTesting resets the publisher singleton (test use only).
+// ResetPublisherForTesting resets publisher state and maintenance loops.
 func ResetPublisherForTesting() {
-	publisherOnce = sync.Once{}
-	globalPublisher = nil
-	publisherErr = nil
+	publisherMu.Lock()
+	defer publisherMu.Unlock()
+	for _, cancel := range publisherDrainCancels {
+		cancel()
+	}
+	publisherConfig = nil
+	publisherConfigLoaded = false
+	publisherConfigRetry = publisherRetryState{}
+	publisherBase = nil
+	publisherSlots = make(map[string]*publisherSlot)
+	publisherDrainCancels = nil
 }

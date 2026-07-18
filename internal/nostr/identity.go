@@ -11,27 +11,23 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 )
 
-// IdentityManager handles per-agent identity provisioning and profile publishing.
-// It manages the lifecycle of agent Nostr identities:
-//   - Provisioning keypairs via NIP-46
-//   - Publishing kind 0 profiles
-//   - Publishing relay lists (kind 10002 + kind 10050)
-//   - Retiring agent identities
+// IdentityManager handles per-agent identity provisioning, profile publishing,
+// standard relay-list publication, and the local identity registry.
 type IdentityManager struct {
-	cfg          *config.NostrConfig
-	publisher    *Publisher
-	registry     *IdentityRegistry
+	cfg       *config.NostrConfig
+	publisher *Publisher
+	registry  *IdentityRegistry
 }
 
 // AgentIdentity holds the Nostr identity for a Gas Town agent.
 type AgentIdentity struct {
-	Actor     string              `json:"actor"`      // Full actor address (e.g., "gastown/polecats/Toast")
-	Role      string              `json:"role"`        // Agent role
-	Rig       string              `json:"rig"`         // Rig name
-	Pubkey    string              `json:"pubkey"`      // Hex public key
-	BunkerURI string              `json:"bunker"`      // NIP-46 bunker connection string
-	Profile   *config.AgentProfile `json:"profile"`     // Profile metadata
-	CreatedAt time.Time           `json:"created_at"`
+	Actor     string               `json:"actor"`   // Full actor address (e.g., "gastown/polecats/Toast")
+	Role      string               `json:"role"`    // Agent role
+	Rig       string               `json:"rig"`     // Rig name
+	Pubkey    string               `json:"pubkey"`  // Hex public key
+	BunkerURI string               `json:"bunker"`  // NIP-46 bunker connection string
+	Profile   *config.AgentProfile `json:"profile"` // Profile metadata
+	CreatedAt time.Time            `json:"created_at"`
 }
 
 // NewIdentityManager creates a new identity manager.
@@ -115,9 +111,8 @@ func (im *IdentityManager) PublishProfile(ctx context.Context, agent *AgentIdent
 	return im.publisher.Publish(ctx, event)
 }
 
-// PublishRelayLists publishes kind 10002 (relay list) and kind 10050 (DM relay list)
-// for an agent so that other Nostr clients can discover their preferred relays.
-func (im *IdentityManager) PublishRelayLists(ctx context.Context, agent *AgentIdentity) error {
+// PublishRelayLists publishes the standard kind 10002 relay list.
+func (im *IdentityManager) PublishRelayLists(ctx context.Context, _ *AgentIdentity) error {
 	// Kind 10002: Relay list
 	var relayTags nostr.Tags
 	for _, url := range im.cfg.ReadRelays {
@@ -138,46 +133,19 @@ func (im *IdentityManager) PublishRelayLists(ctx context.Context, agent *AgentId
 		return fmt.Errorf("publishing relay list: %w", err)
 	}
 
-	// Kind 10050: DM relay list
-	if len(im.cfg.DMRelays) > 0 {
-		var dmTags nostr.Tags
-		for _, url := range im.cfg.DMRelays {
-			dmTags = append(dmTags, nostr.Tag{"relay", url})
-		}
-
-		dmRelayEvent := &nostr.Event{
-			CreatedAt: nostr.Timestamp(time.Now().Unix()),
-			Kind:      KindDMRelayList,
-			Tags:      dmTags,
-			Content:   "",
-		}
-
-		if err := im.publisher.Publish(ctx, dmRelayEvent); err != nil {
-			return fmt.Errorf("publishing DM relay list: %w", err)
-		}
-	}
-
 	return nil
 }
 
-// RetireAgent marks an agent as retired and publishes a lifecycle event.
-func (im *IdentityManager) RetireAgent(ctx context.Context, actor string) error {
+// RetireAgent marks an agent as retired in the retained local registry.
+// Lifecycle publication is intentionally absent until the canonical heartbeat
+// runtime is wired.
+func (im *IdentityManager) RetireAgent(_ context.Context, actor string) error {
 	agent, err := im.registry.Lookup(actor)
 	if err != nil {
 		return fmt.Errorf("looking up agent %q: %w", actor, err)
 	}
-
 	agent.Status = "retired"
-
-	// Publish lifecycle retire event
-	event, err := NewLifecycleEvent(agent.Rig, agent.Role, actor, actor, "retire", map[string]interface{}{
-		"retired_at": time.Now().Format(time.RFC3339),
-	})
-	if err != nil {
-		return fmt.Errorf("creating retire event: %w", err)
-	}
-
-	return im.publisher.PublishReplaceable(ctx, event)
+	return nil
 }
 
 // Registry returns the identity registry for direct access.

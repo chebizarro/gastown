@@ -20,6 +20,9 @@ services:
     environment:
       GT_NOSTR_ENABLED: "1"
       GT_LOG_LEVEL: info
+      GT_NOSTR_WRITE_RELAYS: ${GT_NOSTR_WRITE_RELAYS:-wss://relay.sharegap.net}
+      GT_NOSTR_READ_RELAYS: ${GT_NOSTR_READ_RELAYS:-wss://relay.sharegap.net}
+      GT_NOSTR_BLOSSOM_SERVERS: ${GT_NOSTR_BLOSSOM_SERVERS:-https://blossom.sharegap.net}
       # In production, sunset local paths once validated
       GT_EVENTS_LOCAL: ${GT_EVENTS_LOCAL:-0}
       GT_FEED_CURATOR: ${GT_FEED_CURATOR:-0}
@@ -56,6 +59,8 @@ services:
     image: gastown:${GT_VERSION:-latest}
     build: !reset null
     restart: always
+    ports:
+      - "${GT_MCP_BIND_HOST:-127.0.0.1}:${GT_MCP_PORT:-9500}:9500"
     deploy:
       resources:
         limits:

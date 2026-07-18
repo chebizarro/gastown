@@ -4,6 +4,7 @@ services:
   # ---------------------------------------------------------------------------
   relay:
     image: scsibug/nostr-rs-relay:latest
+    profiles: [dev]
     volumes:
       - ./config/relay.toml:/usr/src/app/config.toml:ro
       - relay-data:/usr/src/app/db
@@ -16,6 +17,7 @@ services:
 
   blossom:
     image: ghcr.io/hzrd149/blossom-server:latest
+    profiles: [dev]
     environment:
       DATA_DIR: /data
       PORT: "3000"
@@ -46,24 +48,27 @@ services:
         BUILD_TIME: ${GT_BUILD_TIME:-1970-01-01T00:00:00Z}
     image: gastown:local
     command: ["daemon", "run"]
-    depends_on:
-      relay:
-        condition: service_started
-      blossom:
-        condition: service_healthy
     environment:
       GT_RIG: ${GT_RIG:-gastown}
 
       # Rig-rooted town root (as required)
-      GT_TOWN_ROOT: /gt/${GT_RIG}
-      GT_ROOT: /gt/${GT_RIG}
+      GT_TOWN_ROOT: /gt/${GT_RIG:-gastown}
+      GT_ROOT: /gt/${GT_RIG:-gastown}
 
-      # Nostr support — relay/blossom via Docker internal DNS
+      # Fleet Nostr endpoints; override with the dev infrastructure endpoints
+      # when starting the dev profile.
       GT_NOSTR_ENABLED: "1"
-      GT_NOSTR_CONFIG: /gt/${GT_RIG}/settings/nostr.json
-      GT_NOSTR_WRITE_RELAYS: "ws://relay:7000"
-      GT_NOSTR_READ_RELAYS: "ws://relay:7000"
-      GT_NOSTR_BLOSSOM_SERVERS: "http://blossom:3000"
+      GT_NOSTR_CONFIG: /gt/${GT_RIG:-gastown}/settings/nostr.json
+      GT_NOSTR_WRITE_RELAYS: ${GT_NOSTR_WRITE_RELAYS:-wss://relay.sharegap.net}
+      GT_NOSTR_READ_RELAYS: ${GT_NOSTR_READ_RELAYS:-wss://relay.sharegap.net}
+      GT_NOSTR_BLOSSOM_SERVERS: ${GT_NOSTR_BLOSSOM_SERVERS:-https://blossom.sharegap.net}
+
+      # External Dolt server; defaults match the local Gastown convention.
+      GT_DOLT_HOST: ${GT_DOLT_HOST:-127.0.0.1}
+      GT_DOLT_PORT: ${GT_DOLT_PORT:-3307}
+
+      # Claude CLI credentials inherited by interactive tmux agents.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
 
       # Optional migration/sunset flags (defaults preserve local behavior)
       GT_EVENTS_LOCAL: ${GT_EVENTS_LOCAL:-1}
@@ -73,6 +78,12 @@ services:
     volumes:
       - ./rigs/${GT_RIG:-gastown}:/gt/${GT_RIG:-gastown}
       - ./runtime/${GT_RIG:-gastown}:/gt/${GT_RIG:-gastown}/.runtime
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f '[g]t daemon run' >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
     restart: unless-stopped
 
   agentloop:
@@ -104,14 +115,16 @@ services:
       # - "${GT_AGENT_PRIME_INTERVAL:-30s}"
     environment:
       GT_RIG: ${GT_RIG:-gastown}
-      GT_TOWN_ROOT: /gt/${GT_RIG}
-      GT_ROOT: /gt/${GT_RIG}
+      GT_TOWN_ROOT: /gt/${GT_RIG:-gastown}
+      GT_ROOT: /gt/${GT_RIG:-gastown}
 
       GT_NOSTR_ENABLED: "1"
-      GT_NOSTR_CONFIG: /gt/${GT_RIG}/settings/nostr.json
-      GT_NOSTR_WRITE_RELAYS: "ws://relay:7000"
-      GT_NOSTR_READ_RELAYS: "ws://relay:7000"
-      GT_NOSTR_BLOSSOM_SERVERS: "http://blossom:3000"
+      GT_NOSTR_CONFIG: /gt/${GT_RIG:-gastown}/settings/nostr.json
+      GT_NOSTR_WRITE_RELAYS: ${GT_NOSTR_WRITE_RELAYS:-wss://relay.sharegap.net}
+      GT_NOSTR_READ_RELAYS: ${GT_NOSTR_READ_RELAYS:-wss://relay.sharegap.net}
+      GT_NOSTR_BLOSSOM_SERVERS: ${GT_NOSTR_BLOSSOM_SERVERS:-https://blossom.sharegap.net}
+      GT_DOLT_HOST: ${GT_DOLT_HOST:-deacon}
+      GT_DOLT_PORT: ${GT_DOLT_PORT:-3307}
 
       # LLM creds referenced via agents.json (api.api_key: "$OPENAI_API_KEY" etc.)
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
@@ -120,12 +133,18 @@ services:
     volumes:
       - ./rigs/${GT_RIG:-gastown}:/gt/${GT_RIG:-gastown}
       - ./runtime/${GT_RIG:-gastown}:/gt/${GT_RIG:-gastown}/.runtime
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f '[g]t agentloop run' >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
     restart: unless-stopped
 
   mcp:
     image: gastown:local
     # Optional — activate with: docker compose --profile mcp up
-    # Requires GT_MCP_TOKEN to be set
+    # Network exposure requires GT_MCP_TOKEN; host publishing defaults to loopback.
     profiles: [mcp]
     depends_on: [deacon]
     command:
@@ -138,20 +157,22 @@ services:
       - "--workdir"
       - "/gt/${GT_RIG:-gastown}"
       - "--auth-token"
-      - "${GT_MCP_TOKEN}"
+      - "${GT_MCP_TOKEN:-}"
     environment:
       GT_RIG: ${GT_RIG:-gastown}
-      GT_TOWN_ROOT: /gt/${GT_RIG}
-      GT_ROOT: /gt/${GT_RIG}
+      GT_TOWN_ROOT: /gt/${GT_RIG:-gastown}
+      GT_ROOT: /gt/${GT_RIG:-gastown}
 
       GT_NOSTR_ENABLED: "1"
-      GT_NOSTR_CONFIG: /gt/${GT_RIG}/settings/nostr.json
-      GT_NOSTR_WRITE_RELAYS: "ws://relay:7000"
-      GT_NOSTR_READ_RELAYS: "ws://relay:7000"
-      GT_NOSTR_BLOSSOM_SERVERS: "http://blossom:3000"
+      GT_NOSTR_CONFIG: /gt/${GT_RIG:-gastown}/settings/nostr.json
+      GT_NOSTR_WRITE_RELAYS: ${GT_NOSTR_WRITE_RELAYS:-wss://relay.sharegap.net}
+      GT_NOSTR_READ_RELAYS: ${GT_NOSTR_READ_RELAYS:-wss://relay.sharegap.net}
+      GT_NOSTR_BLOSSOM_SERVERS: ${GT_NOSTR_BLOSSOM_SERVERS:-https://blossom.sharegap.net}
+      GT_DOLT_HOST: ${GT_DOLT_HOST:-deacon}
+      GT_DOLT_PORT: ${GT_DOLT_PORT:-3307}
     working_dir: /gt/${GT_RIG:-gastown}
     ports:
-      - "9500:9500"
+      - "${GT_MCP_BIND_HOST:-127.0.0.1}:${GT_MCP_PORT:-9500}:9500"
     volumes:
       - ./rigs/${GT_RIG:-gastown}:/gt/${GT_RIG:-gastown}
       - ./runtime/${GT_RIG:-gastown}:/gt/${GT_RIG:-gastown}/.runtime
@@ -173,11 +194,8 @@ services:
     ports:
       - "${GT_FLOTILLA_PORT:-1847}:1847"
     environment:
-      VITE_FORCE_RELAYS: "ws://relay:7000"
-      VITE_DEFAULT_BLOSSOM: "http://blossom:3000"
-    depends_on:
-      relay:
-        condition: service_started
+      VITE_FORCE_RELAYS: ${GT_NOSTR_READ_RELAYS:-wss://relay.sharegap.net}
+      VITE_DEFAULT_BLOSSOM: ${GT_NOSTR_BLOSSOM_SERVERS:-https://blossom.sharegap.net}
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------

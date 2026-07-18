@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/agentloop"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/llm"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -26,7 +27,7 @@ var (
 	alAgentsConfig string
 	alAgentID      string
 
-	alTask         string
+	alTask          string
 	alPrimeInterval time.Duration
 
 	alSystemPrompt  string
@@ -142,8 +143,8 @@ func runAgentLoopRun(cmd *cobra.Command, args []string) error {
 		RigName:          rigName,
 		Actor:            actor,
 		OnHeartbeat: func(state agentloop.LoopState, iteration int, totalTokens int) {
-			// Keep minimal output; full lifecycle/Nostr publishing is handled elsewhere.
-			_ = state
+			// Publishing is best-effort and must not stall the agent loop.
+			go events.PublishAgentHeartbeat(actor, rigName, role, string(state))
 			_ = iteration
 			_ = totalTokens
 		},

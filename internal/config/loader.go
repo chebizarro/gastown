@@ -3027,12 +3027,6 @@ func validateNostrConfig(c *NostrConfig) error {
 			return fmt.Errorf("write_relays: %w", err)
 		}
 	}
-	for _, relay := range c.DMRelays {
-		if err := validateRelayURL(relay); err != nil {
-			return fmt.Errorf("dm_relays: %w", err)
-		}
-	}
-
 	// Validate Blossom server URLs
 	for _, server := range c.BlossomServers {
 		if !strings.HasPrefix(server, "http://") && !strings.HasPrefix(server, "https://") {
@@ -3230,10 +3224,6 @@ func mergeNostrConfig(town, rig *NostrConfig) *NostrConfig {
 	if len(rig.BlossomServers) > 0 {
 		merged.BlossomServers = rig.BlossomServers
 	}
-	if len(rig.DMRelays) > 0 {
-		merged.DMRelays = rig.DMRelays
-	}
-
 	// Merge identities: start with town, overlay rig
 	mergedIdentities := make(map[string]*NostrIdentity)
 	for role, id := range town.Identities {

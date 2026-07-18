@@ -14,8 +14,6 @@ import (
 //
 // Storage:
 //   - Local: ~/gt/settings/identity-registry.json
-//   - Nostr: published as kind 30316 with d=identity_registry
-//   - Loadable from relay for Flotilla address resolution
 type IdentityRegistry struct {
 	mu     sync.RWMutex
 	agents map[string]*RegisteredAgent // key: actor address

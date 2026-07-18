@@ -14,61 +14,22 @@ import (
 	"encoding/hex"
 
 	"fiatjaf.com/nostr"
+	cascadia "git.sharegap.net/cascadia/cascadia-go"
 )
 
-// --- Event Kind Constants ---
-
-// AI-Hub shared kinds (reused from compendium).
+// Standard Nostr kinds used by the retained identity subsystem.
 const (
-	KindLogStatus = 30315 // Activity feed (replaces .events.jsonl)
-	KindLifecycle = 30316 // Agent register/heartbeat/retire/dead
+	KindProfile   = 0     // NIP-01: Agent profile metadata
+	KindRelayList = 10002 // NIP-65: Agent relay list
 )
 
-// Gas Town custom kinds.
-const (
-	KindConvoyState     = 30318 // Convoy definition and progress
-	KindBeadsIssueState = 30319 // Beads issue mirror for UI
-	KindProtocolEvent   = 30320 // Machine-to-machine protocol events
-	KindGroupDef        = 30321 // Group membership definition
-	KindQueueDef        = 30322 // Work queue definition and status
-	KindChannelDef      = 30323 // Pub/sub channel definition
-	KindWorkItem        = 30325 // Queue work items (claimable tasks)
-)
-
-// Standard Nostr kinds (reused as-is).
-const (
-	KindProfile        = 0     // NIP-01: Agent profile metadata
-	KindChannelCreate  = 40    // NIP-28: Channel creation
-	KindChannelMeta    = 41    // NIP-28: Channel metadata updates
-	KindChannelMessage = 42    // NIP-28: Channel messages
-	KindDirectMessage  = 14    // NIP-17: Private DMs
-	KindGiftWrap       = 1059  // NIP-59: Gift wraps for DMs
-	KindRelayList      = 10002 // NIP-65: Agent relay list
-	KindDMRelayList    = 10050 // NIP-17: Agent DM relay preferences
-)
-
-// --- Protocol Constants ---
-
-// ProtocolVersion is the current Gas Town Nostr protocol version.
-// Included as ["gt", "1"] tag on every GT event.
+// ProtocolVersion is included as ["gt", "1"] on Gas Town events.
 const ProtocolVersion = "1"
 
-// SchemaPrefix is prepended to all schema identifiers in event content.
+// SchemaPrefix is prepended to Gas Town schema identifiers.
 const SchemaPrefix = "gt/"
 
-// --- Visibility Constants ---
-
-// Event visibility levels (matching existing events package).
-const (
-	VisibilityAudit = "audit" // Internal audit trail only
-	VisibilityFeed  = "feed"  // Visible in activity feed
-	VisibilityBoth  = "both"  // Both audit and feed
-)
-
-// --- Cross-reference Types ---
-
 // Correlations holds cross-reference data for Nostr event tags.
-// Used to link events to issues, convoys, beads, sessions, branches, and MRs.
 type Correlations struct {
 	IssueID   string
 	ConvoyID  string
@@ -78,10 +39,7 @@ type Correlations struct {
 	MergeReq  string
 }
 
-// --- Tag Builder Functions ---
-
-// BaseTags returns the base tags included on every Gas Town Nostr event.
-// These identify the protocol version, source rig, agent role, and actor.
+// BaseTags identifies the Gas Town protocol version and logical actor.
 func BaseTags(rig, role, actor string) nostr.Tags {
 	tags := nostr.Tags{
 		{"gt", ProtocolVersion},
@@ -93,13 +51,12 @@ func BaseTags(rig, role, actor string) nostr.Tags {
 		tags = append(tags, nostr.Tag{"role", role})
 	}
 	if actor != "" {
-		tags = append(tags, nostr.Tag{"actor", actor})
+		tags = append(tags, nostr.Tag{cascadia.TagAgent, actor})
 	}
 	return tags
 }
 
 // CorrelationTags returns optional correlation tags for event tracing.
-// Empty values are omitted.
 func CorrelationTags(issueID, convoyID, beadID, sessionID string) nostr.Tags {
 	var tags nostr.Tags
 	if issueID != "" {
@@ -112,78 +69,61 @@ func CorrelationTags(issueID, convoyID, beadID, sessionID string) nostr.Tags {
 		tags = append(tags, nostr.Tag{"bead", beadID})
 	}
 	if sessionID != "" {
-		tags = append(tags, nostr.Tag{"session", sessionID})
+		tags = append(tags, nostr.Tag{cascadia.TagSession, sessionID})
 	}
 	return tags
 }
 
-// ReplaceableTag returns a NIP-33 "d" tag for parameterized replaceable events.
+// ReplaceableTag returns a NIP-33 d-tag for an addressable event.
 func ReplaceableTag(d string) nostr.Tag {
 	return nostr.Tag{"d", d}
 }
 
-// TypeTag returns a type discriminator tag for events within the same kind.
+// TypeTag returns the canonical Cascadia type discriminator.
 func TypeTag(eventType string) nostr.Tag {
-	return nostr.Tag{"type", eventType}
+	return nostr.Tag{cascadia.TagType, eventType}
 }
 
-// VisibilityTag returns a visibility tag controlling where the event appears.
+// VisibilityTag preserves Gas Town's local audit/feed visibility metadata.
 func VisibilityTag(visibility string) nostr.Tag {
 	return nostr.Tag{"visibility", visibility}
 }
 
-// SchemaVersion returns a schema identifier string like "gt/log@1".
+// SchemaVersion returns a schema identifier such as "gt/log@1".
 func SchemaVersion(name string, version int) string {
 	return SchemaPrefix + name + "@" + itoa(version)
 }
 
-// --- Type Conversion Helpers ---
-// The fiatjaf.com/nostr library uses fixed-size byte array types for ID and PubKey
-// (not string aliases). These helpers provide safe conversions.
-
-// IDToString converts a nostr.ID (byte array) to its hex string representation.
+// IDToString converts a nostr.ID to hexadecimal.
 func IDToString(id nostr.ID) string {
 	return id.Hex()
 }
 
-// PubKeyFromHexGT converts a hex string to a nostr.PubKey byte array.
-// Returns a zero PubKey if the hex string is invalid or wrong length.
-// Wraps the library's PubKeyFromHex which validates the key.
+// PubKeyFromHexGT converts a hex string to a nostr.PubKey.
 func PubKeyFromHexGT(hexStr string) nostr.PubKey {
 	pk, err := nostr.PubKeyFromHex(hexStr)
 	if err != nil {
-		return nostr.PubKey{} // zero value
+		return nostr.PubKey{}
 	}
 	return pk
 }
 
-// PubKeyToString converts a nostr.PubKey (byte array) to its hex string representation.
+// PubKeyToString converts a nostr.PubKey to hexadecimal.
 func PubKeyToString(pk nostr.PubKey) string {
 	return pk.Hex()
 }
 
-// SigFromHex converts a hex string to a nostr Sig byte array ([64]byte).
-// Returns a zero Sig if the hex string is invalid or wrong length.
+// SigFromHex converts a hex string to a 64-byte signature.
 func SigFromHex(hexStr string) [64]byte {
 	var sig [64]byte
 	b, err := hex.DecodeString(hexStr)
 	if err != nil || len(b) != 64 {
-		return sig // zero value
+		return sig
 	}
 	copy(sig[:], b)
 	return sig
 }
 
-// KindSlice converts plain int values to a []nostr.Kind (uint16) slice.
-func KindSlice(kinds ...int) []nostr.Kind {
-	result := make([]nostr.Kind, len(kinds))
-	for i, k := range kinds {
-		result[i] = nostr.Kind(k)
-	}
-	return result
-}
-
-// itoa is a simple int-to-string without importing strconv.
 func itoa(n int) string {
 	if n == 0 {
 		return "0"

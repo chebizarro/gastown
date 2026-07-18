@@ -1732,6 +1732,7 @@ func (b *Beads) Create(opts CreateOptions) (*Issue, error) {
 	if err := json.Unmarshal(out, &issue); err != nil {
 		return nil, fmt.Errorf("parsing bd create output: %w", err)
 	}
+	b.reportNostrigPostMutationError(b.publishNostrigCreateIfEnabled(&issue))
 
 	return &issue, nil
 }
@@ -1803,6 +1804,7 @@ func (b *Beads) CreateWithID(id string, opts CreateOptions) (*Issue, error) {
 	if err := json.Unmarshal(out, &issue); err != nil {
 		return nil, fmt.Errorf("parsing bd create output: %w", err)
 	}
+	b.reportNostrigPostMutationError(b.publishNostrigCreateIfEnabled(&issue))
 
 	return &issue, nil
 }
@@ -1820,6 +1822,9 @@ type SearchOptions struct {
 func (b *Beads) Search(opts SearchOptions) ([]*Issue, error) {
 	if b.store != nil {
 		return b.storeSearch(opts)
+	}
+	if err := b.syncNostrigLedgerIfEnabled(); err != nil {
+		return nil, err
 	}
 
 	args := []string{"search", "--json"}
@@ -1966,12 +1971,16 @@ func (b *Beads) Update(id string, opts UpdateOptions) error {
 	if _, err := b.runWithStdin(stdinData, args...); err != nil {
 		return err
 	}
-	return b.publishNostrigUpdateIfEnabled(id, opts)
+	b.reportNostrigPostMutationError(b.publishNostrigUpdateIfEnabled(id, opts))
+	return nil
 }
 
 func (b *Beads) deleteBead(id string) error {
-	_, err := b.run("delete", id, "--force")
-	return err
+	if _, err := b.run("delete", id, "--force"); err != nil {
+		return err
+	}
+	b.reportNostrigPostMutationError(b.publishNostrigDeleteIfEnabled(id))
+	return nil
 }
 
 // Close closes one or more issues.
@@ -1997,9 +2006,7 @@ func (b *Beads) Close(ids ...string) error {
 		return err
 	}
 	for _, id := range ids {
-		if err := b.publishNostrigStatusIfEnabled(id, "closed"); err != nil {
-			return err
-		}
+		b.reportNostrigPostMutationError(b.publishNostrigStatusIfEnabled(id, "closed"))
 	}
 	return nil
 }
@@ -2028,9 +2035,7 @@ func (b *Beads) CloseWithReason(reason string, ids ...string) error {
 		return err
 	}
 	for _, id := range ids {
-		if err := b.publishNostrigStatusIfEnabled(id, "closed"); err != nil {
-			return err
-		}
+		b.reportNostrigPostMutationError(b.publishNostrigStatusIfEnabled(id, "closed"))
 	}
 	return nil
 }
@@ -2064,9 +2069,7 @@ func (b *Beads) ForceCloseWithReason(reason string, ids ...string) error {
 		return err
 	}
 	for _, id := range ids {
-		if err := b.publishNostrigStatusIfEnabled(id, "closed"); err != nil {
-			return err
-		}
+		b.reportNostrigPostMutationError(b.publishNostrigStatusIfEnabled(id, "closed"))
 	}
 	return nil
 }
@@ -2106,7 +2109,8 @@ func (b *Beads) ReleaseWithReason(id, reason string) error {
 	}
 	open := "open"
 	empty := ""
-	return b.publishNostrigUpdateIfEnabled(id, UpdateOptions{Status: &open, Assignee: &empty})
+	b.reportNostrigPostMutationError(b.publishNostrigUpdateIfEnabled(id, UpdateOptions{Status: &open, Assignee: &empty}))
+	return nil
 }
 
 // AddDependency adds a dependency: issue depends on dependsOn.
@@ -2115,8 +2119,11 @@ func (b *Beads) AddDependency(issue, dependsOn string) error {
 		return b.storeAddDependency(issue, dependsOn)
 	}
 
-	_, err := b.run("dep", "add", issue, dependsOn)
-	return err
+	if _, err := b.run("dep", "add", issue, dependsOn); err != nil {
+		return err
+	}
+	b.reportNostrigPostMutationError(b.publishNostrigDependencyIfEnabled(issue, dependsOn, true))
+	return nil
 }
 
 // RemoveDependency removes a dependency.
@@ -2125,8 +2132,11 @@ func (b *Beads) RemoveDependency(issue, dependsOn string) error {
 		return b.storeRemoveDependency(issue, dependsOn)
 	}
 
-	_, err := b.run("dep", "remove", issue, dependsOn)
-	return err
+	if _, err := b.run("dep", "remove", issue, dependsOn); err != nil {
+		return err
+	}
+	b.reportNostrigPostMutationError(b.publishNostrigDependencyIfEnabled(issue, dependsOn, false))
+	return nil
 }
 
 // Stats returns repository statistics.
