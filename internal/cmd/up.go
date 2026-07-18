@@ -163,14 +163,20 @@ func runUp(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
+	beadsBackend, err := config.ResolveBeadsBackend(townRoot)
+	if err != nil {
+		return fmt.Errorf("resolving beads backend: %w", err)
+	}
 
 	// Ensure lifecycle defaults are configured. On first run this creates
 	// mayor/daemon.json with sensible defaults for the six-stage Dolt lifecycle.
 	// On subsequent runs it fills in any newly added patrols without touching
 	// existing config. Errors are non-fatal — the town can run without lifecycle
 	// automation, it just won't have automated maintenance.
-	if err := daemon.EnsureLifecycleConfigFile(townRoot); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: could not configure lifecycle defaults: %v\n", err)
+	if beadsBackend == config.BeadsBackendDolt {
+		if err := daemon.EnsureLifecycleConfigFile(townRoot); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not configure lifecycle defaults: %v\n", err)
+		}
 	}
 
 	// Load daemon.json env vars so services (Dolt, etc.) use the right config.
@@ -180,7 +186,14 @@ func runUp(cmd *cobra.Command, args []string) error {
 			os.Setenv(k, v)
 		}
 	}
-	config.ApplyConfiguredDoltEnv(townRoot)
+	if err := os.Setenv(config.BeadsBackendEnv, string(beadsBackend)); err != nil {
+		return fmt.Errorf("setting beads backend env: %w", err)
+	}
+	if beadsBackend == config.BeadsBackendDolt {
+		config.ApplyConfiguredDoltEnv(townRoot)
+	} else {
+		config.ClearDoltEnv()
+	}
 
 	allOK := true
 	var services []ServiceStatus
@@ -204,7 +217,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 	var rigErrors map[string]error
 	var doltOK bool
 	var doltDetail string
-	var doltSkipped bool
+	doltSkipped := beadsBackend != config.BeadsBackendDolt
 
 	var startupWg sync.WaitGroup
 	startupWg.Add(5)
@@ -212,6 +225,9 @@ func runUp(cmd *cobra.Command, args []string) error {
 	// 0. Dolt server (if configured)
 	go func() {
 		defer startupWg.Done()
+		if doltSkipped {
+			return
+		}
 		cfg := doltserver.DefaultConfig(townRoot)
 		if _, err := os.Stat(cfg.DataDir); os.IsNotExist(err) {
 			doltSkipped = true
@@ -421,7 +437,10 @@ func runUp(cmd *cobra.Command, args []string) error {
 
 	// Log boot event for both JSON and text paths
 	if allOK {
-		startedServices := []string{"dolt", "daemon", "deacon", "mayor"}
+		startedServices := []string{"daemon", "deacon", "mayor"}
+		if beadsBackend == config.BeadsBackendDolt {
+			startedServices = append([]string{"dolt"}, startedServices...)
+		}
 		for _, rigName := range rigs {
 			startedServices = append(startedServices, fmt.Sprintf("%s/witness", rigName))
 			startedServices = append(startedServices, fmt.Sprintf("%s/refinery", rigName))

@@ -797,6 +797,42 @@ func TestConfigSetGet(t *testing.T) {
 		}
 	})
 
+	t.Run("set and get beads.backend", func(t *testing.T) {
+		townRoot := setupTestTownForConfig(t)
+		settingsPath := config.TownSettingsPath(townRoot)
+
+		originalWd, _ := os.Getwd()
+		defer os.Chdir(originalWd)
+		if err := os.Chdir(townRoot); err != nil {
+			t.Fatalf("chdir: %v", err)
+		}
+
+		cmd := &cobra.Command{}
+		if err := runConfigSet(cmd, []string{"beads.backend", "sqlite"}); err != nil {
+			t.Fatalf("runConfigSet: %v", err)
+		}
+		loaded, err := config.LoadOrCreateTownSettings(settingsPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if loaded.Beads == nil || loaded.Beads.Backend != "sqlite" {
+			t.Fatalf("beads config = %+v, want sqlite", loaded.Beads)
+		}
+		var getErr error
+		out := captureStdout(t, func() {
+			getErr = runConfigGet(cmd, []string{"beads.backend"})
+		})
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		if strings.TrimSpace(out) != "sqlite" {
+			t.Fatalf("config get beads.backend = %q, want sqlite", strings.TrimSpace(out))
+		}
+		if err := runConfigSet(cmd, []string{"beads.backend", "postgres"}); err == nil {
+			t.Fatal("expected invalid backend error")
+		}
+	})
+
 	t.Run("set cli_theme rejects invalid value", func(t *testing.T) {
 		townRoot := setupTestTownForConfig(t)
 

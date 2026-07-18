@@ -83,12 +83,20 @@ func isBDTargetEnv(entry string) bool {
 // inherited selectors are stripped first so stale shell state cannot make bd
 // write to a different database than the selected .beads directory.
 func BuildPinnedBDEnv(base []string, beadsDir string) []string {
-	env := SuppressBDSideEffects(StripBDTargetEnv(base))
-	if beadsDir == "" {
-		return addResolvedDoltConnectionEnv(env, "")
-	}
 	beadsDir = canonicalBeadsDir(beadsDir)
+	backend := selectedBeadsBackend(base, beadsDir)
+	env := suppressBDSideEffectsForBackend(StripBDTargetEnv(base), backend)
+	env = pinBeadsBackendEnv(env, backend)
+	if beadsDir == "" {
+		if backend == agentconfig.BeadsBackendDolt {
+			return addResolvedDoltConnectionEnv(env, "")
+		}
+		return env
+	}
 	env = append(env, "BEADS_DIR="+beadsDir)
+	if backend != agentconfig.BeadsBackendDolt {
+		return env
+	}
 	env = append(env, doltTargetEnvFromBeadsDir(beadsDir)...)
 	if dbEnv := DatabaseEnv(beadsDir); dbEnv != "" {
 		env = append(env, dbEnv)
@@ -100,8 +108,13 @@ func BuildPinnedBDEnv(base []string, beadsDir string) []string {
 // bd prefix routing. It strips stale target/database selectors, then re-adds only
 // connection host/port from fallbackBeadsDir so routing can choose the database.
 func BuildRoutingBDEnv(base []string, fallbackBeadsDir string) []string {
-	env := SuppressBDSideEffects(StripBDTargetEnv(base))
 	fallbackBeadsDir = canonicalBeadsDir(fallbackBeadsDir)
+	backend := selectedBeadsBackend(base, fallbackBeadsDir)
+	env := suppressBDSideEffectsForBackend(StripBDTargetEnv(base), backend)
+	env = pinBeadsBackendEnv(env, backend)
+	if backend != agentconfig.BeadsBackendDolt {
+		return env
+	}
 	env = append(env, doltTargetEnvFromBeadsDir(fallbackBeadsDir)...)
 	return addResolvedDoltConnectionEnv(env, fallbackBeadsDir)
 }
@@ -136,7 +149,9 @@ func BuildMutationRoutingBDEnv(base []string, fallbackBeadsDir string) []string 
 // Gas Town target selectors and suppresses side effects without adding BEADS_DIR
 // or town Dolt connection metadata that could change native bd path semantics.
 func BuildMutationNeutralBDEnv(base []string) []string {
-	return forceBDMutation(SuppressBDSideEffects(StripBDTargetEnv(base)))
+	backend := selectedBeadsBackend(base, "")
+	env := suppressBDSideEffectsForBackend(StripBDTargetEnv(base), backend)
+	return forceBDMutation(pinBeadsBackendEnv(env, backend))
 }
 
 // ArgsAreReadOnly classifies bd CLI arguments for env policy. Unknown commands
@@ -224,6 +239,21 @@ func hasReadOnlySQLPrefix(query string) bool {
 // JSONL from high-frequency gt callers re-invalidates Beads' import freshness
 // checks and can create a self-feeding Dolt load loop.
 func SuppressBDSideEffects(env []string) []string {
+	return suppressBDSideEffectsForBackend(env, agentconfig.BeadsBackendDolt)
+}
+
+func suppressBDSideEffectsForBackend(env []string, backend agentconfig.BeadsBackend) []string {
+	if backend != agentconfig.BeadsBackendDolt {
+		filtered := make([]string, 0, len(env))
+		for _, entry := range env {
+			key, _, ok := strings.Cut(entry, "=")
+			if ok && (envKeyHasPrefix(key, "GT_DOLT_") || envKeyHasPrefix(key, "BEADS_DOLT_") || envKeyHasPrefix(key, "BD_DOLT_")) {
+				continue
+			}
+			filtered = append(filtered, entry)
+		}
+		env = filtered
+	}
 	for _, key := range []string{
 		"BEADS_NO_AUTO_IMPORT",
 		"BEADS_DOLT_AUTO_START",
@@ -236,28 +266,65 @@ func SuppressBDSideEffects(env []string) []string {
 	} {
 		env = StripEnvKey(env, key)
 	}
-	return append(env,
+	env = append(env,
 		"BEADS_NO_AUTO_IMPORT=1",
-		"BEADS_DOLT_AUTO_START=0",
 		"BD_EXPORT_AUTO=false",
 		"BD_BACKUP_ENABLED=false",
-		"BD_DOLT_AUTO_PUSH=false",
 		"BD_NO_PUSH=true",
 		"BD_EXPORT_GIT_ADD=false",
 		"BD_NO_GIT_OPS=true",
 	)
+	if backend == agentconfig.BeadsBackendDolt {
+		env = append(env, "BEADS_DOLT_AUTO_START=0", "BD_DOLT_AUTO_PUSH=false")
+	}
+	return env
 }
 
 func forceBDReadOnly(env []string) []string {
+	backend := selectedBeadsBackend(env, "")
 	env = StripEnvKey(env, "BD_DOLT_AUTO_COMMIT")
 	env = StripEnvKey(env, "BD_READONLY")
-	return append(env, "BD_DOLT_AUTO_COMMIT=off", "BD_READONLY=true")
+	if backend == agentconfig.BeadsBackendDolt {
+		env = append(env, "BD_DOLT_AUTO_COMMIT=off")
+	}
+	return append(env, "BD_READONLY=true")
 }
 
 func forceBDMutation(env []string) []string {
+	backend := selectedBeadsBackend(env, "")
 	env = StripEnvKey(env, "BD_DOLT_AUTO_COMMIT")
 	env = StripEnvKey(env, "BD_READONLY")
-	return append(env, "BD_DOLT_AUTO_COMMIT=on")
+	if backend == agentconfig.BeadsBackendDolt {
+		env = append(env, "BD_DOLT_AUTO_COMMIT=on")
+	}
+	return env
+}
+
+func selectedBeadsBackend(env []string, beadsDir string) agentconfig.BeadsBackend {
+	townRoot := ""
+	if beadsDir != "" {
+		townRoot = FindTownRoot(filepath.Dir(beadsDir))
+	} else {
+		townRoot = envValue(env, "GT_TOWN_ROOT")
+		if townRoot == "" {
+			townRoot = envValue(env, "GT_ROOT")
+		}
+		if townRoot == "" {
+			if cwd, err := os.Getwd(); err == nil {
+				townRoot = FindTownRoot(cwd)
+			}
+		}
+	}
+	backend, err := agentconfig.ResolveBeadsBackendFromEnv(townRoot, env)
+	if err != nil {
+		return agentconfig.BeadsBackendDolt
+	}
+	return backend
+}
+
+func pinBeadsBackendEnv(env []string, backend agentconfig.BeadsBackend) []string {
+	env = StripEnvKey(env, agentconfig.BeadsBackendEnv)
+	return append(env, agentconfig.BeadsBackendEnv+"="+string(backend))
 }
 
 func doltTargetEnvFromBeadsDir(beadsDir string) []string {

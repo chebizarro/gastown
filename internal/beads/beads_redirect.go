@@ -287,15 +287,13 @@ func ComputeRedirectTarget(townRoot, worktreePath string) (string, error) {
 		return upPath + ".beads", nil
 	}
 
-	// Rig has no own database — try town-level .beads (has routes.jsonl,
-	// config.yaml, Dolt server info, and hq- prefix).
-	townBeadsHasDB := false
-	if info, err := os.Stat(townBeadsPath); err == nil && info.IsDir() {
-		if _, err := os.Stat(filepath.Join(townBeadsPath, "dolt")); err == nil {
-			townBeadsHasDB = true
-		} else if _, err := os.Stat(filepath.Join(townBeadsPath, "config.yaml")); err == nil {
-			townBeadsHasDB = true
-		}
+	// Rig has no own database — try town-level .beads (routes/config and
+	// backend storage). Discovery is backend-neutral so SQLite towns do not
+	// need a synthetic .beads/dolt directory.
+	townBeadsHasDB := beadsDirHasStorage(townBeadsPath)
+	if !townBeadsHasDB {
+		_, configErr := os.Stat(filepath.Join(townBeadsPath, "config.yaml"))
+		townBeadsHasDB = configErr == nil
 	}
 
 	// Only use town-level beads if the rig doesn't have its own redirect chain.
@@ -318,17 +316,7 @@ func ComputeRedirectTarget(townRoot, worktreePath string) (string, error) {
 	if _, err := os.Stat(rigBeadsPath); err == nil {
 		rigBeadsExists = true
 	}
-	rigHasDB := false
-	if rigBeadsExists {
-		// Check for actual database: dolt/ directory
-		if _, err := os.Stat(filepath.Join(rigBeadsPath, "dolt")); err == nil {
-			rigHasDB = true
-		} else if _, err := os.Stat(filepath.Join(rigBeadsPath, "redirect")); err == nil {
-			// A redirect file is a valid beads configuration (tracked beads case).
-			// initBeads creates this to point to mayor/rig/.beads.
-			rigHasDB = true
-		}
-	}
+	rigHasDB := rigBeadsExists && beadsDirHasStorage(rigBeadsPath)
 
 	if !rigBeadsExists || !rigHasDB {
 		// Rig .beads doesn't exist or has no database — check mayor/rig/.beads
@@ -462,20 +450,72 @@ func IsLocalBeadsDir(cwd, resolvedPath string) bool {
 	return cleanResolved == cleanLocal
 }
 
-// rigHasOwnDB checks if a rig's .beads/metadata.json declares its own
-// dolt_database. Rigs with their own database (e.g., laneassist with "lc-"
-// prefix) must not be redirected to town-level beads ("hq-" prefix).
+// rigHasOwnDB checks whether a rig declares backend storage of its own.
+// Such rigs must not be redirected to town-level beads with a different prefix.
 func rigHasOwnDB(rigBeadsPath string) bool {
-	metadataPath := filepath.Join(rigBeadsPath, "metadata.json")
-	data, err := os.ReadFile(metadataPath) //nolint:gosec // G304: trusted beads path
-	if err != nil {
+	meta, ok := readBeadsStorageMetadata(rigBeadsPath)
+	if !ok {
 		return false
 	}
-	var meta struct {
-		DoltDatabase string `json:"dolt_database"`
+	if strings.TrimSpace(meta.DoltDatabase) != "" {
+		return true
 	}
-	if err := json.Unmarshal(data, &meta); err != nil {
+	return strings.EqualFold(strings.TrimSpace(meta.Backend), "sqlite") &&
+		strings.TrimSpace(meta.Database) != ""
+}
+
+type beadsStorageMetadata struct {
+	Backend      string `json:"backend"`
+	Database     string `json:"database"`
+	DoltDatabase string `json:"dolt_database"`
+}
+
+func readBeadsStorageMetadata(beadsDir string) (beadsStorageMetadata, bool) {
+	var meta beadsStorageMetadata
+	data, err := os.ReadFile(filepath.Join(beadsDir, "metadata.json")) //nolint:gosec // trusted beads path
+	if err != nil || json.Unmarshal(data, &meta) != nil {
+		return meta, false
+	}
+	return meta, true
+}
+
+func sqliteDatabaseExists(beadsDir string) bool {
+	for _, name := range []string{"beads.db", "beads.sqlite", "beads.sqlite3", "db.sqlite"} {
+		if _, err := os.Stat(filepath.Join(beadsDir, name)); err == nil {
+			return true
+		}
+	}
+	meta, ok := readBeadsStorageMetadata(beadsDir)
+	if !ok || !strings.EqualFold(strings.TrimSpace(meta.Backend), "sqlite") {
 		return false
 	}
-	return meta.DoltDatabase != ""
+	database := strings.TrimSpace(meta.Database)
+	if database == "" {
+		return false
+	}
+	if !filepath.IsAbs(database) {
+		database = filepath.Join(beadsDir, database)
+	}
+	_, err := os.Stat(database)
+	return err == nil
+}
+
+func beadsDirHasStorage(beadsDir string) bool {
+	if info, err := os.Stat(beadsDir); err != nil || !info.IsDir() {
+		return false
+	}
+	for _, name := range []string{"redirect", "dolt", "beads.db", "beads.sqlite", "beads.sqlite3", "db.sqlite"} {
+		if _, err := os.Stat(filepath.Join(beadsDir, name)); err == nil {
+			return true
+		}
+	}
+	meta, ok := readBeadsStorageMetadata(beadsDir)
+	if !ok {
+		return false
+	}
+	if strings.TrimSpace(meta.DoltDatabase) != "" {
+		return true
+	}
+	backend := strings.ToLower(strings.TrimSpace(meta.Backend))
+	return backend != "" && backend != "dolt" && strings.TrimSpace(meta.Database) != ""
 }

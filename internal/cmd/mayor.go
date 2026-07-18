@@ -425,7 +425,19 @@ func ensureMayorInfra(townRoot string) error {
 		}
 	}
 
-	// Dolt (fatal on failure — Mayor requires database access)
+	beadsBackend, err := config.ResolveBeadsBackend(townRoot)
+	if err != nil {
+		return fmt.Errorf("resolving beads backend: %w", err)
+	}
+	if err := os.Setenv(config.BeadsBackendEnv, string(beadsBackend)); err != nil {
+		return fmt.Errorf("setting beads backend env: %w", err)
+	}
+	if beadsBackend != config.BeadsBackendDolt {
+		config.ClearDoltEnv()
+		return nil
+	}
+
+	// Dolt (fatal on failure in Dolt mode)
 	doltCfg := doltserver.DefaultConfig(townRoot)
 	if !doltCfg.IsRemote() {
 		if _, err := os.Stat(doltCfg.DataDir); err == nil {

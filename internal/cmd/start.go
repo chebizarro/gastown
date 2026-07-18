@@ -181,6 +181,16 @@ func runStart(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
+	beadsBackend, err := config.ResolveBeadsBackend(townRoot)
+	if err != nil {
+		return fmt.Errorf("resolving beads backend: %w", err)
+	}
+	if err := os.Setenv(config.BeadsBackendEnv, string(beadsBackend)); err != nil {
+		return fmt.Errorf("setting beads backend env: %w", err)
+	}
+	if beadsBackend == config.BeadsBackendSQLite {
+		config.ClearDoltEnv()
+	}
 
 	// Apply ephemeral cost tier if specified
 	if startCostTier != "" {
@@ -222,27 +232,29 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// connect to the Dolt SQL server. Without this sequencing, they race the
 	// server and bd auto-spawns orphan embedded servers. (gt-t2zf)
 	var doltOK bool
-	cfg := doltserver.DefaultConfig(townRoot)
-	if _, err := os.Stat(cfg.DataDir); os.IsNotExist(err) {
-		// No Dolt data dir — nothing to start
-		fmt.Printf("  %s Dolt server skipped (no data dir)\n", style.Dim.Render("○"))
+	if beadsBackend != config.BeadsBackendDolt {
+		fmt.Printf("  %s Dolt server disabled (beads backend: %s)\n", style.Dim.Render("○"), beadsBackend)
 	} else {
-		running, _, _ := doltserver.IsRunning(townRoot)
-		if running {
-			doltOK = true
-			fmt.Printf("  %s Dolt server already running\n", style.Dim.Render("○"))
-		} else if err := doltserver.Start(townRoot); err != nil {
-			fmt.Printf("  %s Dolt server failed: %v\n", style.Dim.Render("○"), err)
+		cfg := doltserver.DefaultConfig(townRoot)
+		if _, err := os.Stat(cfg.DataDir); os.IsNotExist(err) {
+			// No Dolt data dir — nothing to start
+			fmt.Printf("  %s Dolt server skipped (no data dir)\n", style.Dim.Render("○"))
 		} else {
-			doltOK = true
-			fmt.Printf("  %s Dolt server started (port %d)\n", style.Bold.Render("✓"), doltserver.DefaultPort)
+			running, _, _ := doltserver.IsRunning(townRoot)
+			if running {
+				doltOK = true
+				fmt.Printf("  %s Dolt server already running\n", style.Dim.Render("○"))
+			} else if err := doltserver.Start(townRoot); err != nil {
+				fmt.Printf("  %s Dolt server failed: %v\n", style.Dim.Render("○"), err)
+			} else {
+				doltOK = true
+				fmt.Printf("  %s Dolt server started (port %d)\n", style.Bold.Render("✓"), doltserver.DefaultPort)
+			}
 		}
-	}
-
-	// Ensure beads metadata is correct BEFORE agents start.
-	// This prevents bd from seeing stale config and spawning orphan servers.
-	if doltOK {
-		_, _ = doltserver.EnsureAllMetadata(townRoot)
+		// Ensure beads metadata is correct BEFORE agents start.
+		if doltOK {
+			_, _ = doltserver.EnsureAllMetadata(townRoot)
+		}
 	}
 
 	// Phase 2: Start all agents in parallel (Dolt is now ready)

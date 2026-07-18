@@ -115,6 +115,9 @@ type TownSettings struct {
 	// All values are optional — omitted values use compiled-in defaults.
 	Operational *OperationalConfig `json:"operational,omitempty"`
 
+	// Beads selects the bd storage backend for this town. Omitted means Dolt.
+	Beads *TownBeadsConfig `json:"beads,omitempty"`
+
 	// DisabledPatrols lists patrol names to disable at the town level.
 	// This provides a simple way to turn off individual daemon patrol dogs
 	// without editing mayor/daemon.json. Patrol names match the keys used
@@ -124,6 +127,11 @@ type TownSettings struct {
 	// "main_branch_test", "handler").
 	// Example: ["doctor_dog", "compactor_dog"]
 	DisabledPatrols []string `json:"disabled_patrols,omitempty"`
+}
+
+// TownBeadsConfig configures the bd storage backend for a town.
+type TownBeadsConfig struct {
+	Backend string `json:"backend,omitempty"` // "dolt" (default) | "sqlite"
 }
 
 // NewTownSettings creates a new TownSettings with defaults.

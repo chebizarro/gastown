@@ -76,7 +76,8 @@ type ConvoyManager struct {
 	// Parked rigs are skipped during event polling. May be nil (never parked).
 	isRigParked func(string) bool
 
-	gtPath string
+	gtPath     string
+	cliPolling bool
 
 	// started guards against double-call of Start() which would spawn duplicate goroutines.
 	started atomic.Bool
@@ -143,6 +144,12 @@ func NewConvoyManager(townRoot string, logger func(format string, args ...interf
 	}
 }
 
+// EnableCLIPolling switches event polling to the backend-neutral gt/bd CLI path.
+// Call before Start. This is used when the linked beads SDK cannot open the selected backend.
+func (m *ConvoyManager) EnableCLIPolling() {
+	m.cliPolling = true
+}
+
 // Start begins the convoy manager goroutines (event poll + stranded scan).
 // It is safe to call multiple times; subsequent calls are no-ops.
 func (m *ConvoyManager) Start() error {
@@ -185,6 +192,11 @@ func (m *ConvoyManager) Stop() {
 // lazily via the openStores callback until stores become available.
 func (m *ConvoyManager) runEventPoll() {
 	defer m.wg.Done()
+
+	if m.cliPolling {
+		m.runCLIEventPoll()
+		return
+	}
 
 	m.storesMu.Lock()
 	hasStores := len(m.stores) > 0
@@ -244,6 +256,60 @@ func (m *ConvoyManager) runEventPoll() {
 			}
 		}
 	}
+}
+
+// runCLIEventPoll periodically checks all open convoys through gt commands.
+// gt convoy check uses bd CLI routing, so it supports backends unavailable to
+// the linked Go SDK while retaining idempotent completion behavior.
+func (m *ConvoyManager) runCLIEventPoll() {
+	currentInterval := eventPollInterval
+	ticker := time.NewTicker(currentInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-ticker.C:
+			err := m.pollConvoysViaCLI()
+			if err != nil {
+				m.recoveryMode.Store(true)
+				newInterval := currentInterval * 2
+				if newInterval > eventPollMaxBackoff {
+					newInterval = eventPollMaxBackoff
+				}
+				if newInterval != currentInterval {
+					currentInterval = newInterval
+					ticker.Reset(currentInterval)
+					m.logger("Convoy: CLI poll backoff → %s", currentInterval)
+				}
+				continue
+			}
+			m.recoveryMode.Store(false)
+			if currentInterval != eventPollInterval {
+				currentInterval = eventPollInterval
+				ticker.Reset(currentInterval)
+				m.logger("Convoy: CLI poll recovered, interval reset to %s", currentInterval)
+			}
+		}
+	}
+}
+
+func (m *ConvoyManager) pollConvoysViaCLI() error {
+	cmd := exec.CommandContext(m.ctx, m.gtPath, "convoy", "check")
+	cmd.Dir = m.townRoot
+	cmd.Env = bdMutationRoutingEnv(m.townRoot)
+	util.SetProcessGroup(cmd)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		detail := util.FirstLine(stderr.String())
+		if detail == "" {
+			detail = err.Error()
+		}
+		m.logger("Convoy: CLI poll failed: %s", detail)
+		return fmt.Errorf("convoy CLI poll: %s", detail)
+	}
+	return nil
 }
 
 // pollStoresSnapshot polls events from all non-parked stores in the snapshot.

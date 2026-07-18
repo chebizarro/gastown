@@ -289,35 +289,43 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 		}
 	}
 
-	// Inject Dolt server endpoint so agents' direct bd invocations connect to
-	// gt's central server instead of auto-starting rogue per-rig servers.
-	// BEADS_DOLT_* values are output aliases only; they are never authoritative.
+	// Propagate the selected beads backend. Dolt remains the default, but SQLite
+	// agents must not inherit or synthesize any Dolt server controls.
+	beadsBackend := BeadsBackendDolt
 	if cfg.TownRoot != "" {
-		if port := ResolveDoltPort(cfg.TownRoot); port > 0 {
-			setDoltPortEnv(env, strconv.Itoa(port))
+		if resolved, err := ResolveBeadsBackend(cfg.TownRoot); err == nil {
+			beadsBackend = resolved
+			env[BeadsBackendEnv] = string(resolved)
 		}
-	}
-	if _, ok := env["GT_DOLT_PORT"]; !ok {
-		if v := os.Getenv("GT_DOLT_PORT"); v != "" {
-			setDoltPortEnv(env, v)
-		}
-	}
-	// Suppress bd's Dolt auto-start for all Gas Town agents (GH#2930).
-	// Gas Town manages its own Dolt server (gt dolt start/stop). When the
-	// server is momentarily unreachable (restart, journal hiccup), bd's
-	// auto-start tries to launch a shadow server in the agent's .beads/dolt/
-	// directory — which conflicts with the real server on the same port and
-	// triggers an escalation flood loop. Dogs are especially affected because
-	// their kennel's .beads/ has no explicit dolt_server_port in metadata.json.
-	if cfg.TownRoot != "" {
-		env["BEADS_DOLT_AUTO_START"] = "0"
 	}
 
-	// Propagate Dolt server host. GT/config host is authoritative; stale Beads
-	// aliases from the parent shell are intentionally ignored.
-	if host := ResolveDoltHost(cfg.TownRoot); host != "" {
-		env["GT_DOLT_HOST"] = host
-		env["BEADS_DOLT_SERVER_HOST"] = host
+	if beadsBackend == BeadsBackendDolt {
+		// Inject Dolt server endpoint so agents' direct bd invocations connect to
+		// gt's central server instead of auto-starting rogue per-rig servers.
+		// BEADS_DOLT_* values are output aliases only; they are never authoritative.
+		if cfg.TownRoot != "" {
+			if port := ResolveDoltPort(cfg.TownRoot); port > 0 {
+				setDoltPortEnv(env, strconv.Itoa(port))
+			}
+		}
+		if _, ok := env["GT_DOLT_PORT"]; !ok {
+			if v := os.Getenv("GT_DOLT_PORT"); v != "" {
+				setDoltPortEnv(env, v)
+			}
+		}
+		// Suppress bd's Dolt auto-start for all Gas Town agents (GH#2930).
+		if cfg.TownRoot != "" {
+			env["BEADS_DOLT_AUTO_START"] = "0"
+		}
+
+		// Propagate Dolt server host. GT/config host is authoritative; stale Beads
+		// aliases from the parent shell are intentionally ignored.
+		if host := ResolveDoltHost(cfg.TownRoot); host != "" {
+			env["GT_DOLT_HOST"] = host
+			env["BEADS_DOLT_SERVER_HOST"] = host
+		}
+	} else {
+		delete(env, "BD_DOLT_AUTO_COMMIT")
 	}
 
 	// Pass through cloud API credentials and provider configuration from the parent shell.
@@ -516,6 +524,18 @@ func NormalizeConfiguredDoltEnv(base []string, townRoot string) []string {
 		base = append(base, "GT_DOLT_PORT="+strconv.Itoa(port))
 	}
 	return base
+}
+
+// ClearDoltEnv removes Gas Town and bd Dolt selectors from the process.
+// SQLite mode calls this at startup boundaries so inherited shell state cannot
+// cause bd to contact or auto-start a Dolt server.
+func ClearDoltEnv() {
+	for _, entry := range os.Environ() {
+		key, _, ok := strings.Cut(entry, "=")
+		if ok && (strings.HasPrefix(key, "GT_DOLT_") || strings.HasPrefix(key, "BEADS_DOLT_") || strings.HasPrefix(key, "BD_DOLT_")) {
+			_ = os.Unsetenv(key)
+		}
+	}
 }
 
 // ApplyConfiguredDoltEnv applies NormalizeConfiguredDoltEnv to the current

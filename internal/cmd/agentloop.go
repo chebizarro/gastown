@@ -59,6 +59,16 @@ func runAgentLoopRun(cmd *cobra.Command, args []string) error {
 	if err := ensureWorkspaceSkeleton(townRoot); err != nil {
 		return fmt.Errorf("initializing workspace skeleton: %w", err)
 	}
+	beadsBackend, err := config.ResolveBeadsBackend(townRoot)
+	if err != nil {
+		return fmt.Errorf("resolving beads backend: %w", err)
+	}
+	if err := os.Setenv(config.BeadsBackendEnv, string(beadsBackend)); err != nil {
+		return fmt.Errorf("setting beads backend env: %w", err)
+	}
+	if beadsBackend != config.BeadsBackendDolt {
+		config.ClearDoltEnv()
+	}
 
 	role := strings.TrimSpace(alRole)
 	if role == "" {

@@ -59,6 +59,7 @@ type Daemon struct {
 	curator       *feed.Curator
 	convoyManager *ConvoyManager
 	beadsStores   map[string]beadsdk.Storage
+	beadsBackend  agentconfig.BeadsBackend
 	doltServer    *DoltServerManager
 	krcPruner     *KRCPruner
 
@@ -282,7 +283,21 @@ func New(config *Config) (*Daemon, error) {
 			logger.Printf("Set env %s=%s from daemon.json", k, v)
 		}
 	}
-	agentconfig.ApplyConfiguredDoltEnv(config.TownRoot)
+	beadsBackend, err := agentconfig.ResolveBeadsBackend(config.TownRoot)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("resolving beads backend: %w", err)
+	}
+	logger.Printf("Beads backend: %s", beadsBackend)
+	if err := os.Setenv(agentconfig.BeadsBackendEnv, string(beadsBackend)); err != nil {
+		cancel()
+		return nil, fmt.Errorf("setting beads backend env: %w", err)
+	}
+	if beadsBackend == agentconfig.BeadsBackendDolt {
+		agentconfig.ApplyConfiguredDoltEnv(config.TownRoot)
+	} else {
+		agentconfig.ClearDoltEnv()
+	}
 
 	// Load disabled_patrols from town settings (settings/config.json).
 	// This provides a simpler way to disable patrols than editing daemon.json.
@@ -292,12 +307,22 @@ func New(config *Config) (*Daemon, error) {
 		for k := range disabledPatrols {
 			names = append(names, k)
 		}
+		sort.Strings(names)
 		logger.Printf("Patrols disabled via town settings: %v", names)
+	}
+	if beadsBackend != agentconfig.BeadsBackendDolt {
+		if disabledPatrols == nil {
+			disabledPatrols = make(map[string]bool)
+		}
+		for _, name := range doltOnlyPatrols {
+			disabledPatrols[name] = true
+		}
+		logger.Printf("Dolt-only patrols disabled for beads backend %s: %v", beadsBackend, doltOnlyPatrols)
 	}
 
 	// Initialize Dolt server manager if configured
 	var doltServer *DoltServerManager
-	if patrolConfig != nil && patrolConfig.Patrols != nil && patrolConfig.Patrols.DoltServer != nil {
+	if beadsBackend == agentconfig.BeadsBackendDolt && patrolConfig != nil && patrolConfig.Patrols != nil && patrolConfig.Patrols.DoltServer != nil {
 		doltServer = NewDoltServerManager(config.TownRoot, patrolConfig.Patrols.DoltServer, logger.Printf)
 		if doltServer.IsEnabled() {
 			logger.Printf("Dolt server management enabled (port %d)", doltServer.config.Port)
@@ -308,28 +333,26 @@ func New(config *Config) (*Daemon, error) {
 		}
 	}
 
-	// Fallback: if GT_DOLT_PORT still isn't set (no DoltServerManager, daemon
-	// started independently of gt up), detect the port from dolt config.
-	// This ensures AgentEnv() always has the port for spawned sessions. (GH#2412)
-	if os.Getenv("GT_DOLT_PORT") == "" {
-		if port := agentconfig.ResolveConfiguredDoltPort(config.TownRoot); port > 0 {
-			portStr := strconv.Itoa(port)
-			os.Setenv("GT_DOLT_PORT", portStr)
+	if beadsBackend == agentconfig.BeadsBackendDolt {
+		// Fallback: if GT_DOLT_PORT still isn't set (no DoltServerManager, daemon
+		// started independently of gt up), detect the port from Dolt config.
+		if os.Getenv("GT_DOLT_PORT") == "" {
+			if port := agentconfig.ResolveConfiguredDoltPort(config.TownRoot); port > 0 {
+				portStr := strconv.Itoa(port)
+				os.Setenv("GT_DOLT_PORT", portStr)
+				os.Setenv("BEADS_DOLT_SERVER_PORT", portStr)
+				os.Setenv("BEADS_DOLT_PORT", portStr)
+				logger.Printf("Set GT_DOLT_PORT=%s from resolved Dolt config (fallback)", portStr)
+			}
+		} else {
+			portStr := os.Getenv("GT_DOLT_PORT")
 			os.Setenv("BEADS_DOLT_SERVER_PORT", portStr)
 			os.Setenv("BEADS_DOLT_PORT", portStr)
-			logger.Printf("Set GT_DOLT_PORT=%s from resolved Dolt config (fallback)", portStr)
 		}
-	} else {
-		portStr := os.Getenv("GT_DOLT_PORT")
-		os.Setenv("BEADS_DOLT_SERVER_PORT", portStr)
-		os.Setenv("BEADS_DOLT_PORT", portStr)
-	}
 
-	// Propagate Dolt host to process env so bd doesn't fall back to 127.0.0.1
-	// when the server runs on a remote machine. BEADS_DOLT_SERVER_HOST is a
-	// derived alias, not an authority, so stale inherited values are replaced or
-	// removed here.
-	applyConfiguredDoltHostEnv(config.TownRoot, logger.Printf)
+		// Propagate the selected Dolt host to child processes.
+		applyConfiguredDoltHostEnv(config.TownRoot, logger.Printf)
+	}
 
 	// PATCH-006: Resolve binary paths at startup.
 	gtPath, err := exec.LookPath("gt")
@@ -383,6 +406,7 @@ func New(config *Config) (*Daemon, error) {
 	d := &Daemon{
 		config:          config,
 		patrolConfig:    patrolConfig,
+		beadsBackend:    beadsBackend,
 		disabledPatrols: disabledPatrols,
 		tmux:            tmux.NewTmux(),
 		logger:          logger,
@@ -475,16 +499,18 @@ func (d *Daemon) Run() (err error) {
 	}
 	defer func() { _ = fileLock.Unlock() }()
 
-	// Pre-flight check: all rigs must be on Dolt backend.
-	if err := d.checkAllRigsDolt(); err != nil {
+	// Pre-flight check: every configured beads store must match the selected backend.
+	if err := d.checkAllRigsBackend(); err != nil {
 		return err
 	}
 
-	// Repair metadata.json for all rigs on startup.
-	// This ensures all rigs have proper Dolt server configuration.
-	if _, errs := doltserver.EnsureAllMetadata(d.config.TownRoot); len(errs) > 0 {
-		for _, e := range errs {
-			d.logger.Printf("Warning: metadata repair: %v", e)
+	// Dolt mode retains the existing metadata repair behavior. SQLite metadata
+	// must never be rewritten with Dolt server fields.
+	if d.effectiveBeadsBackend() == agentconfig.BeadsBackendDolt {
+		if _, errs := doltserver.EnsureAllMetadata(d.config.TownRoot); len(errs) > 0 {
+			for _, e := range errs {
+				d.logger.Printf("Warning: metadata repair: %v", e)
+			}
 		}
 	}
 
@@ -523,12 +549,15 @@ func (d *Daemon) Run() (err error) {
 		d.logger.Println("Feed curator started")
 	}
 
-	// Start convoy manager (event-driven + periodic stranded scan)
-	// Try opening beads stores eagerly; if Dolt isn't ready yet,
-	// pass the opener as a callback for lazy retry on each poll tick.
-	d.beadsStores, err = d.openBeadsStores()
-	if err != nil {
-		return err
+	// Start convoy manager. The embedded beads SDK in this Gastown version is
+	// Dolt-only; SQLite mode uses CLI polling and never opens the SDK.
+	if d.effectiveBeadsBackend() == agentconfig.BeadsBackendDolt {
+		d.beadsStores, err = d.openBeadsStores()
+		if err != nil {
+			return err
+		}
+	} else {
+		d.logger.Printf("Convoy: beads SDK is Dolt-only; using CLI polling for backend %s", d.beadsBackend)
 	}
 
 	// Clean sessions left behind on legacy tmux sockets after daemon startup has
@@ -540,7 +569,7 @@ func (d *Daemon) Run() (err error) {
 		return !ok
 	}
 	var storeOpener func() map[string]beadsdk.Storage
-	if len(d.beadsStores) == 0 {
+	if d.effectiveBeadsBackend() == agentconfig.BeadsBackendDolt && len(d.beadsStores) == 0 {
 		storeOpener = func() map[string]beadsdk.Storage {
 			stores, err := d.openBeadsStores()
 			if err != nil {
@@ -551,6 +580,9 @@ func (d *Daemon) Run() (err error) {
 		}
 	}
 	d.convoyManager = NewConvoyManager(d.config.TownRoot, d.logger.Printf, d.gtPath, 0, d.beadsStores, storeOpener, isRigParked)
+	if d.effectiveBeadsBackend() != agentconfig.BeadsBackendDolt {
+		d.convoyManager.EnableCLIPolling()
+	}
 	if err := d.convoyManager.Start(); err != nil {
 		d.logger.Printf("Warning: failed to start convoy manager: %v", err)
 	} else {
@@ -1080,54 +1112,69 @@ func (d *Daemon) pourDoctorMolecule(warnings []string) {
 	mol.closeStep("report")
 }
 
-// checkAllRigsDolt verifies all rigs are using the Dolt backend.
-func (d *Daemon) checkAllRigsDolt() error {
-	var problems []string
-
-	// Check town-level beads
-	townBeadsDir := filepath.Join(d.config.TownRoot, ".beads")
-	if backend := readBeadsBackend(townBeadsDir); backend != "" && backend != "dolt" {
-		problems = append(problems, fmt.Sprintf(
-			"Rig %q is using %s backend.\n  Gas Town requires Dolt. Run: cd %s && bd migrate dolt",
-			"town-root", backend, d.config.TownRoot))
+// checkAllRigsBackend verifies that every town/rig store declares the selected backend.
+// Missing or malformed metadata is an error for both modes; silently accepting it
+// can route bd to an unintended default backend.
+func (d *Daemon) checkAllRigsBackend() error {
+	type target struct {
+		name     string
+		beadsDir string
+	}
+	targets := []target{{name: "town-root", beadsDir: filepath.Join(d.config.TownRoot, ".beads")}}
+	for _, rigName := range d.getKnownRigs() {
+		targets = append(targets, target{
+			name:     rigName,
+			beadsDir: doltserver.FindRigBeadsDir(d.config.TownRoot, rigName),
+		})
 	}
 
-	// Check each registered rig
-	for _, rigName := range d.getKnownRigs() {
-		rigBeadsDir := filepath.Join(d.config.TownRoot, rigName, "mayor", "rig", ".beads")
-		if backend := readBeadsBackend(rigBeadsDir); backend != "" && backend != "dolt" {
-			rigPath := filepath.Join(d.config.TownRoot, rigName)
+	var problems []string
+	for _, target := range targets {
+		backend, err := readBeadsBackend(target.beadsDir)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("Rig %q: %v", target.name, err))
+			continue
+		}
+		if backend != d.effectiveBeadsBackend() {
 			problems = append(problems, fmt.Sprintf(
-				"Rig %q is using %s backend.\n  Gas Town requires Dolt. Run: cd %s && bd migrate dolt",
-				rigName, backend, rigPath))
+				"Rig %q is using %s backend (selected backend: %s)",
+				target.name, backend, d.effectiveBeadsBackend()))
 		}
 	}
-
 	if len(problems) == 0 {
 		return nil
 	}
-
-	return fmt.Errorf("daemon startup blocked: %d rig(s) not on Dolt backend\n\n  %s",
-		len(problems), strings.Join(problems, "\n\n  "))
+	return fmt.Errorf("daemon startup blocked: %d beads store(s) do not match backend %s\n\n  %s",
+		len(problems), d.effectiveBeadsBackend(), strings.Join(problems, "\n\n  "))
 }
 
-// readBeadsBackend reads the backend field from metadata.json in a beads directory.
-// Returns empty string if the directory or metadata doesn't exist.
-func readBeadsBackend(beadsDir string) string {
+// readBeadsBackend reads and validates metadata.json's backend field.
+func readBeadsBackend(beadsDir string) (agentconfig.BeadsBackend, error) {
+	if beadsDir == "" {
+		return "", fmt.Errorf("beads directory is not configured")
+	}
 	metadataPath := filepath.Join(beadsDir, "metadata.json")
 	data, err := os.ReadFile(metadataPath)
 	if err != nil {
-		return ""
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("missing %s", metadataPath)
+		}
+		return "", fmt.Errorf("reading %s: %w", metadataPath, err)
 	}
-
 	var metadata struct {
 		Backend string `json:"backend"`
 	}
 	if err := json.Unmarshal(data, &metadata); err != nil {
-		return ""
+		return "", fmt.Errorf("parsing %s: %w", metadataPath, err)
 	}
-
-	return metadata.Backend
+	if strings.TrimSpace(metadata.Backend) == "" {
+		return "", fmt.Errorf("%s has no backend field", metadataPath)
+	}
+	backend, err := agentconfig.ParseBeadsBackend(metadata.Backend)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", metadataPath, err)
+	}
+	return backend, nil
 }
 
 type beadsMetadataReader interface {
@@ -2071,6 +2118,9 @@ func (d *Daemon) killDefaultPrefixGhosts() {
 // Stores that fail to open are logged and skipped. Successfully opened stores
 // are compatibility-checked before being returned to Convoy polling.
 func (d *Daemon) openBeadsStores() (map[string]beadsdk.Storage, error) {
+	if d.effectiveBeadsBackend() != agentconfig.BeadsBackendDolt {
+		return nil, nil
+	}
 	stores := make(map[string]beadsdk.Storage)
 
 	// Town-level store (hq)

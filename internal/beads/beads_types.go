@@ -330,8 +330,8 @@ var prefixRe = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9-]{0,19}$`)
 // This handles the case where a rig was added but the database was never created,
 // which causes Dolt panics when trying to create agent beads.
 //
-// Uses --server mode to match all production bd init callers (gastown uses a
-// centralized Dolt sql-server). JSONL auto-import is handled by bd init itself.
+// Initialization follows the selected town backend: centralized --server mode
+// for Dolt, or --backend sqlite for SQLite-capable bd versions.
 func ensureDatabaseInitialized(beadsDir string) error {
 	// If this beads dir has a redirect, the database lives elsewhere.
 	// Never create a new database for a redirected location (polecats, crew, refinery).
@@ -340,39 +340,48 @@ func ensureDatabaseInitialized(beadsDir string) error {
 		return nil
 	}
 
-	// Check for Dolt database directory (embedded mode)
-	doltDir := filepath.Join(beadsDir, "dolt")
-	if _, err := os.Stat(doltDir); err == nil {
+	townRoot := FindTownRoot(filepath.Dir(beadsDir))
+	backend, err := config.ResolveBeadsBackend(townRoot)
+	if err != nil {
+		return fmt.Errorf("resolve beads backend: %w", err)
+	}
+
+	if backend == config.BeadsBackendSQLite {
+		if sqliteDatabaseExists(beadsDir) {
+			return nil
+		}
+	} else if _, err := os.Stat(filepath.Join(beadsDir, "dolt")); err == nil {
 		return nil
 	}
 
-	// Check for metadata.json (server mode — gastown's exclusive mode).
+	// Check for metadata.json (Dolt server mode).
 	// In server mode, .beads/ may contain only metadata.json with no local dolt/ dir.
 	// This mirrors the deep check in bdDatabaseExists (internal/rig/manager.go):
 	// parse metadata.json and verify the referenced database exists in .dolt-data/.
 	// metadata.json can be git-tracked from another workspace where the Dolt server
 	// had this database, but this may be a fresh server without it.
 	metadataFile := filepath.Join(beadsDir, "metadata.json")
-	if data, err := os.ReadFile(metadataFile); err == nil {
-		var meta struct {
-			DoltMode     string `json:"dolt_mode"`
-			DoltDatabase string `json:"dolt_database"`
-		}
-		if err := json.Unmarshal(data, &meta); err != nil {
-			return nil // Can't parse — assume initialized (backward compat)
-		}
-		if meta.DoltMode == "server" && meta.DoltDatabase != "" {
-			townRoot := FindTownRoot(filepath.Dir(beadsDir))
-			if townRoot == "" {
-				return nil // Can't find town root — assume initialized
+	if backend == config.BeadsBackendDolt {
+		if data, err := os.ReadFile(metadataFile); err == nil {
+			var meta struct {
+				DoltMode     string `json:"dolt_mode"`
+				DoltDatabase string `json:"dolt_database"`
 			}
-			dbDir := filepath.Join(townRoot, ".dolt-data", meta.DoltDatabase)
-			if _, err := os.Stat(dbDir); !os.IsNotExist(err) {
-				return nil // Database exists (or stat error — assume initialized)
+			if err := json.Unmarshal(data, &meta); err != nil {
+				return nil // Can't parse — assume initialized (backward compat)
 			}
-			// metadata.json exists but database doesn't — fall through to init
-		} else {
-			return nil // Non-server mode or no database ref — assume initialized
+			if backend == config.BeadsBackendDolt && meta.DoltMode == "server" && meta.DoltDatabase != "" {
+				if townRoot == "" {
+					return nil // Can't find town root — assume initialized
+				}
+				dbDir := filepath.Join(townRoot, ".dolt-data", meta.DoltDatabase)
+				if _, err := os.Stat(dbDir); !os.IsNotExist(err) {
+					return nil // Database exists (or stat error — assume initialized)
+				}
+				// metadata.json exists but database doesn't — fall through to init
+			} else {
+				return nil // Non-server mode or no database ref — assume initialized
+			}
 		}
 	}
 
@@ -380,13 +389,16 @@ func ensureDatabaseInitialized(beadsDir string) error {
 	prefix := detectPrefix(beadsDir)
 
 	// bd init must run from the parent directory (not inside .beads/).
-	// Use --server to match all production callers (rig/manager.go, doctor/rig_check.go, cmd/install.go).
 	parentDir := filepath.Dir(beadsDir)
 	initArgs := []string{"init"}
 	if prefix != "" {
 		initArgs = append(initArgs, "--prefix", prefix)
 	}
-	initArgs = append(initArgs, "--server")
+	if backend == config.BeadsBackendDolt {
+		initArgs = append(initArgs, "--server")
+	} else {
+		initArgs = append(initArgs, "--backend", string(backend))
+	}
 	cmd := exec.Command("bd", initArgs...)
 	cmd.Dir = parentDir
 	util.SetDetachedProcessGroup(cmd)
