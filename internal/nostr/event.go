@@ -34,7 +34,7 @@ func NewLogStatusEvent(rig, role, actor, eventType, visibility string, payload i
 
 	return &nostr.Event{
 		CreatedAt: nostr.Timestamp(time.Now().Unix()),
-		Kind:      nostr.KindUserStatuses,
+		Kind:      nostr.Kind(cascadia.NIP38_USER_STATUS),
 		Tags:      tags,
 		Content:   string(content),
 	}, nil

@@ -17,8 +17,8 @@ func TestNewLogStatusEventUsesCanonicalNIP38Shape(t *testing.T) {
 		t.Fatalf("NewLogStatusEvent: %v", err)
 	}
 
-	if event.Kind != nostr.KindUserStatuses {
-		t.Fatalf("kind = %d, want NIP-38 %d", event.Kind, nostr.KindUserStatuses)
+	if event.Kind != nostr.Kind(cascadia.NIP38_USER_STATUS) {
+		t.Fatalf("kind = %d, want NIP-38 %d", event.Kind, nostr.Kind(cascadia.NIP38_USER_STATUS))
 	}
 
 	want := map[string]string{
