@@ -28,32 +28,30 @@ const (
 )
 
 // NewAgentCapabilityEvent creates a canonical 30317 capability descriptor.
-func NewAgentCapabilityEvent(agentID, rig, role, capability string, details interface{}) (*nostr.Event, error) {
-	if agentID == "" {
+func NewAgentCapabilityEvent(rig, role string, payload cascadia.CascadiaAgentCapabilityV1Payload) (*nostr.Event, error) {
+	if payload.AgentId == "" {
 		return nil, fmt.Errorf("agent ID is required")
 	}
 	if role == "" {
 		return nil, fmt.Errorf("agent role is required")
 	}
-	if capability == "" {
+	if payload.Capability == "" {
 		return nil, fmt.Errorf("capability is required")
 	}
+	if err := payload.Validate(); err != nil {
+		return nil, err
+	}
 
-	content, err := json.Marshal(map[string]interface{}{
-		"schema":     agentCapabilitySchema,
-		"runtime":    "gastown",
-		"capability": capability,
-		"details":    details,
-	})
+	content, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
 
 	tags := BaseTags(rig, role, "")
 	tags = append(tags,
-		ReplaceableTag("agent:"+agentID+":cap:"+capability),
-		nostr.Tag{cascadia.TagAgent, role},
-		nostr.Tag{cascadia.TagCap, capability},
+		ReplaceableTag("agent:"+payload.AgentId+":cap:"+payload.Capability),
+		nostr.Tag{cascadia.TagAgent, payload.AgentId},
+		nostr.Tag{cascadia.TagCap, payload.Capability},
 		nostr.Tag{cascadia.TagRuntime, "gastown"},
 		nostr.Tag{cascadia.TagSchema, agentCapabilitySchema},
 	)
@@ -68,21 +66,20 @@ func NewAgentCapabilityEvent(agentID, rig, role, capability string, details inte
 
 // NewTaskStateEvent creates a canonical 30900 task:* state projection for
 // beads/nostrig task state.
-func NewTaskStateEvent(taskID string, state interface{}) (*nostr.Event, error) {
-	if taskID == "" {
+func NewTaskStateEvent(payload cascadia.CascadiaTaskStateV1Payload) (*nostr.Event, error) {
+	if payload.Id == "" {
 		return nil, fmt.Errorf("task ID is required")
 	}
-	content, err := json.Marshal(map[string]interface{}{
-		"schema": taskStateSchema,
-		"task":   taskID,
-		"state":  state,
-	})
+	if err := payload.Validate(); err != nil {
+		return nil, err
+	}
+	content, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
 
 	tags := nostr.Tags{
-		ReplaceableTag(TaskDTag(taskID)),
+		ReplaceableTag(TaskDTag(payload.Id)),
 		nostr.Tag{cascadia.TagDomain, "task"},
 		nostr.Tag{cascadia.TagSchema, taskStateSchema},
 	}
@@ -96,20 +93,28 @@ func NewTaskStateEvent(taskID string, state interface{}) (*nostr.Event, error) {
 }
 
 // NewTaskQueueEvent creates a canonical NIP-51 collection for a queue or epic.
-// NIP-29 group identity can be linked with the optional h tag.
-func NewTaskQueueEvent(queueID string, taskIDs []string, groupID string) (*nostr.Event, error) {
+// NIP-29 group identity can be linked with the optional h tag. taskAuthor is
+// required because NIP-33 a-tags are kind:pubkey:d-tag coordinates.
+func NewTaskQueueEvent(queueID, taskAuthor string, taskIDs []string, groupID string) (*nostr.Event, error) {
 	if queueID == "" {
 		return nil, fmt.Errorf("queue ID is required")
 	}
-	content, err := json.Marshal(map[string]interface{}{
-		"schema": taskQueueSchema,
-		"queue":  queueID,
-	})
+	if taskAuthor == "" {
+		return nil, fmt.Errorf("task author pubkey is required")
+	}
+	payload := cascadia.CascadiaTaskCollectionV1Payload{Id: queueID}
+	if err := payload.Validate(); err != nil {
+		return nil, err
+	}
+	content, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
 
-	tags := nostr.Tags{ReplaceableTag(QueueDTag(queueID))}
+	tags := nostr.Tags{
+		ReplaceableTag(QueueDTag(queueID)),
+		nostr.Tag{cascadia.TagSchema, taskQueueSchema},
+	}
 	if groupID != "" {
 		tags = append(tags, nostr.Tag{"h", groupID})
 	}
@@ -117,7 +122,7 @@ func NewTaskQueueEvent(queueID string, taskIDs []string, groupID string) (*nostr
 		if taskID == "" {
 			continue
 		}
-		tags = append(tags, nostr.Tag{cascadia.TagA, fmt.Sprintf("%d:%s:%s", cascadia.CAS_CP_STATE, "", TaskDTag(taskID))})
+		tags = append(tags, nostr.Tag{cascadia.TagA, fmt.Sprintf("%d:%s:%s", cascadia.CAS_CP_STATE, taskAuthor, TaskDTag(taskID))})
 	}
 
 	return &nostr.Event{

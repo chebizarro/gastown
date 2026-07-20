@@ -36,19 +36,27 @@ func TestCanonicalAliasesUseGeneratedCascadiaKinds(t *testing.T) {
 }
 
 func TestCanonicalMigrationConstructors(t *testing.T) {
-	capability, err := NewAgentCapabilityEvent("myrig/polecats/Toast", "myrig", "polecat", "task-runner", nil)
+	capability, err := NewAgentCapabilityEvent("myrig", "polecat", cascadia.CascadiaAgentCapabilityV1Payload{
+		AgentId:    "myrig/polecats/Toast",
+		Capability: "task-runner",
+	})
 	if err != nil {
 		t.Fatalf("NewAgentCapabilityEvent: %v", err)
 	}
 	requireKindAndTags(t, capability, cascadia.CAS_AGENT_CAPABILITY, map[string]string{
 		"d":                 "agent:myrig/polecats/Toast:cap:task-runner",
-		cascadia.TagAgent:   "polecat",
+		cascadia.TagAgent:   "myrig/polecats/Toast",
 		cascadia.TagCap:     "task-runner",
 		cascadia.TagRuntime: "gastown",
 		cascadia.TagSchema:  agentCapabilitySchema,
 	})
 
-	taskState, err := NewTaskStateEvent("fp-106", map[string]string{"status": "open"})
+	taskState, err := NewTaskStateEvent(cascadia.CascadiaTaskStateV1Payload{
+		Id:       "fp-106",
+		Title:    "Gastown canonical-kind migration",
+		Status:   "open",
+		Priority: "P4",
+	})
 	if err != nil {
 		t.Fatalf("NewTaskStateEvent: %v", err)
 	}
@@ -58,16 +66,19 @@ func TestCanonicalMigrationConstructors(t *testing.T) {
 		cascadia.TagSchema: taskStateSchema,
 	})
 
-	queue, err := NewTaskQueueEvent("merge", []string{"fp-106"}, "fleet-dev")
+	queue, err := NewTaskQueueEvent("merge", "abc123", []string{"fp-106"}, "fleet-dev")
 	if err != nil {
 		t.Fatalf("NewTaskQueueEvent: %v", err)
 	}
 	requireKindAndTags(t, queue, cascadia.NIP51_TASK_COLLECTION, map[string]string{
-		"d": "queue:merge",
-		"h": "fleet-dev",
+		"d":                "queue:merge",
+		"h":                "fleet-dev",
+		cascadia.TagSchema: taskQueueSchema,
 	})
-	if _, ok := tagValue(queue.Tags, cascadia.TagA); !ok {
+	if coordinate, ok := tagValue(queue.Tags, cascadia.TagA); !ok {
 		t.Fatal("queue event missing NIP-51 a tag")
+	} else if coordinate != "30900:abc123:task:fp-106" {
+		t.Fatalf("queue task coordinate = %q", coordinate)
 	}
 
 	intent, err := NewContextVMIntentEvent("abc123", "task/update", map[string]string{"id": "fp-106"}, "req-1")
