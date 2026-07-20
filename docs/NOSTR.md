@@ -2,7 +2,9 @@
 
 > Version: 0.3.0 | Status: Draft | Last updated: 2026-02-13
 
-Gas Town can publish its operational state to [Nostr](https://nostr.com) relays, making agent activity, lifecycle events, convoy progress, and issue state visible to external consumers (like the Flotilla dashboard or other monitoring tools) without filesystem access.
+Gas Town can publish its operational state to [Nostr](https://nostr.com) relays, making agent activity, lifecycle events, task state, and queue membership visible to external consumers (like the Flotilla dashboard or other monitoring tools) without filesystem access.
+
+Gas Town's Cascadia-facing events use the generated `git.sharegap.net/cascadia/cascadia-go` canonical bindings. The older Gas Town-only `30318`-`30325` block is retired: status is `30315`, heartbeat is `30316`, capabilities are `30317`, task/beads state is `30900 task:*`, task queues are NIP-51 `30000` collections, and task mutations use ContextVM `25910`.
 
 This guide covers how to enable, configure, and use the Nostr integration.
 
@@ -19,9 +21,9 @@ This guide covers how to enable, configure, and use the Nostr integration.
 4. [Features](#features)
    - [Activity Feed (Dual-Write)](#activity-feed-dual-write)
    - [Agent Lifecycle & Heartbeats](#agent-lifecycle--heartbeats)
-   - [Convoy State Publishing](#convoy-state-publishing)
+   - [Task State Publishing](#task-state-publishing)
    - [Issue Mirroring](#issue-mirroring)
-   - [Protocol Events](#protocol-events)
+   - [ContextVM Protocol Events](#contextvm-protocol-events)
    - [Chat (DMs & Channels)](#chat-dms--channels)
    - [Work Queues](#work-queues)
 5. [Health & Monitoring](#health--monitoring)
@@ -226,7 +228,7 @@ See [docs/examples/](examples/) for complete configuration examples.
 
 ### Activity Feed (Dual-Write)
 
-When Nostr is enabled, every event written to `.events.jsonl` is also published as a **kind 30315** (`LOG_STATUS`) Nostr event. This includes:
+When Nostr is enabled, every event written to `.events.jsonl` is also published as a canonical **kind 30315** (`NIP38_USER_STATUS`) status event. This includes:
 
 - `sling`, `hook`, `unhook`, `handoff`, `done`
 - `session_start`, `session_end`, `session_death`
@@ -245,7 +247,7 @@ The dual-write is **async and non-blocking** — the local JSONL file remains th
 
 ### Agent Lifecycle & Heartbeats
 
-Each agent publishes **kind 30316** (`LIFECYCLE`) NIP-33 replaceable events:
+Each agent publishes canonical **kind 30316** (`CAS_AGENT_HEARTBEAT`) addressable events:
 
 | State | Meaning |
 |-------|---------|
@@ -260,38 +262,40 @@ The deacon detects stale agents by checking heartbeat timestamps:
 - Agents: stale after 3× heartbeat interval (180s)
 - Deacon: stale after 2× heartbeat interval (60s)
 
-### Convoy State Publishing
+Capabilities are published as canonical **kind 30317** (`CAS_AGENT_CAPABILITY`) addressable events keyed by namespaced `d` tags.
 
-**Kind 30318** (`GT_CONVOY_STATE`) replaceable events publish the current state of convoys:
+### Task State Publishing
+
+Canonical **kind 30900** (`CAS_CP_STATE`) addressable events publish current task and convoy-derived state:
 - Tracked issues with status, assignee, and dependencies
 - Summary statistics (total, done, in-progress, blocked)
 - Convoy status (active, paused, completed)
 
-The `d` tag is set to the convoy ID for NIP-33 deduplication.
+The `d` tag is namespaced as `task:<id>` for NIP-33 deduplication. Content uses `cascadia.task-state.v1`.
 
 ### Issue Mirroring
 
-**Kind 30319** (`GT_BEADS_ISSUE_STATE`) replaceable events mirror beads issues to Nostr:
+Beads issues are mirrored through the same canonical **kind 30900** task-state projection:
 - Full issue metadata (title, status, priority, type)
 - Dependency graph (blocks, blocked_by, related)
 - Blob references (links to Blossom-stored artifacts)
 
 Issues are polled at a configurable interval (default: 120s). A content hash is computed to avoid republishing unchanged issues.
 
-### Protocol Events
+### ContextVM Protocol Events
 
-**Kind 30320** (`GT_PROTOCOL_EVENT`) events carry machine-to-machine signals:
+Canonical **kind 25910** (`CAS_INTENT`) ContextVM JSON-RPC events carry machine-to-machine task mutations:
 
-| Message Type | Description |
-|-------------|-------------|
-| `POLECAT_DONE` | Polecat finished its assigned work |
-| `MERGE_READY` | Branch is ready for merge |
-| `MERGED` | Branch has been merged |
-| `MERGE_FAILED` | Merge attempt failed |
-| `REWORK_REQUEST` | Work needs rework |
-| `HELP` | Agent requesting assistance |
+| Method | Description |
+|--------|-------------|
+| `task/claim` | Claim a task |
+| `task/assign` | Assign a task |
+| `task/update` | Update task metadata or progress |
+| `task/close` | Close a task |
+| `queue/enqueue` | Add a task to a queue |
+| `queue/dequeue` | Remove a task from a queue |
 
-Protocol events include sender, recipient, and correlation tags for routing.
+ContextVM intents include recipient `p`, `method`, and schema tags for routing. Private payloads should be gift-wrapped via NIP-59 where needed.
 
 ### Chat (DMs & Channels)
 
@@ -334,18 +338,14 @@ Send a DM with content `help` to any agent to see its available commands.
 
 ### Work Queues
 
-**Kind 30325** (`GT_WORK_ITEM`) events implement a distributed work queue:
-- `PublishWorkItem()` — Submit work to a named queue
-- `ClaimWorkItem()` — Claim a work item for processing
-- `CompleteWorkItem()` — Mark work as completed
-- `FailWorkItem()` — Mark work as failed with reason
+NIP-51 **kind 30000** collections implement task queues and epic membership:
+- `queue:<id>` `d` tags identify named queues
+- `a` tags reference canonical `30900` `task:<id>` state events
+- Optional NIP-29 `h` tags link queues to relay-native groups
 
 ### Group, Queue, and Channel Definitions
 
-Administrative events define organizational structure:
-- **Kind 30321** (`GT_GROUP_DEF`) — Group membership (e.g., "polecat-squad-alpha")
-- **Kind 30322** (`GT_QUEUE_DEF`) — Work queue configuration (merge-queue, patrol-queue)
-- **Kind 30323** (`GT_CHANNEL_DEF`) — Pub/sub channel definitions with retention policies
+Organizational structure uses standard NIP-29 groups plus NIP-51 collections. Gas Town no longer defines custom `GT_GROUP_DEF`, `GT_QUEUE_DEF`, or `GT_CHANNEL_DEF` kinds.
 
 ---
 
