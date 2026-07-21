@@ -57,20 +57,19 @@ The core Nostr package. All Nostr event construction, signing, relay management,
 
 | File | Purpose | Key Types |
 |------|---------|-----------|
-| `types.go` | Event kind constants, tag builders, protocol constants | `Correlations`, `BaseTags()`, `SchemaVersion()` |
+| `types.go` | Standard identity kind constants, tag builders, protocol constants | `Correlations`, `BaseTags()`, `SchemaVersion()` |
 | `signer.go` | Event signing abstraction | `Signer` (interface), `NIP46Signer`, `LocalSigner` |
 | `client.go` | Relay connection pool | `RelayPool` |
 | `publisher.go` | High-level sign→broadcast→spool API | `Publisher` |
 | `spool.go` | Local event store for offline resilience | `Spool`, `SpoolEntry` |
-| `event.go` | Event construction helpers | `NewLogStatusEvent()`, `NewLifecycleEvent()`, etc. |
+| `event.go` | Canonical status and heartbeat construction helpers | `NewLogStatusEvent()`, `NewAgentHeartbeatEvent()` |
+| `canonical.go` | Cascadia-backed task, capability, collection, and intent constructors | `KindStatus`, `KindHeartbeat`, `KindCapability`, `KindTaskState`, `KindTaskCollection`, `KindIntent` |
 | `identity.go` | Per-agent keypair provisioning | `IdentityManager` |
 | `registry.go` | Agent identity registry | `Registry` |
 | `lifecycle.go` | Agent heartbeat publishing | `HeartbeatPublisher`, `PublishDeath()` |
-| `convoy.go` | Convoy state publishing (kind 30318) | `ConvoyStateContent`, `PublishConvoyState()` |
-| `issues.go` | Issue mirroring (kind 30319) | `BeadsIssueContent`, `PublishIssueMirror()` |
-| `protocol.go` | Machine-to-machine signals (kind 30320) | `PublishProtocolEvent()`, `ProtocolEventRouter` |
-| `workqueue.go` | Work queue items (kind 30325) | `PublishWorkItem()`, `ClaimWorkItem()` |
-| `definitions.go` | Group/queue/channel definitions (30321-30323) | `PublishGroupDef()`, `PublishQueueDef()` |
+| task state helpers | Beads/nostrig task state projection through canonical `30900 task:<id>` records | `NewTaskStateEvent()` |
+| task collection helpers | Queue and epic membership through NIP-51 `30000` collections | `NewTaskQueueEvent()` |
+| mutation helpers | Machine-to-machine task mutation through ContextVM `25910` JSON-RPC envelopes | `NewContextVMIntentEvent()` |
 | `dm.go` | NIP-17 encrypted DMs | `DMSender`, `DMListener` |
 | `channels.go` | NIP-28 public channels | `CreateTownChannels()`, `PostChannelMessage()` |
 | `commands.go` | DM command router | `CommandRouter`, `RegisterMayorCommands()` |
@@ -159,23 +158,23 @@ Exponential backoff: 30s → 60s → 120s → 300s cap.
 Each event kind has a constructor in `event.go`:
 
 ```go
-// Kind 30315 - Activity feed
+// Kind 30315 - Activity/status feed
 event, _ := nostr.NewLogStatusEvent(rig, role, actor, eventType, visibility, payload)
 
-// Kind 30316 - Lifecycle
-event, _ := nostr.NewLifecycleEvent(rig, role, actor, instanceID, action, payload)
+// Kind 30316 - Agent heartbeat
+event, _ := nostr.NewAgentHeartbeatEvent(agentID, rig, role, status)
 
-// Kind 30318 - Convoy state
-event, _ := nostr.NewConvoyStateEvent(rig, role, actor, convoyID, state)
+// Kind 30317 - Agent capability
+event, _ := nostr.NewAgentCapabilityEvent(rig, role, capabilityPayload)
 
-// Kind 30319 - Issue mirror
-event, _ := nostr.NewBeadsIssueStateEvent(rig, role, actor, issueID, issueData)
+// Kind 30900 - Task state
+event, _ := nostr.NewTaskStateEvent(taskPayload)
 
-// Kind 30320 - Protocol event
-event, _ := nostr.NewProtocolEvent(rig, role, actor, protocolType, payload)
+// Kind 30000 - NIP-51 task collection
+event, _ := nostr.NewTaskQueueEvent(queueID, taskAuthorPubkey, taskIDs, groupID)
 
-// Kind 30325 - Work item
-event, _ := nostr.NewWorkItemEvent(rig, role, actor, queueName, workItem)
+// Kind 25910 - ContextVM task mutation
+event, _ := nostr.NewContextVMIntentEvent(recipientPubkey, method, params, requestID)
 ```
 
 Higher-level helpers exist in specialized files (e.g., `PublishConvoyState()`, `PublishIssueMirror()`) that handle both event construction and publishing.

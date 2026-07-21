@@ -98,6 +98,8 @@ fiatjaf.com/nostr v0.0.0-20260611214214-c4534c716026/go.mod h1:b1EIUDnd133Ie8Pg8
 filippo.io/edwards25519 v1.1.1 h1:YpjwWWlNmGIDyXOn8zLzqiD+9TyIlPhGFG96P39uBpw=
 filippo.io/edwards25519 v1.1.1/go.mod h1:BxyFTGdWcka3PhytdK4V28tE5sGfRvvvRV7EaN4VDT4=
 gioui.org v0.0.0-20210308172011-57750fc8a0a6/go.mod h1:RSH6KIUZ0p2xy5zHDxgAM4zumjgTw83q2ge/PI+yyw8=
+git.sharegap.net/cascadia/cascadia-go v1.0.2 h1:fhmiBi37BeorboQlpGlw0goUMIcaWoIpj51bO1h4sXA=
+git.sharegap.net/cascadia/cascadia-go v1.0.2/go.mod h1:4gZR4rS9vec7ufmq7Bb9U7T175COytwDirgJu3+NqCM=
 git.sr.ht/~sbinet/gg v0.3.1 h1:LNhjNn8DerC8f9DHLz6lS0YYul/b602DUxDgGkd/Aik=
 git.sr.ht/~sbinet/gg v0.3.1/go.mod h1:KGYtlADtqsqANL9ueOFkWymvzUvLMQllU5Ixo+8v3pc=
 github.com/AdaLogics/go-fuzz-headers v0.0.0-20240806141605-e8a1dd7889d6 h1:He8afgbRMd7mFxO99hRNu+6tazq8nFF9lIwo9JFroBk=

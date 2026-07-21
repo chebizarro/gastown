@@ -3,6 +3,7 @@ package nostr
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -127,6 +128,14 @@ func TestNoRetiredGastownKindDefinitionsInInternalSource(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCascadiaKindConformanceScript(t *testing.T) {
+	cmd := exec.Command("bash", filepath.Join("..", "..", "scripts", "check-cascadia-kind-conformance.sh"))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("cascadia kind conformance failed: %v\n%s", err, out)
 	}
 }
 
