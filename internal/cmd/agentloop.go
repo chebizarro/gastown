@@ -170,6 +170,10 @@ func runAgentLoopRun(cmd *cobra.Command, args []string) error {
 
 	loop := agentloop.NewAgentLoop(client, executor, cfg)
 
+	// Advertise the capability from the active runtime path. Publication is
+	// best-effort and uses the same configured NIP-46 identity as heartbeats.
+	go events.PublishAgentCapability(actor, rigName, role, "task-runner", nil)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

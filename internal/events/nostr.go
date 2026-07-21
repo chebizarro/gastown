@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	cascadia "git.sharegap.net/cascadia/cascadia-go"
 	"github.com/steveyegge/gastown/internal/config"
 	gtnostr "github.com/steveyegge/gastown/internal/nostr"
 )
@@ -252,6 +253,18 @@ func publishToNostr(event Event) {
 	if err := publisher.PublishReplaceable(context.Background(), nostrEvent); err != nil {
 		log.Printf("[events/nostr] Publish failed for %s (spooled): %v", event.Type, err)
 	}
+
+	// Task lifecycle feed events also drive the canonical 30900 task-state
+	// projection. This keeps the active dual-write path, rather than only
+	// library callers, on the shared task contract.
+	if taskState, ok := taskStateProjection(event, event.Actor); ok {
+		taskEvent, err := gtnostr.NewTaskStateEvent(taskState)
+		if err != nil {
+			log.Printf("[events/nostr] Failed to build task state for %s: %v", taskState.Id, err)
+		} else if err := publisher.PublishReplaceable(context.Background(), taskEvent); err != nil {
+			log.Printf("[events/nostr] Task state publish failed for %s (spooled): %v", taskState.Id, err)
+		}
+	}
 }
 
 // PublishAgentHeartbeat publishes the latest canonical heartbeat for an API
@@ -273,6 +286,62 @@ func PublishAgentHeartbeat(agentID, rig, role, status string) {
 	if err := publisher.PublishReplaceable(ctx, event); err != nil {
 		log.Printf("[events/nostr] Heartbeat publish failed for %s: %v", agentID, err)
 	}
+}
+
+// PublishAgentCapability advertises an API agent loop on the canonical 30317
+// capability contract. It is best-effort and uses the role's configured NIP-46
+// signer, exactly like heartbeats.
+func PublishAgentCapability(agentID, rig, role, capability string, tools []string) {
+	publisher := getPublisher(role)
+	if publisher == nil {
+		return
+	}
+
+	event, err := gtnostr.NewAgentCapabilityEvent(rig, role, cascadia.CascadiaAgentCapabilityV1Payload{
+		AgentId:    agentID,
+		Capability: capability,
+		Tools:      tools,
+	})
+	if err != nil {
+		log.Printf("[events/nostr] Failed to build capability for %s: %v", agentID, err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), gtnostr.DefaultPublishTimeout)
+	defer cancel()
+	if err := publisher.PublishReplaceable(ctx, event); err != nil {
+		log.Printf("[events/nostr] Capability publish failed for %s: %v", agentID, err)
+	}
+}
+
+func taskStateProjection(event Event, assignee string) (cascadia.CascadiaTaskStateV1Payload, bool) {
+	if event.Payload == nil {
+		return cascadia.CascadiaTaskStateV1Payload{}, false
+	}
+	taskID := getString(event.Payload, "bead")
+	if taskID == "" {
+		return cascadia.CascadiaTaskStateV1Payload{}, false
+	}
+
+	status := ""
+	switch event.Type {
+	case TypeSling, TypeHook:
+		status = "in_progress"
+	case TypeUnhook:
+		status = "open"
+	case TypeDone:
+		status = "closed"
+	default:
+		return cascadia.CascadiaTaskStateV1Payload{}, false
+	}
+
+	return cascadia.CascadiaTaskStateV1Payload{
+		Id:       taskID,
+		Title:    taskID,
+		Status:   status,
+		Assignee: assignee,
+		Metadata: map[string]any{"gastown_event": event.Type},
+	}, true
 }
 
 // extractCorrelations extracts cross-reference data from event payloads.
