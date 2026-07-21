@@ -38,6 +38,39 @@ func TestResolvePublisherIdentityUsesRoleThenDeaconFallback(t *testing.T) {
 	}
 }
 
+func TestTaskStateProjectionFollowsActiveLifecycle(t *testing.T) {
+	tests := []struct {
+		eventType string
+		status    string
+	}{
+		{TypeSling, "in_progress"},
+		{TypeHook, "in_progress"},
+		{TypeUnhook, "open"},
+		{TypeDone, "closed"},
+	}
+	for _, test := range tests {
+		t.Run(test.eventType, func(t *testing.T) {
+			payload, ok := taskStateProjection(Event{
+				Type:    test.eventType,
+				Payload: map[string]interface{}{"bead": "fp-106"},
+			}, "rig/polecats/Gus")
+			if !ok {
+				t.Fatal("task state projection was not produced")
+			}
+			if payload.Id != "fp-106" || payload.Status != test.status || payload.Assignee != "rig/polecats/Gus" {
+				t.Fatalf("projection = %#v", payload)
+			}
+			if err := payload.Validate(); err != nil {
+				t.Fatalf("projection does not satisfy canonical schema: %v", err)
+			}
+		})
+	}
+
+	if _, ok := taskStateProjection(Event{Type: TypeHandoff, Payload: map[string]interface{}{"bead": "fp-106"}}, "Gus"); ok {
+		t.Fatal("non-task lifecycle event produced a task projection")
+	}
+}
+
 func TestGetPublisherUsesRoleSignerThenDeaconFallback(t *testing.T) {
 	ResetPublisherForTesting()
 	originalLoad := loadPublisherConfig
