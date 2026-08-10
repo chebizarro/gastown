@@ -2,6 +2,7 @@ package nostr
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"fiatjaf.com/nostr"
@@ -31,6 +32,34 @@ func TestNewLogStatusEventUsesCanonicalNIP38Shape(t *testing.T) {
 		if got, ok := tagValue(event.Tags, key); !ok || got != value {
 			t.Errorf("tag %q = %q, %v; want %q", key, got, ok, value)
 		}
+	}
+}
+
+func TestNewNIP29GroupMessageUsesKind9AndGroupTag(t *testing.T) {
+	event, err := NewNIP29GroupMessage("fleet-ops", "convoy_progress", "gastown", "deacon", "deacon", "[progress] convoy hq-cv-1")
+	if err != nil {
+		t.Fatalf("NewNIP29GroupMessage: %v", err)
+	}
+	if event.Kind != nostr.KindSimpleGroupChatMessage {
+		t.Fatalf("kind = %d, want %d", event.Kind, nostr.KindSimpleGroupChatMessage)
+	}
+	if got, ok := tagValue(event.Tags, "h"); !ok || got != "fleet-ops" {
+		t.Fatalf("h tag = %q, %v", got, ok)
+	}
+	if _, ok := tagValue(event.Tags, "d"); ok {
+		t.Fatal("client group message must not use relay-side d metadata tag")
+	}
+}
+
+func TestWithCanonicalReferences(t *testing.T) {
+	event := &nostr.Event{}
+	id := strings.Repeat("a", 64)
+	WithCanonicalReferences(event, id, "30900:pubkey:task:fp-104")
+	if got, ok := tagValue(event.Tags, "e"); !ok || got != id {
+		t.Fatalf("e tag = %q, %v", got, ok)
+	}
+	if got, ok := tagValue(event.Tags, "a"); !ok || got != "30900:pubkey:task:fp-104" {
+		t.Fatalf("a tag = %q, %v", got, ok)
 	}
 }
 

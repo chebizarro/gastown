@@ -3027,6 +3027,30 @@ func validateNostrConfig(c *NostrConfig) error {
 			return fmt.Errorf("write_relays: %w", err)
 		}
 	}
+	if c.NIP29 != nil {
+		if c.NIP29.Enabled && len(c.NIP29.Relays) == 0 {
+			return fmt.Errorf("%w: nip29.relays (at least one group relay required when enabled)", ErrMissingField)
+		}
+		for _, relay := range c.NIP29.Relays {
+			if err := validateRelayURL(relay); err != nil {
+				return fmt.Errorf("nip29.relays: %w", err)
+			}
+		}
+		if c.NIP29.Enabled && len(c.NIP29.Groups.Progress)+len(c.NIP29.Groups.Asks)+len(c.NIP29.Groups.Results) == 0 {
+			return fmt.Errorf("%w: nip29.groups (at least one target group required when enabled)", ErrMissingField)
+		}
+		for class, groups := range map[string][]string{
+			"progress": c.NIP29.Groups.Progress,
+			"asks":     c.NIP29.Groups.Asks,
+			"results":  c.NIP29.Groups.Results,
+		} {
+			for _, group := range groups {
+				if strings.TrimSpace(group) == "" {
+					return fmt.Errorf("%w: nip29.groups.%s contains an empty group ID", ErrMissingField, class)
+				}
+			}
+		}
+	}
 	// Validate Blossom server URLs
 	for _, server := range c.BlossomServers {
 		if !strings.HasPrefix(server, "http://") && !strings.HasPrefix(server, "https://") {
@@ -3224,6 +3248,9 @@ func mergeNostrConfig(town, rig *NostrConfig) *NostrConfig {
 	if len(rig.BlossomServers) > 0 {
 		merged.BlossomServers = rig.BlossomServers
 	}
+	if rig.NIP29 != nil {
+		merged.NIP29 = rig.NIP29
+	}
 	// Merge identities: start with town, overlay rig
 	mergedIdentities := make(map[string]*NostrIdentity)
 	for role, id := range town.Identities {
@@ -3256,6 +3283,8 @@ func ApplyNostrEnvOverrides(config *NostrConfig) {
 	if v := os.Getenv("GT_NOSTR_BLOSSOM_SERVERS"); v != "" {
 		config.BlossomServers = strings.Split(v, ",")
 	}
+
+	applyNIP29EnvOverrides(config)
 
 	// Single-identity env vars: create/update a "default" identity
 	pubkey := os.Getenv("GT_NOSTR_PUBKEY")
@@ -3291,6 +3320,50 @@ func ApplyNostrEnvOverrides(config *NostrConfig) {
 			config.Defaults.HeartbeatIntervalSec = n
 		}
 	}
+}
+
+func applyNIP29EnvOverrides(config *NostrConfig) {
+	values := []struct {
+		name string
+		set  func(*NIP29Config, []string)
+	}{
+		{"GT_NOSTR_NIP29_RELAYS", func(c *NIP29Config, v []string) { c.Relays = v }},
+		{"GT_NOSTR_NIP29_PROGRESS_GROUPS", func(c *NIP29Config, v []string) { c.Groups.Progress = v }},
+		{"GT_NOSTR_NIP29_ASK_GROUPS", func(c *NIP29Config, v []string) { c.Groups.Asks = v }},
+		{"GT_NOSTR_NIP29_RESULT_GROUPS", func(c *NIP29Config, v []string) { c.Groups.Results = v }},
+	}
+	enabled, hasEnabled := os.LookupEnv("GT_NOSTR_NIP29_ENABLED")
+	hasValues := false
+	for _, value := range values {
+		if _, ok := os.LookupEnv(value.name); ok {
+			hasValues = true
+			break
+		}
+	}
+	if !hasEnabled && !hasValues {
+		return
+	}
+	if config.NIP29 == nil {
+		config.NIP29 = &NIP29Config{}
+	}
+	if hasEnabled {
+		config.NIP29.Enabled = enabled == "1" || enabled == "true" || enabled == "yes"
+	}
+	for _, value := range values {
+		if raw, ok := os.LookupEnv(value.name); ok {
+			value.set(config.NIP29, splitTrimmedList(raw))
+		}
+	}
+}
+
+func splitTrimmedList(value string) []string {
+	var result []string
+	for _, item := range strings.Split(value, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			result = append(result, item)
+		}
+	}
+	return result
 }
 
 // parseInt is a simple string-to-int parser for env var overrides.

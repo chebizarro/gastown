@@ -12,9 +12,23 @@
   "blossom_servers": [
     "https://blossom.gastown.example.com"
   ],
-  "dm_relays": [
-    "wss://dm-inbox.gastown.example.com"
-  ],
+  "nip29": {
+    "enabled": true,
+    "relays": [
+      "wss://groups.sharegap.net"
+    ],
+    "groups": {
+      "progress": [
+        "fleet-ops"
+      ],
+      "asks": [
+        "fleet-ops"
+      ],
+      "results": [
+        "fleet-ops"
+      ]
+    }
+  },
   "identities": {
     "deacon": {
       "pubkey": "hex-or-npub1-public-key-here",
@@ -55,8 +69,6 @@
   },
   "defaults": {
     "heartbeat_interval_seconds": 60,
-    "spool_drain_interval_seconds": 30,
-    "convoy_recompute_interval_seconds": 300,
-    "issue_mirror_poll_interval_seconds": 120
+    "spool_drain_interval_seconds": 30
   }
 }

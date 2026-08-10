@@ -5830,6 +5830,15 @@ func TestNostrConfigRoundTrip(t *testing.T) {
 		ReadRelays:     []string{"wss://relay1.example.com", "wss://relay2.example.com"},
 		WriteRelays:    []string{"wss://relay1.example.com"},
 		BlossomServers: []string{"https://blossom.example.com"},
+		NIP29: &NIP29Config{
+			Enabled: true,
+			Relays:  []string{"wss://groups.example.com"},
+			Groups: NIP29Groups{
+				Progress: []string{"fleet-ops"},
+				Asks:     []string{"incidents"},
+				Results:  []string{"fleet-ops", "fleet-dev"},
+			},
+		},
 		Identities: map[string]*NostrIdentity{
 			"deacon": {
 				Pubkey: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
@@ -5879,6 +5888,9 @@ func TestNostrConfigRoundTrip(t *testing.T) {
 	}
 	if len(loaded.BlossomServers) != 1 {
 		t.Errorf("BlossomServers count = %d, want 1", len(loaded.BlossomServers))
+	}
+	if loaded.NIP29 == nil || !loaded.NIP29.Enabled || len(loaded.NIP29.Groups.Results) != 2 {
+		t.Fatalf("NIP29 round trip = %#v", loaded.NIP29)
 	}
 
 	deacon, ok := loaded.Identities["deacon"]
@@ -5988,6 +6000,36 @@ func TestNostrConfigValidation(t *testing.T) {
 			wantErr: true,
 			errMsg:  "blossom_servers",
 		},
+		{
+			name: "enabled NIP-29 requires group relay",
+			config: &NostrConfig{
+				Type:        "nostr",
+				Version:     1,
+				Enabled:     true,
+				WriteRelays: []string{"wss://relay.example.com"},
+				NIP29: &NIP29Config{
+					Enabled: true,
+					Groups:  NIP29Groups{Progress: []string{"fleet-ops"}},
+				},
+			},
+			wantErr: true,
+			errMsg:  "nip29.relays",
+		},
+		{
+			name: "enabled NIP-29 requires target group",
+			config: &NostrConfig{
+				Type:        "nostr",
+				Version:     1,
+				Enabled:     true,
+				WriteRelays: []string{"wss://relay.example.com"},
+				NIP29: &NIP29Config{
+					Enabled: true,
+					Relays:  []string{"wss://groups.example.com"},
+				},
+			},
+			wantErr: true,
+			errMsg:  "nip29.groups",
+		},
 	}
 
 	for _, tc := range tests {
@@ -6017,6 +6059,26 @@ func TestNostrConfigValidation(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestApplyNIP29EnvOverrides(t *testing.T) {
+	t.Setenv("GT_NOSTR_NIP29_ENABLED", "true")
+	t.Setenv("GT_NOSTR_NIP29_RELAYS", "wss://groups.example, wss://backup.example")
+	t.Setenv("GT_NOSTR_NIP29_PROGRESS_GROUPS", "fleet-ops,gastown")
+	t.Setenv("GT_NOSTR_NIP29_ASK_GROUPS", "incidents")
+	t.Setenv("GT_NOSTR_NIP29_RESULT_GROUPS", "fleet-ops")
+
+	cfg := NewNostrConfig()
+	ApplyNostrEnvOverrides(cfg)
+	if cfg.NIP29 == nil || !cfg.NIP29.Enabled {
+		t.Fatalf("NIP29 env config = %#v", cfg.NIP29)
+	}
+	if got := cfg.NIP29.Relays; len(got) != 2 || got[1] != "wss://backup.example" {
+		t.Fatalf("NIP29 relays = %v", got)
+	}
+	if got := cfg.NIP29.Groups.Progress; len(got) != 2 || got[1] != "gastown" {
+		t.Fatalf("progress groups = %v", got)
 	}
 }
 

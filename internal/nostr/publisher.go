@@ -23,7 +23,7 @@ type Publisher struct {
 // NewPublisher creates a publisher from the Nostr configuration.
 // It initializes the signer, relay pool, and local spool.
 func NewPublisher(ctx context.Context, cfg *config.NostrConfig, signer Signer, runtimeDir string) (*Publisher, error) {
-	pool, err := NewRelayPool(ctx, cfg)
+	pool, err := NewRelayPool(ctx, cfg, signer)
 	if err != nil {
 		return nil, fmt.Errorf("creating relay pool: %w", err)
 	}
@@ -53,16 +53,26 @@ func (p *Publisher) WithSigner(signer Signer) *Publisher {
 // If all relays fail, the event is spooled locally for later drain.
 // Returns an error only if both publishing and spooling fail.
 func (p *Publisher) Publish(ctx context.Context, event *nostr.Event) error {
+	return p.publishTo(ctx, event, p.pool.WriteRelayURLs())
+}
+
+// PublishToRelays signs and publishes an event only to targetRelays. Failed
+// group-relay delivery is spooled with the same targets for later retry.
+func (p *Publisher) PublishToRelays(ctx context.Context, event *nostr.Event, targetRelays []string) error {
+	return p.publishTo(ctx, event, targetRelays)
+}
+
+func (p *Publisher) publishTo(ctx context.Context, event *nostr.Event, targetRelays []string) error {
 	// Sign the event
 	if err := p.signer.Sign(ctx, event); err != nil {
 		return fmt.Errorf("signing event: %w", err)
 	}
 
 	// Attempt to broadcast
-	if err := p.pool.Publish(ctx, *event); err != nil {
+	if err := p.pool.PublishTo(ctx, *event, targetRelays); err != nil {
 		log.Printf("[nostr] publish failed, spooling event %s: %v", IDToString(event.ID), err)
 		// Spool for later retry
-		if spoolErr := p.spool.Enqueue(event, p.pool.WriteRelayURLs()); spoolErr != nil {
+		if spoolErr := p.spool.Enqueue(event, targetRelays); spoolErr != nil {
 			return fmt.Errorf("publish failed (%v) and spool failed: %w", err, spoolErr)
 		}
 		// Spooled successfully — not a hard failure

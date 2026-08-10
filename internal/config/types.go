@@ -1728,6 +1728,24 @@ type NostrConfig struct {
 	BlossomServers []string                  `json:"blossom_servers,omitempty"` // Blossom blob storage servers
 	Identities     map[string]*NostrIdentity `json:"identities,omitempty"`      // role → identity mapping
 	Defaults       *NostrDefaults            `json:"defaults,omitempty"`        // timing and behavior defaults
+	NIP29          *NIP29Config              `json:"nip29,omitempty"`           // relay-based coordination groups
+}
+
+// NIP29Config controls publication of conversational convoy coordination
+// messages to relay-based NIP-29 groups. These messages are discussion-only;
+// authoritative task state remains in the configured task system.
+type NIP29Config struct {
+	Enabled bool        `json:"enabled"`
+	Relays  []string    `json:"relays,omitempty"`
+	Groups  NIP29Groups `json:"groups"`
+}
+
+// NIP29Groups maps coordination message classes to target group IDs. A class
+// may target more than one group (for example, fleet ops plus a rig room).
+type NIP29Groups struct {
+	Progress []string `json:"progress,omitempty"`
+	Asks     []string `json:"asks,omitempty"`
+	Results  []string `json:"results,omitempty"`
 }
 
 // NostrIdentity represents a Nostr identity for an agent role.

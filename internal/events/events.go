@@ -74,6 +74,12 @@ const (
 	TypeSchedulerDispatch       = "scheduler_dispatch"        // Bead dispatched from scheduler
 	TypeSchedulerDispatchFailed = "scheduler_dispatch_failed" // Bead dispatch failed (requeued)
 	TypeSchedulerCloseRetry     = "scheduler_close_retry"     // Context close needed last-resort attempt
+
+	// Headless fleet coordination events. These are dual-written to the local
+	// event log and, when configured, NIP-29 discussion groups.
+	TypeConvoyProgress = "convoy_progress"
+	TypeConvoyAsk      = "convoy_ask"
+	TypeConvoyResult   = "convoy_result"
 )
 
 // EventsFile is the name of the raw events log.
@@ -83,6 +89,12 @@ const EventsFile = ".events.jsonl"
 // The event is appended to ~/gt/.events.jsonl.
 // Returns nil if logging fails (events are best-effort).
 func Log(eventType, actor string, payload map[string]interface{}, visibility string) error {
+	return LogAt("", eventType, actor, payload, visibility)
+}
+
+// LogAt writes an event using townRoot instead of relying on the process cwd.
+// Daemons and background convoy managers should use this form.
+func LogAt(townRoot, eventType, actor string, payload map[string]interface{}, visibility string) error {
 	event := Event{
 		Timestamp:  time.Now().UTC().Format(time.RFC3339),
 		Source:     "gt",
@@ -91,12 +103,17 @@ func Log(eventType, actor string, payload map[string]interface{}, visibility str
 		Payload:    payload,
 		Visibility: visibility,
 	}
-	return write(event)
+	return writeAt(townRoot, event)
 }
 
 // LogFeed is a convenience wrapper for feed-visible events.
 func LogFeed(eventType, actor string, payload map[string]interface{}) error {
 	return Log(eventType, actor, payload, VisibilityFeed)
+}
+
+// LogFeedAt is LogFeed with an explicit town root for headless processes.
+func LogFeedAt(townRoot, eventType, actor string, payload map[string]interface{}) error {
+	return LogAt(townRoot, eventType, actor, payload, VisibilityFeed)
 }
 
 // LogAudit is a convenience wrapper for audit-only events.
@@ -108,11 +125,17 @@ func LogAudit(eventType, actor string, payload map[string]interface{}) error {
 // Uses flock for cross-process synchronization — sync.Mutex only protects
 // intra-process goroutines, but multiple gt processes write concurrently.
 func write(event Event) error {
-	// Find town root
-	townRoot, err := workspace.FindFromCwd()
-	if err != nil || townRoot == "" {
-		// Silently ignore - we're not in a Gas Town workspace
-		return nil
+	return writeAt("", event)
+}
+
+func writeAt(townRoot string, event Event) error {
+	if townRoot == "" {
+		var err error
+		townRoot, err = workspace.FindFromCwd()
+		if err != nil || townRoot == "" {
+			// Silently ignore - we're not in a Gas Town workspace
+			return nil
+		}
 	}
 
 	eventsPath := filepath.Join(townRoot, EventsFile)
@@ -145,7 +168,7 @@ func write(event Event) error {
 		return fmt.Errorf("closing events file: %w", err)
 	}
 
-	// Dual-write: publish to Nostr if enabled (async, non-blocking).
+	// Dual-write: publish to Nostr if enabled.
 	// JSONL file is the source of truth; Nostr publish is best-effort.
 	// On relay failure, the spool catches events for later delivery.
 	//
@@ -159,9 +182,25 @@ func write(event Event) error {
 			eventCopy.Payload[k] = v
 		}
 	}
-	go publishToNostr(eventCopy)
+	// Coordination messages emitted by short-lived CLI commands must finish
+	// sign → publish-or-spool before process exit. The general activity feed
+	// remains async so routine command latency is unchanged.
+	if isCoordinationCritical(event.Type) {
+		publishToNostr(eventCopy, townRoot)
+	} else {
+		go publishToNostr(eventCopy, townRoot)
+	}
 
 	return nil
+}
+
+func isCoordinationCritical(eventType string) bool {
+	switch eventType {
+	case TypeConvoyProgress, TypeConvoyAsk, TypeConvoyResult, TypeEscalationSent:
+		return true
+	default:
+		return false
+	}
 }
 
 // Payload helpers for common event structures.
@@ -172,6 +211,19 @@ func SlingPayload(beadID, target string) map[string]interface{} {
 		"bead":   beadID,
 		"target": target,
 	}
+}
+
+// ConvoyCoordinationPayload describes a human-readable convoy lifecycle update.
+func ConvoyCoordinationPayload(convoyID, beadID, status, message string) map[string]interface{} {
+	p := map[string]interface{}{
+		"convoy_id": convoyID,
+		"status":    status,
+		"message":   message,
+	}
+	if beadID != "" {
+		p["bead"] = beadID
+	}
+	return p
 }
 
 // HookPayload creates a payload for hook events.

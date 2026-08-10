@@ -17,25 +17,38 @@ var relayConnect = nostr.RelayConnect
 // RelayPool manages connections to read and write relays.
 // It handles auto-reconnection and health monitoring.
 type RelayPool struct {
-	mu          sync.RWMutex
-	readURLs    []string
-	writeURLs   []string
-	readRelays  []*nostr.Relay
-	writeRelays []*nostr.Relay
-	closed      bool
+	mu               sync.RWMutex
+	readURLs         []string
+	writeURLs        []string
+	defaultWriteURLs []string
+	relayOptions     nostr.RelayOptions
+	readRelays       []*nostr.Relay
+	writeRelays      []*nostr.Relay
+	closed           bool
 }
 
 // NewRelayPool creates a relay pool from the Nostr configuration.
 // It connects to all configured read and write relays.
-func NewRelayPool(ctx context.Context, cfg *config.NostrConfig) (*RelayPool, error) {
+func NewRelayPool(ctx context.Context, cfg *config.NostrConfig, signers ...Signer) (*RelayPool, error) {
+	writeURLs := append([]string(nil), cfg.WriteRelays...)
+	if cfg.NIP29 != nil && cfg.NIP29.Enabled {
+		writeURLs = appendUnique(writeURLs, cfg.NIP29.Relays...)
+	}
 	p := &RelayPool{
-		readURLs:  append([]string(nil), cfg.ReadRelays...),
-		writeURLs: append([]string(nil), cfg.WriteRelays...),
+		readURLs:         append([]string(nil), cfg.ReadRelays...),
+		writeURLs:        writeURLs,
+		defaultWriteURLs: append([]string(nil), cfg.WriteRelays...),
+	}
+	if len(signers) > 0 && signers[0] != nil {
+		signer := signers[0]
+		p.relayOptions.AuthHandler = func(authCtx context.Context, _ *nostr.Relay, event *nostr.Event) error {
+			return signer.Sign(authCtx, event)
+		}
 	}
 
 	// Connect to write relays (required)
-	for _, url := range cfg.WriteRelays {
-		relay, err := relayConnect(ctx, url, nostr.RelayOptions{})
+	for _, url := range writeURLs {
+		relay, err := relayConnect(ctx, url, p.relayOptions)
 		if err != nil {
 			log.Printf("[nostr] warning: failed to connect to write relay %s: %v", url, err)
 			continue
@@ -45,7 +58,7 @@ func NewRelayPool(ctx context.Context, cfg *config.NostrConfig) (*RelayPool, err
 
 	// Connect to read relays (optional)
 	for _, url := range cfg.ReadRelays {
-		relay, err := relayConnect(ctx, url, nostr.RelayOptions{})
+		relay, err := relayConnect(ctx, url, p.relayOptions)
 		if err != nil {
 			log.Printf("[nostr] warning: failed to connect to read relay %s: %v", url, err)
 			continue
@@ -59,6 +72,13 @@ func NewRelayPool(ctx context.Context, cfg *config.NostrConfig) (*RelayPool, err
 // Publish sends an event to all write relays.
 // Returns an error only if ALL relays fail.
 func (p *RelayPool) Publish(ctx context.Context, event nostr.Event) error {
+	return p.PublishTo(ctx, event, p.defaultWriteURLs)
+}
+
+// PublishTo sends an event only to the requested configured write relays.
+// This is used for relay-bound NIP-29 groups so an acknowledgement from an
+// unrelated relay cannot mask failure at the group relay.
+func (p *RelayPool) PublishTo(ctx context.Context, event nostr.Event, targetURLs []string) error {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
@@ -66,14 +86,28 @@ func (p *RelayPool) Publish(ctx context.Context, event nostr.Event) error {
 		return fmt.Errorf("relay pool is closed")
 	}
 
-	if len(p.writeRelays) == 0 {
-		return fmt.Errorf("no write relays connected")
+	if len(targetURLs) == 0 {
+		return fmt.Errorf("no target write relays configured")
+	}
+	targets := make(map[string]struct{}, len(targetURLs))
+	for _, url := range targetURLs {
+		if normalized := nostr.NormalizeURL(url); normalized != "" {
+			targets[normalized] = struct{}{}
+		}
 	}
 
 	var lastErr error
 	successes := 0
+	attempts := 0
 
 	for _, relay := range p.writeRelays {
+		if relay == nil {
+			continue
+		}
+		if _, ok := targets[relay.URL]; !ok {
+			continue
+		}
+		attempts++
 		if err := relay.Publish(ctx, event); err != nil {
 			lastErr = err
 			log.Printf("[nostr] publish to %s failed: %v", relay.URL, err)
@@ -83,10 +117,28 @@ func (p *RelayPool) Publish(ctx context.Context, event nostr.Event) error {
 	}
 
 	if successes == 0 {
+		if attempts == 0 {
+			return fmt.Errorf("no target write relays connected")
+		}
 		return fmt.Errorf("all write relays failed, last error: %w", lastErr)
 	}
 
 	return nil
+}
+
+func appendUnique(base []string, values ...string) []string {
+	seen := make(map[string]struct{}, len(base)+len(values))
+	for _, value := range base {
+		seen[value] = struct{}{}
+	}
+	for _, value := range values {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		base = append(base, value)
+	}
+	return base
 }
 
 // Subscribe creates a subscription across all read relays.
@@ -124,11 +176,11 @@ func (p *RelayPool) Reconnect(ctx context.Context) {
 
 	// Iterate configured URLs rather than only the successfully connected relay
 	// slices. This also retries URLs that failed during NewRelayPool.
-	p.writeRelays = reconnectConfiguredRelays(ctx, "write", p.writeURLs, p.writeRelays)
-	p.readRelays = reconnectConfiguredRelays(ctx, "read", p.readURLs, p.readRelays)
+	p.writeRelays = reconnectConfiguredRelays(ctx, "write", p.writeURLs, p.writeRelays, p.relayOptions)
+	p.readRelays = reconnectConfiguredRelays(ctx, "read", p.readURLs, p.readRelays, p.relayOptions)
 }
 
-func reconnectConfiguredRelays(ctx context.Context, relayType string, urls []string, relays []*nostr.Relay) []*nostr.Relay {
+func reconnectConfiguredRelays(ctx context.Context, relayType string, urls []string, relays []*nostr.Relay, opts nostr.RelayOptions) []*nostr.Relay {
 	indices := make(map[string]int, len(relays))
 	for i, relay := range relays {
 		if relay != nil {
@@ -142,7 +194,7 @@ func reconnectConfiguredRelays(ctx context.Context, relayType string, urls []str
 		}
 
 		log.Printf("[nostr] reconnecting %s relay %s", relayType, url)
-		newRelay, err := relayConnect(ctx, url, nostr.RelayOptions{})
+		newRelay, err := relayConnect(ctx, url, opts)
 		if err != nil {
 			log.Printf("[nostr] reconnect failed for %s: %v", url, err)
 			continue
@@ -180,7 +232,7 @@ func (p *RelayPool) ConnectedWriteRelays() int {
 func (p *RelayPool) WriteRelayURLs() []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return append([]string(nil), p.writeURLs...)
+	return append([]string(nil), p.defaultWriteURLs...)
 }
 
 // HealthCheck logs the current connection status of all relays.

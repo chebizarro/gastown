@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -68,13 +69,17 @@ func transitionConvoyToOpen(convoyID string, force bool) error {
 	switch status {
 	case convoyStatusStagedReady:
 		// Transition directly to open.
-		return bdUpdateStatus(convoyID, convoyStatusOpen)
+		if err := bdUpdateStatus(convoyID, convoyStatusOpen); err != nil {
+			return err
+		}
 
 	case convoyStatusStagedWarnings:
 		if !force {
 			return fmt.Errorf("convoy %s has warnings, use --force to launch", convoyID)
 		}
-		return bdUpdateStatus(convoyID, convoyStatusOpen)
+		if err := bdUpdateStatus(convoyID, convoyStatusOpen); err != nil {
+			return err
+		}
 
 	case convoyStatusOpen:
 		return fmt.Errorf("convoy %s is already launched", convoyID)
@@ -85,6 +90,14 @@ func transitionConvoyToOpen(convoyID string, force bool) error {
 	default:
 		return fmt.Errorf("convoy %s has unexpected status %q", convoyID, result.Status)
 	}
+
+	actor := detectActor()
+	if actor == "" {
+		actor = "gt"
+	}
+	_ = events.LogFeed(events.TypeConvoyProgress, actor,
+		events.ConvoyCoordinationPayload(convoyID, "", convoyStatusOpen, "convoy launched"))
+	return nil
 }
 
 // bdUpdateStatus runs `bd update <id> --status=<status>` against the town beads

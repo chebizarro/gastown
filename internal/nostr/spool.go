@@ -45,11 +45,11 @@ type SpoolEntry struct {
 
 // SpoolMeta contains retry tracking information.
 type SpoolMeta struct {
-	SpooledAt    time.Time `json:"spooled_at"`
-	TargetRelays []string  `json:"target_relays"`
-	Attempts     int       `json:"attempts"`
+	SpooledAt    time.Time  `json:"spooled_at"`
+	TargetRelays []string   `json:"target_relays"`
+	Attempts     int        `json:"attempts"`
 	LastAttempt  *time.Time `json:"last_attempt"`
-	LastError    *string   `json:"last_error"`
+	LastError    *string    `json:"last_error"`
 }
 
 // Default spool limits.
@@ -175,7 +175,7 @@ func (s *Spool) Drain(ctx context.Context, pool *RelayPool) (sent int, failed in
 		}
 
 		// Try to publish
-		if pubErr := pool.Publish(ctx, event); pubErr != nil {
+		if pubErr := pool.PublishTo(ctx, event, entry.SpoolMeta.TargetRelays); pubErr != nil {
 			// Update attempt metadata
 			entry.SpoolMeta.Attempts++
 			nowCopy := now
