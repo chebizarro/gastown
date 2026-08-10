@@ -3,6 +3,7 @@ package events
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"strings"
@@ -75,7 +76,7 @@ var (
 // getPublisher returns the publisher for a role. Initialization failures are
 // retried with bounded exponential backoff instead of disabling Nostr for the
 // lifetime of the process.
-func getPublisher(role string) *gtnostr.Publisher {
+func getPublisher(role string, townRoots ...string) *gtnostr.Publisher {
 	publisherMu.Lock()
 	defer publisherMu.Unlock()
 
@@ -85,7 +86,7 @@ func getPublisher(role string) *gtnostr.Publisher {
 			return nil
 		}
 
-		cfg, err := loadPublisherConfig(nostrConfigPath())
+		cfg, err := loadPublisherConfig(nostrConfigPath(townRoots...))
 		if err != nil {
 			publisherConfigRetry.fail(now)
 			log.Printf("[events/nostr] Failed to load nostr config (retry in %s): %v", publisherConfigRetry.delay, err)
@@ -131,7 +132,7 @@ func getPublisher(role string) *gtnostr.Publisher {
 
 	var publisher *gtnostr.Publisher
 	if publisherBase == nil {
-		publisher, err = newEventsPublisher(context.Background(), publisherConfig, signer, nostrRuntimeDir())
+		publisher, err = newEventsPublisher(context.Background(), publisherConfig, signer, nostrRuntimeDir(townRoots...))
 		if err != nil {
 			_ = signer.Close()
 			slot.retry.fail(now)
@@ -149,16 +150,19 @@ func getPublisher(role string) *gtnostr.Publisher {
 	return publisher
 }
 
-func nostrConfigPath() string {
+func nostrConfigPath(townRoots ...string) string {
 	if path := strings.TrimSpace(os.Getenv("GT_NOSTR_CONFIG")); path != "" {
 		return path
 	}
-	return config.NostrConfigPath(nostrRuntimeDir())
+	return config.NostrConfigPath(nostrRuntimeDir(townRoots...))
 }
 
-func nostrRuntimeDir() string {
+func nostrRuntimeDir(townRoots ...string) string {
 	if townRoot := strings.TrimSpace(os.Getenv("GT_TOWN_ROOT")); townRoot != "" {
 		return townRoot
+	}
+	if len(townRoots) > 0 && strings.TrimSpace(townRoots[0]) != "" {
+		return townRoots[0]
 	}
 	return "."
 }
@@ -220,13 +224,13 @@ func startPublisherMaintenance(publisher *gtnostr.Publisher, interval time.Durat
 
 // publishToNostr converts an Event to a canonical NIP-38 status event and publishes it.
 // This is called asynchronously from write() and should never block.
-func publishToNostr(event Event) {
+func publishToNostr(event Event, townRoot string) {
 	// Extract correlation data from the payload
 	correlations := extractCorrelations(event.Type, event.Payload)
 
 	// Parse actor address to extract rig, role, actor components
 	rig, role, actor := parseActor(event.Actor)
-	publisher := getPublisher(role)
+	publisher := getPublisher(role, townRoot)
 	if publisher == nil {
 		return
 	}
@@ -248,10 +252,98 @@ func publishToNostr(event Event) {
 		addExtraTags(nostrEvent, event.Type, correlations)
 	}
 
-	// Publish (async - publisher handles spool fallback)
-	if err := publisher.PublishReplaceable(context.Background(), nostrEvent); err != nil {
+	// Publisher handles spool fallback. Bound relay operations because selected
+	// coordination events execute synchronously before a CLI process exits.
+	ctx, cancel := context.WithTimeout(context.Background(), gtnostr.DefaultPublishTimeout)
+	err = publisher.PublishReplaceable(ctx, nostrEvent)
+	cancel()
+	if err != nil {
 		log.Printf("[events/nostr] Publish failed for %s (spooled): %v", event.Type, err)
 	}
+
+	publishToNIP29(publisher, event, rig, role, actor, correlations)
+}
+
+type coordinationClass string
+
+const (
+	coordinationProgress coordinationClass = "progress"
+	coordinationAsk      coordinationClass = "ask"
+	coordinationResult   coordinationClass = "result"
+)
+
+func publishToNIP29(publisher *gtnostr.Publisher, event Event, rig, role, actor string, c *correlations) {
+	class, relays, groups := coordinationTargets(event.Type)
+	if len(relays) == 0 || len(groups) == 0 {
+		return
+	}
+	content := formatCoordinationMessage(class, event, c)
+	for _, groupID := range groups {
+		groupEvent, err := gtnostr.NewNIP29GroupMessage(groupID, event.Type, rig, role, actor, content)
+		if err != nil {
+			log.Printf("[events/nostr] Failed to build NIP-29 message for %s: %v", event.Type, err)
+			continue
+		}
+		if c != nil {
+			gtnostr.WithCorrelation(groupEvent, c.IssueID, c.ConvoyID, c.BeadID, c.SessionID)
+		}
+		gtnostr.WithCanonicalReferences(groupEvent,
+			getString(event.Payload, "nostr_event_id"),
+			getString(event.Payload, "nostr_event_address"),
+		)
+		ctx, cancel := context.WithTimeout(context.Background(), gtnostr.DefaultPublishTimeout)
+		err = publisher.PublishToRelays(ctx, groupEvent, relays)
+		cancel()
+		if err != nil {
+			log.Printf("[events/nostr] NIP-29 publish failed for %s/%s: %v", event.Type, groupID, err)
+		}
+	}
+}
+
+func coordinationTargets(eventType string) (coordinationClass, []string, []string) {
+	publisherMu.Lock()
+	defer publisherMu.Unlock()
+	if publisherConfig == nil || publisherConfig.NIP29 == nil || !publisherConfig.NIP29.Enabled {
+		return "", nil, nil
+	}
+	var class coordinationClass
+	var groups []string
+	switch eventType {
+	case TypeConvoyProgress:
+		class, groups = coordinationProgress, publisherConfig.NIP29.Groups.Progress
+	case TypeConvoyAsk, TypeEscalationSent:
+		class, groups = coordinationAsk, publisherConfig.NIP29.Groups.Asks
+	case TypeConvoyResult:
+		class, groups = coordinationResult, publisherConfig.NIP29.Groups.Results
+	default:
+		return "", nil, nil
+	}
+	return class,
+		append([]string(nil), publisherConfig.NIP29.Relays...),
+		append([]string(nil), groups...)
+}
+
+func formatCoordinationMessage(class coordinationClass, event Event, c *correlations) string {
+	parts := make([]string, 0, 3)
+	if c != nil && c.ConvoyID != "" {
+		parts = append(parts, "convoy "+c.ConvoyID)
+	}
+	if c != nil && c.IssueID != "" {
+		parts = append(parts, "task "+c.IssueID)
+	}
+	detail := ""
+	for _, key := range []string{"message", "summary", "reason", "error", "description", "status"} {
+		if detail = strings.TrimSpace(getString(event.Payload, key)); detail != "" {
+			break
+		}
+	}
+	if len(parts) == 0 {
+		parts = append(parts, event.Type)
+	}
+	if detail != "" {
+		parts = append(parts, detail)
+	}
+	return fmt.Sprintf("[%s] %s", class, strings.Join(parts, " — "))
 }
 
 // PublishAgentHeartbeat publishes the latest canonical heartbeat for an API
@@ -285,6 +377,17 @@ func extractCorrelations(eventType string, payload map[string]interface{}) *corr
 	c := &correlations{}
 
 	switch eventType {
+	case TypeConvoyProgress, TypeConvoyAsk, TypeConvoyResult:
+		c.ConvoyID = getString(payload, "convoy_id")
+		c.BeadID = getString(payload, "bead")
+		c.IssueID = c.BeadID
+
+	case TypeEscalationSent:
+		c.IssueID = getString(payload, "escalation_id")
+		if c.IssueID == "" {
+			c.IssueID = getString(payload, "rig")
+		}
+
 	case TypeSling:
 		c.BeadID = getString(payload, "bead")
 		c.IssueID = c.BeadID

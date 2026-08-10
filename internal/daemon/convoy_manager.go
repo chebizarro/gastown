@@ -14,6 +14,7 @@ import (
 	beadsdk "github.com/steveyegge/beads"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/convoy"
+	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/util"
 )
 
@@ -638,9 +639,14 @@ func (m *ConvoyManager) feedFirstReady(c strandedConvoyInfo) {
 		cmd.Stderr = &stderr
 
 		if err := cmd.Run(); err != nil {
-			m.logger("Convoy %s: sling %s failed: %s", c.ID, issueID, util.FirstLine(stderr.String()))
+			detail := util.FirstLine(stderr.String())
+			m.logger("Convoy %s: sling %s failed: %s", c.ID, issueID, detail)
+			_ = events.LogFeedAt(m.townRoot, events.TypeConvoyAsk, "deacon",
+				events.ConvoyCoordinationPayload(c.ID, issueID, "dispatch_failed", "dispatch failed: "+detail))
 			continue
 		}
+		_ = events.LogFeedAt(m.townRoot, events.TypeConvoyProgress, "deacon",
+			events.ConvoyCoordinationPayload(c.ID, issueID, "dispatched", "next ready task dispatched to "+rig))
 		return // Successfully dispatched one issue
 	}
 

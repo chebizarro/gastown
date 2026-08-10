@@ -251,3 +251,44 @@ func TestGetPublisherAppliesNostrEnvOverrides(t *testing.T) {
 		t.Fatalf("write relays = %v", captured.WriteRelays)
 	}
 }
+
+func TestCoordinationTargetsRoutesConfiguredClasses(t *testing.T) {
+	ResetPublisherForTesting()
+	t.Cleanup(ResetPublisherForTesting)
+	publisherConfig = &config.NostrConfig{NIP29: &config.NIP29Config{
+		Enabled: true,
+		Relays:  []string{"wss://groups.example"},
+		Groups: config.NIP29Groups{
+			Progress: []string{"fleet-ops"},
+			Asks:     []string{"incidents"},
+			Results:  []string{"fleet-ops", "fleet-dev"},
+		},
+	}}
+
+	class, relays, groups := coordinationTargets(TypeConvoyResult)
+	if class != coordinationResult {
+		t.Fatalf("class = %q", class)
+	}
+	if !reflect.DeepEqual(relays, []string{"wss://groups.example"}) {
+		t.Fatalf("relays = %v", relays)
+	}
+	if !reflect.DeepEqual(groups, []string{"fleet-ops", "fleet-dev"}) {
+		t.Fatalf("groups = %v", groups)
+	}
+
+	class, _, groups = coordinationTargets(TypeEscalationSent)
+	if class != coordinationAsk || !reflect.DeepEqual(groups, []string{"incidents"}) {
+		t.Fatalf("escalation route = %q %v", class, groups)
+	}
+}
+
+func TestFormatCoordinationMessageIncludesConvoyTaskAndDetail(t *testing.T) {
+	got := formatCoordinationMessage(coordinationProgress, Event{
+		Type:    TypeConvoyProgress,
+		Payload: map[string]interface{}{"message": "next ready task dispatched"},
+	}, &correlations{ConvoyID: "hq-cv-1", IssueID: "fp-104"})
+	want := "[progress] convoy hq-cv-1 — task fp-104 — next ready task dispatched"
+	if got != want {
+		t.Fatalf("message = %q, want %q", got, want)
+	}
+}

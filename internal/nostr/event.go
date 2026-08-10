@@ -3,11 +3,35 @@ package nostr
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"fiatjaf.com/nostr"
 	cascadia "git.sharegap.net/cascadia/cascadia-go"
 )
+
+// NewNIP29GroupMessage creates a NIP-29 group-addressed NIP-C7 chat message.
+// Relay-generated 39000-series events are intentionally not used by clients.
+func NewNIP29GroupMessage(groupID, messageType, rig, role, actor, content string) (*nostr.Event, error) {
+	groupID = strings.TrimSpace(groupID)
+	if groupID == "" {
+		return nil, fmt.Errorf("NIP-29 group ID is required")
+	}
+	if strings.TrimSpace(content) == "" {
+		return nil, fmt.Errorf("NIP-29 message content is required")
+	}
+	tags := BaseTags(rig, role, actor)
+	tags = append(tags,
+		nostr.Tag{"h", groupID},
+		TypeTag(messageType),
+	)
+	return &nostr.Event{
+		CreatedAt: nostr.Timestamp(time.Now().Unix()),
+		Kind:      nostr.KindSimpleGroupChatMessage,
+		Tags:      tags,
+		Content:   content,
+	}, nil
+}
 
 const (
 	agentStatusDTag      = "cascadia:agent"
@@ -87,4 +111,17 @@ func NewAgentHeartbeatEvent(agentID, rig, role, status string) (*nostr.Event, er
 // WithCorrelation appends correlation tags to an event.
 func WithCorrelation(event *nostr.Event, issueID, convoyID, beadID, sessionID string) {
 	event.Tags = append(event.Tags, CorrelationTags(issueID, convoyID, beadID, sessionID)...)
+}
+
+// WithCanonicalReferences adds optional Nostr event/address references supplied
+// by the task projection. Logical task IDs remain in t/bead correlation tags.
+func WithCanonicalReferences(event *nostr.Event, eventID, eventAddress string) {
+	eventID = strings.TrimSpace(eventID)
+	eventAddress = strings.TrimSpace(eventAddress)
+	if len(eventID) == 64 {
+		event.Tags = append(event.Tags, nostr.Tag{"e", eventID})
+	}
+	if strings.Count(eventAddress, ":") >= 2 {
+		event.Tags = append(event.Tags, nostr.Tag{"a", eventAddress})
+	}
 }

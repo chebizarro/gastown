@@ -13,6 +13,7 @@ import (
 
 	beadsdk "github.com/steveyegge/beads"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/util"
 )
 
@@ -340,9 +341,14 @@ func feedNextReadyIssue(ctx context.Context, store beadsdk.Storage, townRoot, co
 
 		logger("%s: convoy %s: feeding next ready issue %s to %s", caller, convoyID, issue.ID, rig)
 		if err := dispatchIssue(ctx, townRoot, issue.ID, rig, gtPath, baseBranch); err != nil {
-			logger("%s: convoy %s: dispatch %s failed: %s", caller, convoyID, issue.ID, util.FirstLine(err.Error()))
+			detail := util.FirstLine(err.Error())
+			logger("%s: convoy %s: dispatch %s failed: %s", caller, convoyID, issue.ID, detail)
+			_ = events.LogFeedAt(townRoot, events.TypeConvoyAsk, caller,
+				events.ConvoyCoordinationPayload(convoyID, issue.ID, "dispatch_failed", "dispatch failed: "+detail))
 			continue // Try next issue on dispatch failure
 		}
+		_ = events.LogFeedAt(townRoot, events.TypeConvoyProgress, caller,
+			events.ConvoyCoordinationPayload(convoyID, issue.ID, "dispatched", "next ready task dispatched to "+rig))
 		return // Successfully dispatched one issue
 	}
 

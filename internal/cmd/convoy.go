@@ -23,6 +23,7 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	convoyops "github.com/steveyegge/gastown/internal/convoy"
+	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -1909,6 +1910,18 @@ func notifyConvoyCompletion(townBeads, convoyID, title string) {
 
 	// Push notification to active Mayor session if configured.
 	notifyMayorSession(townBeads, convoyID, title)
+
+	resultMessage := fmt.Sprintf("convoy completed: %s", title)
+	if issueCount > 0 {
+		resultMessage += fmt.Sprintf(" (%d tasks)", issueCount)
+	}
+	if durationStr != "" {
+		resultMessage += ", duration " + durationStr
+	}
+	payload := events.ConvoyCoordinationPayload(convoyID, "", convoyStatusClosed, resultMessage)
+	payload["task_count"] = issueCount
+	payload["duration"] = durationStr
+	_ = events.LogFeedAt(townBeads, events.TypeConvoyResult, "deacon", payload)
 
 	fields.CompletionNotifiedAt = time.Now().UTC().Format(time.RFC3339)
 	newDesc := beads.SetConvoyFields(&beads.Issue{Description: convoys[0].Description}, fields)

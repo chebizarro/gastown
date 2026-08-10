@@ -1,6 +1,9 @@
 package events
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -11,6 +14,41 @@ func TestSlingPayload(t *testing.T) {
 	}
 	if p["target"] != "gastown" {
 		t.Errorf("target = %v, want gastown", p["target"])
+	}
+}
+
+func TestCoordinationCriticalEventsPublishBeforeProcessExit(t *testing.T) {
+	for _, eventType := range []string{TypeConvoyProgress, TypeConvoyAsk, TypeConvoyResult, TypeEscalationSent} {
+		if !isCoordinationCritical(eventType) {
+			t.Errorf("%s should be coordination-critical", eventType)
+		}
+	}
+	if isCoordinationCritical(TypeSling) {
+		t.Error("routine sling events should remain asynchronous")
+	}
+}
+
+func TestLogFeedAtUsesExplicitTownRoot(t *testing.T) {
+	ResetPublisherForTesting()
+	t.Cleanup(ResetPublisherForTesting)
+	townRoot := t.TempDir()
+	settingsDir := filepath.Join(townRoot, "settings")
+	if err := os.MkdirAll(settingsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(settingsDir, "nostr.json"), []byte(`{"type":"nostr","version":1,"enabled":false}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := LogFeedAt(townRoot, TypeConvoyProgress, "deacon",
+		ConvoyCoordinationPayload("hq-cv-1", "fp-104", "dispatched", "test")); err != nil {
+		t.Fatalf("LogFeedAt: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(townRoot, EventsFile))
+	if err != nil {
+		t.Fatalf("read explicit event log: %v", err)
+	}
+	if !strings.Contains(string(data), `"convoy_id":"hq-cv-1"`) {
+		t.Fatalf("event log missing convoy ID: %s", data)
 	}
 }
 

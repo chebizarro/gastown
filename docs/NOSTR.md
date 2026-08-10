@@ -1,6 +1,6 @@
 # Gas Town Nostr Integration Guide
 
-> Version: 0.3.0 | Status: Draft | Last updated: 2026-02-13
+> Version: 0.4.0 | Status: Draft | Last updated: 2026-08-09
 
 Gas Town can publish its operational state to [Nostr](https://nostr.com) relays, making agent activity, lifecycle events, convoy progress, and issue state visible to external consumers (like the Flotilla dashboard or other monitoring tools) without filesystem access.
 
@@ -36,7 +36,7 @@ This guide covers how to enable, configure, and use the Nostr integration.
 ## Quick Start
 
 1. **Set up a NIP-46 signer** (bunker) for your Gas Town identity.
-2. **Create a Nostr config file** at `~/gt/.nostr.json` (see [Configuration](#nostr-config-file)).
+2. **Create a Nostr config file** at `~/gt/settings/nostr.json` (see [Configuration](#nostr-config-file)).
 3. **Enable Nostr** via environment variable:
 
 ```bash
@@ -74,7 +74,12 @@ That's it. Gas Town will now dual-write events to both the local JSONL file and 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GT_NOSTR_ENABLED` | `0` | Master switch. Set to `1` to enable Nostr publishing. |
-| `GT_NOSTR_CONFIG` | `~/gt/.nostr.json` | Path to the Nostr configuration file. |
+| `GT_NOSTR_CONFIG` | `~/gt/settings/nostr.json` | Path to the Nostr configuration file. |
+| `GT_NOSTR_NIP29_ENABLED` | config value | Enable NIP-29 coordination messages. |
+| `GT_NOSTR_NIP29_RELAYS` | config value | Comma-separated NIP-29 group relay URLs. |
+| `GT_NOSTR_NIP29_PROGRESS_GROUPS` | config value | Comma-separated progress group IDs. |
+| `GT_NOSTR_NIP29_ASK_GROUPS` | config value | Comma-separated ask/escalation group IDs. |
+| `GT_NOSTR_NIP29_RESULT_GROUPS` | config value | Comma-separated result group IDs. |
 | `GT_EVENTS_LOCAL` | `1` | When `1`, continue writing to `.events.jsonl`. |
 | `GT_FEED_CURATOR` | `1` | When `1`, the feed curator daemon runs locally. |
 | `GT_CONVOY_LOCAL` | `1` | When `1`, convoy uses local `bd dep list`. |
@@ -86,7 +91,7 @@ That's it. Gas Town will now dual-write events to both the local JSONL file and 
 
 ### Nostr Config File
 
-The Nostr configuration lives at `~/gt/.nostr.json` (or the path specified by `GT_NOSTR_CONFIG`). Here's a complete example:
+The Nostr configuration lives at `~/gt/settings/nostr.json` (or the path specified by `GT_NOSTR_CONFIG`). Here's a complete example:
 
 ```json
 {
@@ -103,9 +108,15 @@ The Nostr configuration lives at `~/gt/.nostr.json` (or the path specified by `G
   "blossom_servers": [
     "https://blossom.gastown.example.com"
   ],
-  "dm_relays": [
-    "wss://dm-inbox.gastown.example.com"
-  ],
+  "nip29": {
+    "enabled": true,
+    "relays": ["wss://groups.sharegap.net"],
+    "groups": {
+      "progress": ["fleet-ops"],
+      "asks": ["fleet-ops"],
+      "results": ["fleet-ops"]
+    }
+  },
   "identities": {
     "deacon": {
       "pubkey": "abc123...",
@@ -123,9 +134,7 @@ The Nostr configuration lives at `~/gt/.nostr.json` (or the path specified by `G
   },
   "defaults": {
     "heartbeat_interval_seconds": 60,
-    "spool_drain_interval_seconds": 30,
-    "convoy_recompute_interval_seconds": 300,
-    "issue_mirror_poll_interval_seconds": 120
+    "spool_drain_interval_seconds": 30
   }
 }
 ```
@@ -140,7 +149,7 @@ The Nostr configuration lives at `~/gt/.nostr.json` (or the path specified by `G
 | `read_relays` | Yes | Relay URLs for subscriptions |
 | `write_relays` | Yes | Relay URLs for publishing events |
 | `blossom_servers` | No | Blossom server URLs for blob uploads |
-| `dm_relays` | No | Relay URLs specifically for DM delivery |
+| `nip29` | No | Relay(s) and group IDs for headless convoy progress, asks, and results |
 | `identities` | Yes | Map of role → identity config (see below) |
 | `defaults` | No | Timing and behavior defaults |
 
@@ -262,12 +271,18 @@ The deacon detects stale agents by checking heartbeat timestamps:
 
 ### Convoy State Publishing
 
-**Kind 30318** (`GT_CONVOY_STATE`) replaceable events publish the current state of convoys:
-- Tracked issues with status, assignee, and dependencies
-- Summary statistics (total, done, in-progress, blocked)
-- Convoy status (active, paused, completed)
+Gas Town publishes conversational convoy coordination as **kind 9** NIP-C7
+chat messages addressed to NIP-29 groups with the required `h` tag. It does
+not publish relay-owned `39000`-series metadata/admin events.
 
-The `d` tag is set to the convoy ID for NIP-33 deduplication.
+- `progress` groups receive convoy launch and reactive next-wave dispatches.
+- `asks` groups receive convoy dispatch failures and escalation requests.
+- `results` groups receive deduplicated convoy completion summaries.
+
+Messages carry `convoy`, `t`, and `bead` correlation tags. If a task
+projection supplies `nostr_event_id` or `nostr_event_address`, the message also
+links it with standard `e` or `a` tags. NIP-29 is a discussion surface only;
+authoritative task status and closure remain in Beads/Nostrig.
 
 ### Issue Mirroring
 
@@ -304,20 +319,11 @@ Gas Town uses **NIP-17** (gift-wrapped sealed events) for private agent-to-agent
 
 > **⚠️ Note**: Full NIP-17 implementation requires NIP-44 encryption support. The current implementation has a plaintext kind 4 fallback that is **disabled by default**. Set `AllowPlaintextFallback=true` on `DMSender` only for development/testing.
 
-#### Public Channels (NIP-28)
+#### Public Coordination (NIP-29)
 
-Gas Town creates NIP-28 channels for broadcast communication:
-
-**Town-wide channels**:
-- `town-ops` — Operational updates (boots, halts, health)
-- `activity` — Public activity feed mirror
-- `alerts` — Escalations and warnings
-- `announcements` — Human operator messages
-
-**Per-rig channels**:
-- `<rig>-dev` — Development activity
-- `<rig>-merge` — Merge queue status
-- `<rig>-patrol` — Witness patrol reports
+Public coordination uses operator-provisioned NIP-29 relay groups configured
+under `nip29.groups`. Gas Town is a posting participant; group creation,
+membership, and moderation remain relay/operator responsibilities.
 
 #### DM Commands
 
@@ -339,13 +345,6 @@ Send a DM with content `help` to any agent to see its available commands.
 - `ClaimWorkItem()` — Claim a work item for processing
 - `CompleteWorkItem()` — Mark work as completed
 - `FailWorkItem()` — Mark work as failed with reason
-
-### Group, Queue, and Channel Definitions
-
-Administrative events define organizational structure:
-- **Kind 30321** (`GT_GROUP_DEF`) — Group membership (e.g., "polecat-squad-alpha")
-- **Kind 30322** (`GT_QUEUE_DEF`) — Work queue configuration (merge-queue, patrol-queue)
-- **Kind 30323** (`GT_CHANNEL_DEF`) — Pub/sub channel definitions with retention policies
 
 ---
 
@@ -477,7 +476,7 @@ The spool will grow if relays are persistently unreachable:
 
 ### Agent heartbeats not appearing
 
-1. Verify the agent has a configured identity in `.nostr.json`
+1. Verify the agent has a configured identity in `settings/nostr.json`
 2. Check that the NIP-46 bunker can sign events
 3. Ensure the agent's role has a heartbeat publisher started
 
