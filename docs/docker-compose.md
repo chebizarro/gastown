@@ -33,10 +33,9 @@ runtime/<rig>/
 
 ### Nostr config
 
-Compose expects:
-
-- `${GT_TOWN_ROOT}/settings/nostr.json` inside the container
-- `GT_NOSTR_CONFIG=/gt/<rig>/settings/nostr.json`
+Compose mounts `config/nostr.json` at `/etc/gastown/nostr.json` and sets
+`GT_NOSTR_CONFIG=/etc/gastown/nostr.json`. Development and production overrides
+mount `config/nostr.dev.json` and `config/nostr.prod.json` at the same path.
 
 This file follows `internal/config.NostrConfig`.
 
@@ -107,11 +106,9 @@ network exposure is unsupported.
 
 The production defaults are:
 
-- `GT_NOSTR_READ_RELAYS=wss://relay.sharegap.net`
-- `GT_NOSTR_WRITE_RELAYS=wss://relay.sharegap.net`
-- `GT_NOSTR_BLOSSOM_SERVERS=https://blossom.sharegap.net` (edge-01)
+- `GT_NOSTR_CONFIG=/etc/gastown/nostr.json`; relay, Blossom, enablement, and feed-curator policy live in that mounted file
 
-Override these variables for another deployment. Production does not depend on
+Edit or replace the mounted policy for another deployment. Production does not depend on
 the bundled services. For local development, `--profile dev` starts
 `nostr-rs-relay` and `blossom-server`, and the development override selects
 their Compose DNS endpoints.

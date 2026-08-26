@@ -2957,12 +2957,18 @@ func LoadNostrConfig(path string) (*NostrConfig, error) {
 	return &config, nil
 }
 
-// LoadOrCreateNostrConfig loads the Nostr config, returning defaults if not found.
+// LoadOrCreateNostrConfig loads the persisted Nostr config. When it does not
+// exist, legacy environment values seed it exactly once.
 func LoadOrCreateNostrConfig(path string) (*NostrConfig, error) {
 	config, err := LoadNostrConfig(path)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
-			return NewNostrConfig(), nil
+			config = NewNostrConfig()
+			ApplyNostrEnvOverrides(config)
+			if err := SaveNostrConfig(path, config); err != nil {
+				return nil, fmt.Errorf("seeding nostr config: %w", err)
+			}
+			return config, nil
 		}
 		return nil, err
 	}
@@ -3284,6 +3290,11 @@ func ApplyNostrEnvOverrides(config *NostrConfig) {
 		config.BlossomServers = strings.Split(v, ",")
 	}
 
+	if v := os.Getenv("GT_FEED_CURATOR"); v != "" {
+		enabled := v == "1" || v == "true" || v == "yes"
+		config.FeedCurator = &enabled
+	}
+
 	applyNIP29EnvOverrides(config)
 
 	// Single-identity env vars: create/update a "default" identity
@@ -3378,22 +3389,25 @@ func parseInt(s string) (int, error) {
 	return n, nil
 }
 
-// IsNostrEnabled checks whether Nostr publishing is enabled.
-// It checks the environment variable first, then falls back to config file.
-// This is the canonical check — all Nostr code paths must call this before executing.
+// EffectiveNostrConfigPath resolves the launch-time path to persisted policy.
+func EffectiveNostrConfigPath(townRoot string) string {
+	if path := strings.TrimSpace(os.Getenv("GT_NOSTR_CONFIG")); path != "" {
+		return path
+	}
+	if townRoot == "" {
+		townRoot = strings.TrimSpace(os.Getenv("GT_TOWN_ROOT"))
+	}
+	if townRoot == "" {
+		if discovered, err := findTownRootFromCwd(); err == nil {
+			townRoot = discovered
+		}
+	}
+	return NostrConfigPath(townRoot)
+}
+
+// IsNostrEnabled checks the persisted runtime policy.
 func IsNostrEnabled() bool {
-	// Fast path: check env var directly
-	if v := os.Getenv("GT_NOSTR_ENABLED"); v != "" {
-		return v == "1" || v == "true" || v == "yes"
-	}
-
-	// Slow path: try to load config from standard location
-	townRoot, err := findTownRootFromCwd()
-	if err != nil {
-		return false
-	}
-
-	config, err := LoadNostrConfig(NostrConfigPath(townRoot))
+	config, err := LoadOrCreateNostrConfig(EffectiveNostrConfigPath(""))
 	if err != nil {
 		return false
 	}

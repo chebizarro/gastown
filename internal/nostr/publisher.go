@@ -126,11 +126,15 @@ func (p *Publisher) Pool() *RelayPool {
 func (p *Publisher) Close() error {
 	var firstErr error
 
-	if err := p.signer.Close(); err != nil {
-		firstErr = err
+	if p.signer != nil {
+		if err := p.signer.Close(); err != nil {
+			firstErr = err
+		}
 	}
 
-	p.pool.Close()
+	if p.pool != nil {
+		p.pool.Close()
+	}
 
 	return firstErr
 }

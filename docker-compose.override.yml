@@ -22,25 +22,17 @@ services:
     volumes:
       - ${GT_HOME:-./rigs}/${GT_RIG:-gastown}:/gt/${GT_RIG:-gastown}
       - ${GT_SPOOL_DIR:-./runtime}/${GT_RIG:-gastown}:/gt/${GT_RIG:-gastown}/.runtime
+      - ./config/nostr.dev.json:/etc/gastown/nostr.json
     environment:
       # Development defaults
-      GT_NOSTR_ENABLED: "1"
       GT_LOG_LEVEL: debug
-      GT_NOSTR_WRITE_RELAYS: ws://relay:7000
-      GT_NOSTR_READ_RELAYS: ws://relay:7000
-      GT_NOSTR_BLOSSOM_SERVERS: http://blossom:3000
-
   agentloop:
-    environment:
-      GT_NOSTR_WRITE_RELAYS: ws://relay:7000
-      GT_NOSTR_READ_RELAYS: ws://relay:7000
-      GT_NOSTR_BLOSSOM_SERVERS: http://blossom:3000
+    volumes:
+      - ./config/nostr.dev.json:/etc/gastown/nostr.json
 
   mcp:
-    environment:
-      GT_NOSTR_WRITE_RELAYS: ws://relay:7000
-      GT_NOSTR_READ_RELAYS: ws://relay:7000
-      GT_NOSTR_BLOSSOM_SERVERS: http://blossom:3000
+    volumes:
+      - ./config/nostr.dev.json:/etc/gastown/nostr.json
 
   flotilla:
     environment:

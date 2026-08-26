@@ -24,7 +24,7 @@ type SunsetFlags struct {
 func LoadSunsetFlags() SunsetFlags {
 	return SunsetFlags{
 		EventsLocal: envBool("GT_EVENTS_LOCAL"),
-		FeedCurator: envBool("GT_FEED_CURATOR"),
+		FeedCurator: IsFeedCuratorEnabled(),
 		ConvoyLocal: envBool("GT_CONVOY_LOCAL"),
 		MailLocal:   envBool("GT_MAIL_LOCAL"),
 		NudgeLocal:  envBool("GT_NUDGE_LOCAL"),
@@ -193,7 +193,8 @@ func IsEventsLocalEnabled() bool {
 
 // IsFeedCuratorEnabled returns true if the feed curator daemon should run.
 func IsFeedCuratorEnabled() bool {
-	return envBool("GT_FEED_CURATOR")
+	cfg, err := config.LoadOrCreateNostrConfig(config.EffectiveNostrConfigPath(""))
+	return err != nil || cfg.IsFeedCuratorEnabled()
 }
 
 // IsConvoyLocalEnabled returns true if convoy checks should use local bd dep list.

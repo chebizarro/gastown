@@ -37,11 +37,7 @@ This guide covers how to enable, configure, and use the Nostr integration.
 
 1. **Set up a NIP-46 signer** (bunker) for your Gas Town identity.
 2. **Create a Nostr config file** at `~/gt/settings/nostr.json` (see [Configuration](#nostr-config-file)).
-3. **Enable Nostr** via environment variable:
-
-```bash
-export GT_NOSTR_ENABLED=1
-```
+3. **Point the process at the persisted policy** with `GT_NOSTR_CONFIG`.
 
 4. **Verify** the setup:
 
@@ -73,7 +69,6 @@ That's it. Gas Town will now dual-write events to both the local JSONL file and 
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GT_NOSTR_ENABLED` | `0` | Master switch. Set to `1` to enable Nostr publishing. |
 | `GT_NOSTR_CONFIG` | `~/gt/settings/nostr.json` | Path to the Nostr configuration file. |
 | `GT_NOSTR_NIP29_ENABLED` | config value | Enable NIP-29 coordination messages. |
 | `GT_NOSTR_NIP29_RELAYS` | config value | Comma-separated NIP-29 group relay URLs. |
@@ -81,23 +76,23 @@ That's it. Gas Town will now dual-write events to both the local JSONL file and 
 | `GT_NOSTR_NIP29_ASK_GROUPS` | config value | Comma-separated ask/escalation group IDs. |
 | `GT_NOSTR_NIP29_RESULT_GROUPS` | config value | Comma-separated result group IDs. |
 | `GT_EVENTS_LOCAL` | `1` | When `1`, continue writing to `.events.jsonl`. |
-| `GT_FEED_CURATOR` | `1` | When `1`, the feed curator daemon runs locally. |
 | `GT_CONVOY_LOCAL` | `1` | When `1`, convoy uses local `bd dep list`. |
 | `GT_MAIL_LOCAL` | `1` | When `1`, beads-native mail routing is active. |
 | `GT_NUDGE_LOCAL` | `1` | When `1`, tmux nudge (local) is active. |
 | `GT_TOWN_ROOT` | auto-detected | Path to the Gas Town root directory. |
 
-**Note**: All `GT_*_LOCAL` flags default to `1` (enabled). During migration, both local and Nostr paths run in parallel (dual-write). Set individual flags to `0` to sunset local paths once Nostr equivalents are validated.
+**Note**: Relay topology, Blossom routing, Nostr enablement, and feed-curator enablement are read from the persisted Nostr policy. The legacy `GT_NOSTR_ENABLED`, `GT_NOSTR_READ_RELAYS`, `GT_NOSTR_WRITE_RELAYS`, `GT_NOSTR_BLOSSOM_SERVERS`, and `GT_FEED_CURATOR` values are consulted only to seed a missing file and never override an existing one. All remaining `GT_*_LOCAL` flags default to `1` (enabled).
 
 ### Nostr Config File
 
-The Nostr configuration lives at `~/gt/settings/nostr.json` (or the path specified by `GT_NOSTR_CONFIG`). Here's a complete example:
+The Nostr configuration lives at `~/gt/settings/nostr.json` (or the path specified by `GT_NOSTR_CONFIG`). It is the runtime source of truth and is reloaded on content change by event publishers; the daemon reloads it on `SIGHUP` so feed-curator enablement changes apply without restart. Reload logs report only non-secret effective policy. Here's a complete example:
 
 ```json
 {
   "type": "nostr",
   "version": 1,
   "enabled": true,
+  "feed_curator_enabled": true,
   "read_relays": [
     "wss://relay.gastown.example.com",
     "wss://relay.damus.io"
@@ -389,7 +384,7 @@ Gas Town follows a phased migration from local subsystems to Nostr equivalents. 
 | Flag | Subsystem | What it controls |
 |------|-----------|-----------------|
 | `GT_EVENTS_LOCAL` | Events | Writing to `.events.jsonl` |
-| `GT_FEED_CURATOR` | Feed | Local feed curator daemon |
+| `feed_curator_enabled` | Feed | Persisted local feed curator policy |
 | `GT_CONVOY_LOCAL` | Convoy | Using `bd dep list` for convoy tracking |
 | `GT_MAIL_LOCAL` | Mail | Beads-native mail routing |
 | `GT_NUDGE_LOCAL` | Nudge | Tmux-based session nudging |
@@ -399,13 +394,13 @@ All flags default to `1` (ON). To sunset a subsystem and switch to Nostr-only:
 ```bash
 # After validating the Nostr equivalent works:
 export GT_EVENTS_LOCAL=0   # Stop writing to .events.jsonl
-export GT_FEED_CURATOR=0   # Stop running local feed curator
+# Set "feed_curator_enabled": false in the mounted Nostr policy.
 ```
 
 ### Recommended Migration Order
 
 1. **Events** (`GT_EVENTS_LOCAL`) — Safest to sunset first since it's append-only
-2. **Feed Curator** (`GT_FEED_CURATOR`) — Sunset once Flotilla reads from Nostr
+2. **Feed Curator** (`feed_curator_enabled`) — Sunset once Flotilla reads from Nostr
 3. **Mail** (`GT_MAIL_LOCAL`) — Sunset once DMs and channels are validated
 4. **Nudge** (`GT_NUDGE_LOCAL`) — Sunset once API/MCP mode replaces tmux
 5. **Convoy** (`GT_CONVOY_LOCAL`) — Sunset last (most critical for coordination)
@@ -458,7 +453,7 @@ The agent loop executor sandboxes all file operations to the working directory:
 
 ### "Nostr is not enabled"
 
-Ensure `GT_NOSTR_ENABLED=1` is set and the config file exists at the expected path.
+Ensure `GT_NOSTR_CONFIG` points to an existing policy whose `enabled` field is true.
 
 ### No events reaching relays
 

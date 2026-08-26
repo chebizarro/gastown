@@ -3,6 +3,8 @@ package events
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -202,53 +204,40 @@ func TestGetPublisherRetriesTransientSignerFailureWithBackoff(t *testing.T) {
 	}
 }
 
-func TestGetPublisherAppliesNostrEnvOverrides(t *testing.T) {
+func TestGetPublisherReloadsPersistedPolicyWithoutRestart(t *testing.T) {
 	ResetPublisherForTesting()
-	originalLoad := loadPublisherConfig
-	originalSigner := newPublisherSigner
-	originalPublisher := newEventsPublisher
-	t.Cleanup(func() {
-		ResetPublisherForTesting()
-		loadPublisherConfig = originalLoad
-		newPublisherSigner = originalSigner
-		newEventsPublisher = originalPublisher
-	})
-
-	t.Setenv("GT_NOSTR_ENABLED", "1")
-	t.Setenv("GT_NOSTR_READ_RELAYS", "wss://read-env.example")
-	t.Setenv("GT_NOSTR_WRITE_RELAYS", "wss://write-env.example")
-	loadPublisherConfig = func(string) (*config.NostrConfig, error) {
-		return &config.NostrConfig{
-			Enabled:     false,
-			ReadRelays:  []string{"wss://read-file.example"},
-			WriteRelays: []string{"wss://write-file.example"},
-			Identities: map[string]*config.NostrIdentity{
-				"deacon": {Signer: config.SignerConfig{Bunker: "bunker://deacon"}},
-			},
-			Defaults: config.DefaultNostrDefaults(),
-		}, nil
+	t.Cleanup(ResetPublisherForTesting)
+	path := filepath.Join(t.TempDir(), "nostr.json")
+	t.Setenv("GT_NOSTR_CONFIG", path)
+	initial := config.NewNostrConfig()
+	if err := config.SaveNostrConfig(path, initial); err != nil {
+		t.Fatal(err)
 	}
-	newPublisherSigner = func(context.Context, string) (gtnostr.Signer, error) {
-		return publisherTestSigner{}, nil
+	_ = getPublisher("polecat")
+	if publisherConfig == nil || publisherConfig.Enabled {
+		t.Fatal("initial persisted policy was not loaded")
 	}
 
-	var captured *config.NostrConfig
-	newEventsPublisher = func(_ context.Context, cfg *config.NostrConfig, _ gtnostr.Signer, _ string) (*gtnostr.Publisher, error) {
-		captured = cfg
-		return &gtnostr.Publisher{}, nil
+	updated := config.NewNostrConfig()
+	updated.Enabled = true
+	updated.ReadRelays = []string{"wss://read-file.example"}
+	updated.WriteRelays = []string{"wss://write-file.example"}
+	if err := config.SaveNostrConfig(path, updated); err != nil {
+		t.Fatal(err)
 	}
-
-	if got := getPublisher("polecat"); got == nil {
-		t.Fatal("getPublisher returned nil")
+	_ = getPublisher("polecat")
+	if publisherConfig == nil || !publisherConfig.Enabled {
+		t.Fatal("changed persisted policy was not hot-reloaded")
 	}
-	if captured == nil || !captured.Enabled {
-		t.Fatal("GT_NOSTR_ENABLED override was not applied")
+	if !reflect.DeepEqual(publisherConfig.ReadRelays, updated.ReadRelays) {
+		t.Fatalf("read relays = %v", publisherConfig.ReadRelays)
 	}
-	if !reflect.DeepEqual(captured.ReadRelays, []string{"wss://read-env.example"}) {
-		t.Fatalf("read relays = %v", captured.ReadRelays)
+	if err := os.WriteFile(path, []byte(`{"type":"nostr","version":1,"enabled":true}`), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(captured.WriteRelays, []string{"wss://write-env.example"}) {
-		t.Fatalf("write relays = %v", captured.WriteRelays)
+	_ = getPublisher("polecat")
+	if !reflect.DeepEqual(publisherConfig.ReadRelays, updated.ReadRelays) {
+		t.Fatalf("invalid candidate replaced last valid relays: %v", publisherConfig.ReadRelays)
 	}
 }
 

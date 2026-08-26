@@ -1720,15 +1720,16 @@ const CurrentNostrConfigVersion = 1
 // Town-level config lives at ~/gt/settings/nostr.json (0600 permissions).
 // Rig-level overrides can appear in ~/gt/<rig>/config.json under the "nostr" key.
 type NostrConfig struct {
-	Type           string                    `json:"type"`                      // "nostr"
-	Version        int                       `json:"version"`                   // schema version
-	Enabled        bool                      `json:"enabled"`                   // master switch for Nostr publishing
-	ReadRelays     []string                  `json:"read_relays,omitempty"`     // relays to subscribe for events
-	WriteRelays    []string                  `json:"write_relays,omitempty"`    // relays to publish events to
-	BlossomServers []string                  `json:"blossom_servers,omitempty"` // Blossom blob storage servers
-	Identities     map[string]*NostrIdentity `json:"identities,omitempty"`      // role → identity mapping
-	Defaults       *NostrDefaults            `json:"defaults,omitempty"`        // timing and behavior defaults
-	NIP29          *NIP29Config              `json:"nip29,omitempty"`           // relay-based coordination groups
+	Type           string                    `json:"type"`                           // "nostr"
+	Version        int                       `json:"version"`                        // schema version
+	Enabled        bool                      `json:"enabled"`                        // master switch for Nostr publishing
+	FeedCurator    *bool                     `json:"feed_curator_enabled,omitempty"` // local feed curator policy; nil defaults to enabled
+	ReadRelays     []string                  `json:"read_relays,omitempty"`          // relays to subscribe for events
+	WriteRelays    []string                  `json:"write_relays,omitempty"`         // relays to publish events to
+	BlossomServers []string                  `json:"blossom_servers,omitempty"`      // Blossom blob storage servers
+	Identities     map[string]*NostrIdentity `json:"identities,omitempty"`           // role → identity mapping
+	Defaults       *NostrDefaults            `json:"defaults,omitempty"`             // timing and behavior defaults
+	NIP29          *NIP29Config              `json:"nip29,omitempty"`                // relay-based coordination groups
 }
 
 // NIP29Config controls publication of conversational convoy coordination
@@ -1799,6 +1800,12 @@ func NewNostrConfig() *NostrConfig {
 		Identities: make(map[string]*NostrIdentity),
 		Defaults:   DefaultNostrDefaults(),
 	}
+}
+
+// IsFeedCuratorEnabled reports the persisted feed-curator policy. The legacy
+// default remains enabled when the field is absent.
+func (c *NostrConfig) IsFeedCuratorEnabled() bool {
+	return c == nil || c.FeedCurator == nil || *c.FeedCurator
 }
 
 // NostrConfigFileName is the filename for town-level Nostr configuration.

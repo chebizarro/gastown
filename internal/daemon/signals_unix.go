@@ -13,6 +13,7 @@ func daemonSignals() []os.Signal {
 		syscall.SIGTERM,
 		syscall.SIGUSR1,
 		syscall.SIGUSR2,
+		syscall.SIGHUP,
 	}
 }
 
@@ -22,4 +23,8 @@ func isLifecycleSignal(sig os.Signal) bool {
 
 func isReloadRestartSignal(sig os.Signal) bool {
 	return sig == syscall.SIGUSR2
+}
+
+func isConfigReloadSignal(sig os.Signal) bool {
+	return sig == syscall.SIGHUP
 }

@@ -57,13 +57,8 @@ services:
       GT_TOWN_ROOT: /gt/${GT_RIG:-gastown}
       GT_ROOT: /gt/${GT_RIG:-gastown}
 
-      # Fleet Nostr endpoints; override with the dev infrastructure endpoints
-      # when starting the dev profile.
-      GT_NOSTR_ENABLED: "1"
-      GT_NOSTR_CONFIG: /gt/${GT_RIG:-gastown}/settings/nostr.json
-      GT_NOSTR_WRITE_RELAYS: ${GT_NOSTR_WRITE_RELAYS:-wss://relay.sharegap.net}
-      GT_NOSTR_READ_RELAYS: ${GT_NOSTR_READ_RELAYS:-wss://relay.sharegap.net}
-      GT_NOSTR_BLOSSOM_SERVERS: ${GT_NOSTR_BLOSSOM_SERVERS:-https://blossom.sharegap.net}
+      # Mutable product policy lives in the mounted file; env carries its path only.
+      GT_NOSTR_CONFIG: /etc/gastown/nostr.json
 
       # External Dolt server; defaults match the local Gastown convention.
       GT_DOLT_HOST: ${GT_DOLT_HOST:-127.0.0.1}
@@ -74,12 +69,12 @@ services:
 
       # Optional migration/sunset flags (defaults preserve local behavior)
       GT_EVENTS_LOCAL: ${GT_EVENTS_LOCAL:-1}
-      GT_FEED_CURATOR: ${GT_FEED_CURATOR:-1}
       GT_CONVOY_LOCAL: ${GT_CONVOY_LOCAL:-1}
     working_dir: /gt/${GT_RIG:-gastown}
     volumes:
       - ./rigs/${GT_RIG:-gastown}:/gt/${GT_RIG:-gastown}
       - ./runtime/${GT_RIG:-gastown}:/gt/${GT_RIG:-gastown}/.runtime
+      - ./config/nostr.json:/etc/gastown/nostr.json
     healthcheck:
       test: ["CMD-SHELL", "pgrep -f '[g]t daemon run' >/dev/null"]
       interval: 10s
@@ -120,11 +115,7 @@ services:
       GT_TOWN_ROOT: /gt/${GT_RIG:-gastown}
       GT_ROOT: /gt/${GT_RIG:-gastown}
 
-      GT_NOSTR_ENABLED: "1"
-      GT_NOSTR_CONFIG: /gt/${GT_RIG:-gastown}/settings/nostr.json
-      GT_NOSTR_WRITE_RELAYS: ${GT_NOSTR_WRITE_RELAYS:-wss://relay.sharegap.net}
-      GT_NOSTR_READ_RELAYS: ${GT_NOSTR_READ_RELAYS:-wss://relay.sharegap.net}
-      GT_NOSTR_BLOSSOM_SERVERS: ${GT_NOSTR_BLOSSOM_SERVERS:-https://blossom.sharegap.net}
+      GT_NOSTR_CONFIG: /etc/gastown/nostr.json
       GT_DOLT_HOST: ${GT_DOLT_HOST:-deacon}
       GT_DOLT_PORT: ${GT_DOLT_PORT:-3307}
 
@@ -135,6 +126,7 @@ services:
     volumes:
       - ./rigs/${GT_RIG:-gastown}:/gt/${GT_RIG:-gastown}
       - ./runtime/${GT_RIG:-gastown}:/gt/${GT_RIG:-gastown}/.runtime
+      - ./config/nostr.json:/etc/gastown/nostr.json
     healthcheck:
       test: ["CMD-SHELL", "pgrep -f '[g]t agentloop run' >/dev/null"]
       interval: 10s
@@ -165,11 +157,7 @@ services:
       GT_TOWN_ROOT: /gt/${GT_RIG:-gastown}
       GT_ROOT: /gt/${GT_RIG:-gastown}
 
-      GT_NOSTR_ENABLED: "1"
-      GT_NOSTR_CONFIG: /gt/${GT_RIG:-gastown}/settings/nostr.json
-      GT_NOSTR_WRITE_RELAYS: ${GT_NOSTR_WRITE_RELAYS:-wss://relay.sharegap.net}
-      GT_NOSTR_READ_RELAYS: ${GT_NOSTR_READ_RELAYS:-wss://relay.sharegap.net}
-      GT_NOSTR_BLOSSOM_SERVERS: ${GT_NOSTR_BLOSSOM_SERVERS:-https://blossom.sharegap.net}
+      GT_NOSTR_CONFIG: /etc/gastown/nostr.json
       GT_DOLT_HOST: ${GT_DOLT_HOST:-deacon}
       GT_DOLT_PORT: ${GT_DOLT_PORT:-3307}
     working_dir: /gt/${GT_RIG:-gastown}
@@ -178,6 +166,7 @@ services:
     volumes:
       - ./rigs/${GT_RIG:-gastown}:/gt/${GT_RIG:-gastown}
       - ./runtime/${GT_RIG:-gastown}:/gt/${GT_RIG:-gastown}/.runtime
+      - ./config/nostr.json:/etc/gastown/nostr.json
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:9500/mcp/health"]
       interval: 10s
@@ -196,8 +185,8 @@ services:
     ports:
       - "${GT_FLOTILLA_PORT:-1847}:1847"
     environment:
-      VITE_FORCE_RELAYS: ${GT_NOSTR_READ_RELAYS:-wss://relay.sharegap.net}
-      VITE_DEFAULT_BLOSSOM: ${GT_NOSTR_BLOSSOM_SERVERS:-https://blossom.sharegap.net}
+      VITE_FORCE_RELAYS: ${GT_FLOTILLA_RELAYS:-wss://relay.sharegap.net}
+      VITE_DEFAULT_BLOSSOM: ${GT_FLOTILLA_BLOSSOM:-https://blossom.sharegap.net}
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------

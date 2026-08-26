@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -6234,10 +6235,9 @@ func TestLoadNostrConfigNotFound(t *testing.T) {
 }
 
 func TestLoadOrCreateNostrConfig(t *testing.T) {
-	t.Parallel()
-
 	t.Run("creates default when not found", func(t *testing.T) {
-		config, err := LoadOrCreateNostrConfig("/nonexistent/path.json")
+		path := filepath.Join(t.TempDir(), "nostr.json")
+		config, err := LoadOrCreateNostrConfig(path)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -6246,6 +6246,9 @@ func TestLoadOrCreateNostrConfig(t *testing.T) {
 		}
 		if config.Type != "nostr" {
 			t.Errorf("Type = %q, want 'nostr'", config.Type)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("seeded config was not persisted: %v", err)
 		}
 	})
 
@@ -6495,33 +6498,28 @@ func TestApplyNostrEnvOverrides(t *testing.T) {
 }
 
 func TestIsNostrEnabled(t *testing.T) {
-	// Not parallel: uses t.Setenv
+	path := filepath.Join(t.TempDir(), "nostr.json")
+	t.Setenv("GT_NOSTR_CONFIG", path)
+	t.Setenv("GT_NOSTR_ENABLED", "1")
+	t.Setenv("GT_NOSTR_WRITE_RELAYS", "wss://seed.example")
+	t.Setenv("GT_FEED_CURATOR", "0")
+	if !IsNostrEnabled() {
+		t.Fatal("expected one-time env seed to enable persisted policy")
+	}
 
-	t.Run("returns false by default", func(t *testing.T) {
-		t.Setenv("GT_NOSTR_ENABLED", "")
-		if IsNostrEnabled() {
-			t.Error("expected false when GT_NOSTR_ENABLED is empty")
-		}
-	})
+	t.Setenv("GT_NOSTR_ENABLED", "0")
+	if !IsNostrEnabled() {
+		t.Fatal("env overrode an existing persisted policy")
+	}
 
-	t.Run("returns true when env var set", func(t *testing.T) {
-		t.Setenv("GT_NOSTR_ENABLED", "1")
-		if !IsNostrEnabled() {
-			t.Error("expected true when GT_NOSTR_ENABLED=1")
-		}
-	})
-
-	t.Run("accepts true string", func(t *testing.T) {
-		t.Setenv("GT_NOSTR_ENABLED", "true")
-		if !IsNostrEnabled() {
-			t.Error("expected true when GT_NOSTR_ENABLED=true")
-		}
-	})
-
-	t.Run("returns false for other values", func(t *testing.T) {
-		t.Setenv("GT_NOSTR_ENABLED", "0")
-		if IsNostrEnabled() {
-			t.Error("expected false when GT_NOSTR_ENABLED=0")
-		}
-	})
+	cfg, err := LoadNostrConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(cfg.WriteRelays, []string{"wss://seed.example"}) {
+		t.Fatalf("persisted relays = %v", cfg.WriteRelays)
+	}
+	if cfg.IsFeedCuratorEnabled() {
+		t.Fatal("feed curator env seed was not persisted")
+	}
 }

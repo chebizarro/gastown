@@ -1,0 +1,9 @@
+{
+  "type": "nostr",
+  "version": 1,
+  "enabled": true,
+  "feed_curator_enabled": true,
+  "read_relays": ["ws://relay:7000"],
+  "write_relays": ["ws://relay:7000"],
+  "blossom_servers": ["http://blossom:3000"]
+}

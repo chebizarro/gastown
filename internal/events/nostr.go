@@ -2,6 +2,7 @@ package events
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -62,9 +63,10 @@ var (
 	publisherBase         *gtnostr.Publisher
 	publisherSlots        = make(map[string]*publisherSlot)
 	publisherDrainCancels []context.CancelFunc
+	publisherConfigDigest [sha256.Size]byte
 
 	publisherNow        = time.Now
-	loadPublisherConfig = config.LoadNostrConfig
+	loadPublisherConfig = config.LoadOrCreateNostrConfig
 	newPublisherSigner  = func(ctx context.Context, bunker string) (gtnostr.Signer, error) {
 		return gtnostr.NewNIP46Signer(ctx, bunker)
 	}
@@ -81,24 +83,43 @@ func getPublisher(role string, townRoots ...string) *gtnostr.Publisher {
 	defer publisherMu.Unlock()
 
 	now := publisherNow()
+	path := nostrConfigPath(townRoots...)
+	if publisherConfigLoaded {
+		if data, err := os.ReadFile(path); err == nil {
+			digest := sha256.Sum256(data)
+			if digest != publisherConfigDigest {
+				candidate, err := loadPublisherConfig(path)
+				if err != nil {
+					log.Printf("[events/nostr] Policy reload rejected; keeping last valid projection: %v", err)
+				} else {
+					resetPublisherLocked()
+					publisherConfig = candidate
+					publisherConfigLoaded = true
+					publisherConfigDigest = digest
+					logEffectivePublisherPolicy("reloaded", candidate)
+				}
+			}
+		}
+	}
 	if !publisherConfigLoaded {
 		if !publisherConfigRetry.ready(now) {
 			return nil
 		}
 
-		cfg, err := loadPublisherConfig(nostrConfigPath(townRoots...))
+		cfg, err := loadPublisherConfig(path)
 		if err != nil {
 			publisherConfigRetry.fail(now)
 			log.Printf("[events/nostr] Failed to load nostr config (retry in %s): %v", publisherConfigRetry.delay, err)
 			return nil
 		}
 
-		// Environment is the final configuration layer for the runtime-wired
-		// events path (including relay and default bunker overrides).
-		config.ApplyNostrEnvOverrides(cfg)
 		publisherConfig = cfg
 		publisherConfigLoaded = true
 		publisherConfigRetry.reset()
+		if data, err := os.ReadFile(path); err == nil {
+			publisherConfigDigest = sha256.Sum256(data)
+		}
+		logEffectivePublisherPolicy("loaded", cfg)
 	}
 
 	if publisherConfig == nil || !publisherConfig.Enabled {
@@ -508,8 +529,15 @@ func getString(m map[string]interface{}, key string) string {
 func ResetPublisherForTesting() {
 	publisherMu.Lock()
 	defer publisherMu.Unlock()
+	resetPublisherLocked()
+}
+
+func resetPublisherLocked() {
 	for _, cancel := range publisherDrainCancels {
 		cancel()
+	}
+	if publisherBase != nil {
+		_ = publisherBase.Close()
 	}
 	publisherConfig = nil
 	publisherConfigLoaded = false
@@ -517,4 +545,10 @@ func ResetPublisherForTesting() {
 	publisherBase = nil
 	publisherSlots = make(map[string]*publisherSlot)
 	publisherDrainCancels = nil
+	publisherConfigDigest = [sha256.Size]byte{}
+}
+
+func logEffectivePublisherPolicy(action string, cfg *config.NostrConfig) {
+	log.Printf("[events/nostr] Effective policy %s: enabled=%t read_relays=%d write_relays=%d blossom_servers=%d feed_curator=%t",
+		action, cfg.Enabled, len(cfg.ReadRelays), len(cfg.WriteRelays), len(cfg.BlossomServers), cfg.IsFeedCuratorEnabled())
 }

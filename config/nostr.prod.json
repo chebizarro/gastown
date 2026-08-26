@@ -1,0 +1,9 @@
+{
+  "type": "nostr",
+  "version": 1,
+  "enabled": true,
+  "feed_curator_enabled": false,
+  "read_relays": ["wss://relay.sharegap.net"],
+  "write_relays": ["wss://relay.sharegap.net"],
+  "blossom_servers": ["https://blossom.sharegap.net"]
+}

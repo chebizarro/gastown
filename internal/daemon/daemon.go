@@ -541,13 +541,8 @@ func (d *Daemon) Run() (err error) {
 
 	d.logger.Printf("Daemon running, recovery heartbeat interval %v", d.recoveryHeartbeatInterval())
 
-	// Start feed curator goroutine
-	d.curator = feed.NewCurator(d.config.TownRoot)
-	if err := d.curator.Start(); err != nil {
-		d.logger.Printf("Warning: failed to start feed curator: %v", err)
-	} else {
-		d.logger.Println("Feed curator started")
-	}
+	// Apply persisted Nostr/feed product policy before starting background work.
+	d.reloadProductPolicy()
 
 	// Start convoy manager. The embedded beads SDK in this Gastown version is
 	// Dolt-only; SQLite mode uses CLI polling and never opens the SDK.
@@ -764,7 +759,9 @@ func (d *Daemon) Run() (err error) {
 			return d.shutdown(state)
 
 		case sig := <-sigChan:
-			if isLifecycleSignal(sig) {
+			if isConfigReloadSignal(sig) {
+				d.reloadProductPolicy()
+			} else if isLifecycleSignal(sig) {
 				// Lifecycle signal: immediate lifecycle processing (from gt handoff)
 				d.logger.Println("Received lifecycle signal, processing lifecycle requests immediately")
 				d.processLifecycleRequests()
@@ -865,6 +862,30 @@ func (d *Daemon) Run() (err error) {
 			timer.Reset(d.recoveryHeartbeatInterval())
 		}
 	}
+}
+
+func (d *Daemon) reloadProductPolicy() {
+	cfg, err := agentconfig.LoadOrCreateNostrConfig(agentconfig.EffectiveNostrConfigPath(d.config.TownRoot))
+	if err != nil {
+		d.logger.Printf("Product policy reload rejected; keeping last valid projection: %v", err)
+		return
+	}
+	wantCurator := cfg.IsFeedCuratorEnabled()
+	if wantCurator && d.curator == nil {
+		curator := feed.NewCurator(d.config.TownRoot)
+		if err := curator.Start(); err != nil {
+			d.logger.Printf("Warning: failed to start feed curator: %v", err)
+		} else {
+			d.curator = curator
+			d.logger.Println("Feed curator started")
+		}
+	} else if !wantCurator && d.curator != nil {
+		d.curator.Stop()
+		d.curator = nil
+		d.logger.Println("Feed curator stopped")
+	}
+	d.logger.Printf("Effective product policy reloaded: enabled=%t read_relays=%d write_relays=%d blossom_servers=%d feed_curator=%t",
+		cfg.Enabled, len(cfg.ReadRelays), len(cfg.WriteRelays), len(cfg.BlossomServers), wantCurator)
 }
 
 // recoveryHeartbeatInterval returns the config-driven recovery heartbeat interval.
