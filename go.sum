@@ -100,6 +100,8 @@ filippo.io/edwards25519 v1.1.1/go.mod h1:BxyFTGdWcka3PhytdK4V28tE5sGfRvvvRV7EaN4
 gioui.org v0.0.0-20210308172011-57750fc8a0a6/go.mod h1:RSH6KIUZ0p2xy5zHDxgAM4zumjgTw83q2ge/PI+yyw8=
 git.sharegap.net/cascadia/cascadia-go v1.2.1 h1:Y6eORfMvzWJB6+Aznr2U9jMRaOTOZpEXmfSE4t9jUQs=
 git.sharegap.net/cascadia/cascadia-go v1.2.1/go.mod h1:gv8EroD6JykPs/26C8VEHgJjdtOXnMmWzIamSvb4GeY=
+git.sharegap.net/cascadia/cascadia-nips/generated/go v0.1.1-0.20260826052020-d767082d1803 h1:OW9nBtMlS77dfgOEXJZeTM4IUa+J/cDw5CxUPraR1/Q=
+git.sharegap.net/cascadia/cascadia-nips/generated/go v0.1.1-0.20260826052020-d767082d1803/go.mod h1:UQwk5ukN+UlP90Jx4BNJtZRhWW4QoQlKUuxBOcQsifU=
 git.sr.ht/~sbinet/gg v0.3.1 h1:LNhjNn8DerC8f9DHLz6lS0YYul/b602DUxDgGkd/Aik=
 git.sr.ht/~sbinet/gg v0.3.1/go.mod h1:KGYtlADtqsqANL9ueOFkWymvzUvLMQllU5Ixo+8v3pc=
 github.com/AdaLogics/go-fuzz-headers v0.0.0-20240806141605-e8a1dd7889d6 h1:He8afgbRMd7mFxO99hRNu+6tazq8nFF9lIwo9JFroBk=

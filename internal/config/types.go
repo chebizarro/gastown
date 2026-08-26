@@ -2,6 +2,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -1730,6 +1731,41 @@ type NostrConfig struct {
 	Identities     map[string]*NostrIdentity `json:"identities,omitempty"`           // role → identity mapping
 	Defaults       *NostrDefaults            `json:"defaults,omitempty"`             // timing and behavior defaults
 	NIP29          *NIP29Config              `json:"nip29,omitempty"`                // relay-based coordination groups
+	ConfigFabric   *NostrConfigFabric        `json:"config_fabric,omitempty"`
+}
+
+type NostrConfigFabric struct {
+	TrustedAuthors     []string              `json:"trusted_authors"`
+	SubscriptionRelays []string              `json:"subscription_relays"`
+	Scope              string                `json:"scope"`
+	Accepted           *AcceptedDesiredState `json:"accepted,omitempty"`
+}
+
+type AcceptedDesiredState struct {
+	EventID    string    `json:"event_id"`
+	Author     string    `json:"author"`
+	Version    int64     `json:"version"`
+	Schema     string    `json:"schema"`
+	Coordinate string    `json:"coordinate"`
+	AcceptedAt time.Time `json:"accepted_at"`
+}
+
+type NostrRuntimePolicy struct {
+	Enabled        bool               `json:"enabled"`
+	FeedCurator    *bool              `json:"feed_curator_enabled,omitempty"`
+	ReadRelays     []string           `json:"read_relays,omitempty"`
+	WriteRelays    []string           `json:"write_relays,omitempty"`
+	BlossomServers []string           `json:"blossom_servers,omitempty"`
+	Defaults       *NostrDefaults     `json:"defaults,omitempty"`
+	NIP29          *NIP29Config       `json:"nip29,omitempty"`
+	ConfigFabric   *NostrConfigFabric `json:"config_fabric"`
+}
+
+func (c *NostrConfig) RuntimePolicy() NostrRuntimePolicy {
+	data, _ := json.Marshal(c)
+	var policy NostrRuntimePolicy
+	_ = json.Unmarshal(data, &policy)
+	return policy
 }
 
 // NIP29Config controls publication of conversational convoy coordination

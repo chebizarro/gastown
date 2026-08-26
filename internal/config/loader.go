@@ -2965,6 +2965,9 @@ func LoadOrCreateNostrConfig(path string) (*NostrConfig, error) {
 		if errors.Is(err, ErrNotFound) {
 			config = NewNostrConfig()
 			ApplyNostrEnvOverrides(config)
+			if err := seedNostrConfigFabric(config); err != nil {
+				return nil, err
+			}
 			if err := SaveNostrConfig(path, config); err != nil {
 				return nil, fmt.Errorf("seeding nostr config: %w", err)
 			}
@@ -2972,7 +2975,65 @@ func LoadOrCreateNostrConfig(path string) (*NostrConfig, error) {
 		}
 		return nil, err
 	}
+	if config.ConfigFabric == nil {
+		if err := seedNostrConfigFabric(config); err != nil {
+			return nil, err
+		}
+		if err := SaveNostrConfig(path, config); err != nil {
+			return nil, fmt.Errorf("seeding config fabric policy: %w", err)
+		}
+	}
 	return config, nil
+}
+
+func seedNostrConfigFabric(config *NostrConfig) error {
+	if config.ConfigFabric != nil {
+		return nil
+	}
+	authors := splitCommaSeparated(os.Getenv("GT_NOSTR_CONFIG_TRUSTED_AUTHORS"))
+	relays := splitCommaSeparated(os.Getenv("GT_NOSTR_CONFIG_RELAYS"))
+	if len(authors) == 0 && len(relays) == 0 {
+		return nil
+	}
+	if len(authors) == 0 || len(relays) == 0 {
+		return fmt.Errorf("%w: GT_NOSTR_CONFIG_TRUSTED_AUTHORS and GT_NOSTR_CONFIG_RELAYS", ErrMissingField)
+	}
+	scope := strings.TrimSpace(os.Getenv("GT_NOSTR_CONFIG_SCOPE"))
+	if scope == "" {
+		scope = "prod"
+	}
+	config.ConfigFabric = &NostrConfigFabric{TrustedAuthors: authors, SubscriptionRelays: relays, Scope: scope}
+	return nil
+}
+
+func splitCommaSeparated(value string) []string {
+	var result []string
+	for _, item := range strings.Split(value, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			result = append(result, item)
+		}
+	}
+	return result
+}
+
+func PersistNostrDesiredState(path string, current *NostrConfig, policy NostrRuntimePolicy, accepted AcceptedDesiredState) (*NostrConfig, error) {
+	data, err := json.Marshal(policy)
+	if err != nil {
+		return nil, err
+	}
+	candidate := *current
+	if err := json.Unmarshal(data, &candidate); err != nil {
+		return nil, err
+	}
+	candidate.Identities = current.Identities
+	if candidate.ConfigFabric == nil {
+		return nil, fmt.Errorf("%w: config_fabric", ErrMissingField)
+	}
+	candidate.ConfigFabric.Accepted = &accepted
+	if err := SaveNostrConfig(path, &candidate); err != nil {
+		return nil, err
+	}
+	return &candidate, nil
 }
 
 // SaveNostrConfig saves a Nostr configuration to a file with 0600 permissions
@@ -2991,9 +3052,29 @@ func SaveNostrConfig(path string, config *NostrConfig) error {
 		return fmt.Errorf("encoding nostr config: %w", err)
 	}
 
-	// 0600: bunker URIs are sensitive (they grant signing access)
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		return fmt.Errorf("writing nostr config: %w", err)
+	file, err := os.CreateTemp(filepath.Dir(path), ".nostr-config-*")
+	if err != nil {
+		return fmt.Errorf("creating nostr config temp file: %w", err)
+	}
+	temporary := file.Name()
+	defer os.Remove(temporary)
+	if err := file.Chmod(0600); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("writing nostr config temp file: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("syncing nostr config: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("closing nostr config temp file: %w", err)
+	}
+	if err := os.Rename(temporary, path); err != nil {
+		return fmt.Errorf("replacing nostr config: %w", err)
 	}
 
 	return nil
@@ -3015,6 +3096,11 @@ func validateNostrConfig(c *NostrConfig) error {
 	}
 	if c.Version > CurrentNostrConfigVersion {
 		return fmt.Errorf("%w: got %d, max supported %d", ErrInvalidVersion, c.Version, CurrentNostrConfigVersion)
+	}
+	if c.ConfigFabric != nil {
+		if len(c.ConfigFabric.TrustedAuthors) == 0 || len(c.ConfigFabric.SubscriptionRelays) == 0 {
+			return fmt.Errorf("%w: config_fabric trusted authors and subscription relays", ErrMissingField)
+		}
 	}
 
 	// When enabled, at least one write relay is required

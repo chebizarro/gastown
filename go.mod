@@ -36,6 +36,8 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 )
 
+require git.sharegap.net/cascadia/cascadia-nips/generated/go v0.1.1-0.20260826052020-d767082d1803 // indirect
+
 require (
 	cel.dev/expr v0.25.1 // indirect
 	cloud.google.com/go v0.120.0 // indirect

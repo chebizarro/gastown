@@ -6235,6 +6235,8 @@ func TestLoadNostrConfigNotFound(t *testing.T) {
 }
 
 func TestLoadOrCreateNostrConfig(t *testing.T) {
+	t.Setenv("GT_NOSTR_CONFIG_TRUSTED_AUTHORS", strings.Repeat("a", 64))
+	t.Setenv("GT_NOSTR_CONFIG_RELAYS", "wss://relay.example")
 	t.Run("creates default when not found", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "nostr.json")
 		config, err := LoadOrCreateNostrConfig(path)

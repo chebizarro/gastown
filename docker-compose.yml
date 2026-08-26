@@ -59,6 +59,9 @@ services:
 
       # Mutable product policy lives in the mounted file; env carries its path only.
       GT_NOSTR_CONFIG: /etc/gastown/nostr.json
+      GT_NOSTR_CONFIG_TRUSTED_AUTHORS: ${GT_NOSTR_CONFIG_TRUSTED_AUTHORS:?set trusted config authors}
+      GT_NOSTR_CONFIG_RELAYS: ${GT_NOSTR_CONFIG_RELAYS:?set config subscription relays}
+      GT_NOSTR_CONFIG_SCOPE: ${GT_NOSTR_CONFIG_SCOPE:-prod}
 
       # External Dolt server; defaults match the local Gastown convention.
       GT_DOLT_HOST: ${GT_DOLT_HOST:-127.0.0.1}

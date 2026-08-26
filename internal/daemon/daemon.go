@@ -33,6 +33,7 @@ import (
 	"github.com/steveyegge/gastown/internal/feed"
 	gitpkg "github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mayor"
+	gtnostr "github.com/steveyegge/gastown/internal/nostr"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/refinery"
 	"github.com/steveyegge/gastown/internal/rig"
@@ -543,6 +544,13 @@ func (d *Daemon) Run() (err error) {
 
 	// Apply persisted Nostr/feed product policy before starting background work.
 	d.reloadProductPolicy()
+	configPath := agentconfig.EffectiveNostrConfigPath(d.config.TownRoot)
+	configFabric, err := gtnostr.NewConfigFabric(d.ctx, configPath, d.config.TownRoot, d.applyProductPolicy)
+	if err != nil {
+		return fmt.Errorf("starting config fabric: %w", err)
+	}
+	configFabric.Start(d.ctx)
+	defer configFabric.Close()
 
 	// Start convoy manager. The embedded beads SDK in this Gastown version is
 	// Dolt-only; SQLite mode uses CLI polling and never opens the SDK.
@@ -870,11 +878,17 @@ func (d *Daemon) reloadProductPolicy() {
 		d.logger.Printf("Product policy reload rejected; keeping last valid projection: %v", err)
 		return
 	}
+	if err := d.applyProductPolicy(cfg); err != nil {
+		d.logger.Printf("Product policy reload rejected; keeping last valid projection: %v", err)
+	}
+}
+
+func (d *Daemon) applyProductPolicy(cfg *agentconfig.NostrConfig) error {
 	wantCurator := cfg.IsFeedCuratorEnabled()
 	if wantCurator && d.curator == nil {
 		curator := feed.NewCurator(d.config.TownRoot)
 		if err := curator.Start(); err != nil {
-			d.logger.Printf("Warning: failed to start feed curator: %v", err)
+			return fmt.Errorf("start feed curator: %w", err)
 		} else {
 			d.curator = curator
 			d.logger.Println("Feed curator started")
@@ -886,6 +900,7 @@ func (d *Daemon) reloadProductPolicy() {
 	}
 	d.logger.Printf("Effective product policy reloaded: enabled=%t read_relays=%d write_relays=%d blossom_servers=%d feed_curator=%t",
 		cfg.Enabled, len(cfg.ReadRelays), len(cfg.WriteRelays), len(cfg.BlossomServers), wantCurator)
+	return nil
 }
 
 // recoveryHeartbeatInterval returns the config-driven recovery heartbeat interval.
