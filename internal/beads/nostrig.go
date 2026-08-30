@@ -34,7 +34,7 @@ func (b *Beads) nostrigEnabled() bool {
 	if b == nil || b.isolated {
 		return false
 	}
-	return strings.TrimSpace(os.Getenv("GT_NOSTRIG_ENABLE")) != ""
+	return manifestIntegrationEnv("ENABLE") != ""
 }
 
 func (b *Beads) syncNostrigLedgerIfEnabled() error {
@@ -46,19 +46,19 @@ func (b *Beads) syncNostrigLedgerIfEnabled() error {
 		return err
 	}
 	beadsDir := b.getResolvedBeadsDir()
-	outDir := strings.TrimSpace(os.Getenv("GT_NOSTRIG_OUT"))
+	outDir := manifestIntegrationEnv("OUT")
 	if outDir == "" {
 		outDir = filepath.Dir(beadsDir)
 	}
 	args := append([]string{"sync"}, selectorArgs...)
 	args = append(args, "--out", outDir)
-	if cache := strings.TrimSpace(os.Getenv("GT_NOSTRIG_CACHE")); cache != "" {
+	if cache := manifestIntegrationEnv("CACHE"); cache != "" {
 		args = append(args, "--cache", cache)
 	}
-	if limit := strings.TrimSpace(os.Getenv("GT_NOSTRIG_LIMIT")); limit != "" {
+	if limit := manifestIntegrationEnv("LIMIT"); limit != "" {
 		args = append(args, "--limit", limit)
 	}
-	if strings.TrimSpace(os.Getenv("GT_NOSTRIG_FAIL_ON_CONFLICT")) != "" {
+	if manifestIntegrationEnv("FAIL_ON_CONFLICT") != "" {
 		args = append(args, "--fail-on-conflict")
 	}
 	lock := nostrigOperationLock(beadsDir)
@@ -77,11 +77,11 @@ func (b *Beads) syncNostrigLedgerIfEnabled() error {
 
 func nostrigSyncSelectorArgs() ([]string, error) {
 	args := nostrigRelayArgs(nil)
-	if repoAddr := strings.TrimSpace(os.Getenv("GT_NOSTRIG_REPO_ADDR")); repoAddr != "" {
+	if repoAddr := manifestIntegrationEnv("REPO_ADDR"); repoAddr != "" {
 		args = append(args, "--repo-addr", repoAddr)
 	} else {
-		repoID := strings.TrimSpace(os.Getenv("GT_NOSTRIG_REPO_ID"))
-		owner := strings.TrimSpace(os.Getenv("GT_NOSTRIG_OWNER"))
+		repoID := manifestIntegrationEnv("REPO_ID")
+		owner := manifestIntegrationEnv("OWNER")
 		if repoID != "" {
 			args = append(args, "--repo-id", repoID)
 		}
@@ -89,10 +89,10 @@ func nostrigSyncSelectorArgs() ([]string, error) {
 			args = append(args, "--owner", owner)
 		}
 		if repoID == "" || owner == "" {
-			return nil, fmt.Errorf("GT_NOSTRIG_ENABLE requires GT_NOSTRIG_REPO_ADDR or both GT_NOSTRIG_REPO_ID and GT_NOSTRIG_OWNER")
+			return nil, fmt.Errorf("GT_MANIFEST_ENABLE requires GT_MANIFEST_REPO_ADDR or both GT_MANIFEST_REPO_ID and GT_MANIFEST_OWNER")
 		}
 	}
-	for _, author := range splitNostrigList(os.Getenv("GT_NOSTRIG_AUTHORS")) {
+	for _, author := range splitNostrigList(manifestIntegrationEnv("AUTHORS")) {
 		args = append(args, "--author", author)
 	}
 	return args, nil
@@ -104,13 +104,13 @@ func (b *Beads) publishNostrigCreateIfEnabled(issue *Issue) error {
 	}
 	args := b.nostrigMutationArgs("create", issue.ID)
 	args = append(args, "--title", issue.Title)
-	if repoAddr := strings.TrimSpace(os.Getenv("GT_NOSTRIG_REPO_ADDR")); repoAddr != "" {
+	if repoAddr := manifestIntegrationEnv("REPO_ADDR"); repoAddr != "" {
 		args = append(args, "--repo-addr", repoAddr)
 	} else {
-		if repoID := strings.TrimSpace(os.Getenv("GT_NOSTRIG_REPO_ID")); repoID != "" {
+		if repoID := manifestIntegrationEnv("REPO_ID"); repoID != "" {
 			args = append(args, "--repo-id", repoID)
 		}
-		if owner := strings.TrimSpace(os.Getenv("GT_NOSTRIG_OWNER")); owner != "" {
+		if owner := manifestIntegrationEnv("OWNER"); owner != "" {
 			args = append(args, "--owner", owner)
 		}
 	}
@@ -201,7 +201,7 @@ func (b *Beads) publishNostrigStatusIfEnabled(id, status string) error {
 
 func (b *Beads) nostrigMutationArgs(command, id string) []string {
 	args := nostrigRelayArgs([]string{command, "--task-id", strings.TrimSpace(id)})
-	if recipient := strings.TrimSpace(os.Getenv("GT_NOSTRIG_RECIPIENT")); recipient != "" {
+	if recipient := manifestIntegrationEnv("RECIPIENT"); recipient != "" {
 		args = append(args, "--recipient", recipient)
 	}
 	return args
@@ -209,13 +209,21 @@ func (b *Beads) nostrigMutationArgs(command, id string) []string {
 
 func nostrigRelayArgs(prefix []string) []string {
 	args := append([]string{}, prefix...)
-	for _, relay := range splitNostrigList(os.Getenv("GT_NOSTRIG_RELAYS")) {
+	for _, relay := range splitNostrigList(manifestIntegrationEnv("RELAYS")) {
 		args = append(args, "--relay", relay)
 	}
-	if relay := strings.TrimSpace(os.Getenv("GT_NOSTRIG_RELAY")); relay != "" {
+	if relay := manifestIntegrationEnv("RELAY"); relay != "" {
 		args = append(args, "--relay", relay)
 	}
 	return args
+}
+
+// GT_NOSTRIG_* names remain deprecated fallbacks for existing deployments.
+func manifestIntegrationEnv(suffix string) string {
+	if value := strings.TrimSpace(os.Getenv("GT_MANIFEST_" + suffix)); value != "" {
+		return value
+	}
+	return strings.TrimSpace(os.Getenv("GT_NOSTRIG_" + suffix))
 }
 
 func splitNostrigList(value string) []string {
@@ -383,7 +391,7 @@ func rewriteNostrigOutbox(path string, intents []nostrigIntent) error {
 func (b *Beads) runNostrigIntent(args []string) error {
 	effective := append([]string(nil), args...)
 	if len(effective) > 0 && effective[0] != "sync" && !containsNostrigFlag(effective, "--recipient") {
-		if recipient := strings.TrimSpace(os.Getenv("GT_NOSTRIG_RECIPIENT")); recipient != "" {
+		if recipient := manifestIntegrationEnv("RECIPIENT"); recipient != "" {
 			effective = append(effective, "--recipient", recipient)
 		}
 	}
@@ -400,13 +408,13 @@ func containsNostrigFlag(args []string, flag string) bool {
 }
 
 func (b *Beads) runNostrig(args ...string) error {
-	bin := strings.TrimSpace(os.Getenv("GT_NOSTRIG_BIN"))
+	bin := manifestIntegrationEnv("BIN")
 	if bin == "" {
-		bin = "nostrig"
+		bin = "manifest"
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), nostrigCommandTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, bin, args...) //nolint:gosec // G204: nostrig is a configured internal CLI
+	cmd := exec.CommandContext(ctx, bin, args...) //nolint:gosec // G204: Manifest is a configured internal CLI
 	util.SetDetachedProcessGroup(cmd)
 	cmd.Dir = b.workDir
 	cmd.Env = os.Environ()
@@ -416,9 +424,9 @@ func (b *Beads) runNostrig(args ...string) error {
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		if strings.TrimSpace(stderr.String()) != "" {
-			return fmt.Errorf("nostrig %s: %s", strings.Join(args, " "), strings.TrimSpace(stderr.String()))
+			return fmt.Errorf("manifest %s: %s", strings.Join(args, " "), strings.TrimSpace(stderr.String()))
 		}
-		return fmt.Errorf("nostrig %s: %w", strings.Join(args, " "), err)
+		return fmt.Errorf("manifest %s: %w", strings.Join(args, " "), err)
 	}
 	return nil
 }

@@ -277,7 +277,7 @@ not publish relay-owned `39000`-series metadata/admin events.
 Messages carry `convoy`, `t`, and `bead` correlation tags. If a task
 projection supplies `nostr_event_id` or `nostr_event_address`, the message also
 links it with standard `e` or `a` tags. NIP-29 is a discussion surface only;
-authoritative task status and closure remain in Beads/Nostrig.
+authoritative task status and closure remain in Beads/Manifest.
 
 ### Issue Mirroring
 

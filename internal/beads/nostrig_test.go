@@ -304,7 +304,7 @@ if [ "$1" != sync ]; then
 fi
 exit 0
 `
-	for name, script := range map[string]string{"bd": bdScript, "nostrig": nostrigScript} {
+	for name, script := range map[string]string{"bd": bdScript, "manifest": nostrigScript, "nostrig": nostrigScript} {
 		if err := os.WriteFile(filepath.Join(binDir, name), []byte(script), 0755); err != nil {
 			t.Fatalf("write %s shim: %v", name, err)
 		}
