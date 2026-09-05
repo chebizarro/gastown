@@ -3,7 +3,7 @@ module github.com/steveyegge/gastown
 go 1.26.2
 
 require (
-	fiatjaf.com/nostr v0.0.0-20260611214214-c4534c716026
+	fiatjaf.com/nostr v0.0.0-20260902034142-316ef6591fa2
 	github.com/BurntSushi/toml v1.6.0
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
@@ -36,7 +36,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 )
 
-require git.sharegap.net/cascadia/cascadia-nips/generated/go v0.1.1-0.20260826052020-d767082d1803 // indirect
+require git.sharegap.net/cascadia/cascadia-nips/generated/go v0.1.1-0.20260826052020-d767082d1803
 
 require (
 	cel.dev/expr v0.25.1 // indirect
